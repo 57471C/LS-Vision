@@ -1,7 +1,38 @@
-# Tauri + SvelteKit + TypeScript
+# LS-Vision
 
-This template should help get you started developing with Tauri, SvelteKit and TypeScript in Vite.
+Desktop application for verifying fastener kits on the bench using computer vision.
 
-## Recommended IDE Setup
+Built with Tauri 2, SvelteKit, TypeScript, and Rust. Vision processing currently runs via a Python sidecar (OpenCV + YOLO), with a planned path to ONNX-in-Rust.
 
-[VS Code](https://code.visualstudio.com/) + [Svelte](https://marketplace.visualstudio.com/items?itemName=svelte.svelte-vscode) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer).
+## What it does
+
+Independent bench stations that:
+
+- Read a single barcode from a fixed location on the bench
+- Look up the Bill of Materials (BoM) for that job
+- Detect and inspect the kits present
+- Compare results against the expected parts and quantities
+- Show clear pass/fail feedback
+
+See [plan.md](plan.md) for the full architecture, flow, and phased implementation plan.
+
+## Tech stack
+
+- **Frontend**: SvelteKit + TypeScript + Vite
+- **Desktop shell**: Tauri 2 (Rust)
+- **Vision (current)**: Python sidecar with OpenCV and Ultralytics YOLO
+- **Vision (target)**: ONNX inference in Rust
+- **Data**: JSON/CSV for development; MSSQL for production BoM lookup
+
+## Getting started
+
+```bash
+npm install
+npm run tauri dev
+```
+
+Python sidecar dependencies live in `vision/` (see `vision/requirements.txt`).
+
+## Project status
+
+Early scaffolding. Core loop (barcode → BoM → inspection → result) is the next focus. See `plan.md` for phases.
