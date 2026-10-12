@@ -1,0 +1,18 @@
+{
+  "JOB-12345": {
+    "expectedKitCount": 4,
+    "parts": [
+      { "code": "M6x16", "qty": 8, "description": "M6x16 bolt" },
+      { "code": "M6x20", "qty": 4, "description": "M6x20 bolt" },
+      { "code": "M6-nut", "qty": 12, "description": "M6 nut" },
+      { "code": "M6-washer", "qty": 12, "description": "M6 washer" }
+    ]
+  },
+  "JOB-67890": {
+    "expectedKitCount": 1,
+    "parts": [
+      { "code": "M8x25", "qty": 6, "description": "M8x25 bolt" },
+      { "code": "M8-nut", "qty": 6, "description": "M8 nut" }
+    ]
+  }
+}
