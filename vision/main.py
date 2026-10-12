@@ -43,17 +43,19 @@ def inspect(req: InspectRequest):
             "kits": []
         }
 
+    kits_present = 2  # placeholder until real detection; change as needed for testing
+
     return {
         "barcode": req.barcode,
         "status": "pass",
-        "message": f"BoM loaded – {job.get('expectedKitCount', '?')} kits expected",
+        "message": f"BoM loaded – {kits_present} kit(s) on bench",
         "kitCode": job.get("kitCode"),
-        "expectedKitCount": job.get("expectedKitCount"),
+        "expectedKitCount": job.get("expectedKitCount"),  # display only
         "parts": job.get("parts", []),
-        "kitsFound": job.get("expectedKitCount", 0),
+        "kitsFound": kits_present,
         "kits": [
             {"id": i + 1, "status": "pass", "missing": [], "extra": []}
-            for i in range(job.get("expectedKitCount", 1))
+            for i in range(kits_present)
         ]
     }
 
