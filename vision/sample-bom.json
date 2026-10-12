@@ -1,5 +1,5 @@
 {
-  "1736719": {
+  "6PBBK001": {
     "kitCode": "6PBBK001",
     "expectedKitCount": 1,
     "parts": [
@@ -9,7 +9,7 @@
       { "ic": "2BB06B2SZ", "qty": 4, "des": "M6x16 8.8 SetScrew z" }
     ]
   },
-  "JOB-67890": {
+  "6PBBGR01": {
     "kitCode": "6PBBGR01",
     "expectedKitCount": 2,
     "parts": [
