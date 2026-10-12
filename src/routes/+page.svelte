@@ -1,74 +1,84 @@
 <script lang="ts">
-  import { invoke } from "@tauri-apps/api/core";
+// biome-ignore-all lint/correctness/noUnusedVariables: Biome 2.4 does not treat Svelte template references as uses
+import { invoke } from "@tauri-apps/api/core";
 
-  type Part = { ic: string; des: string; qty: number };
-  type InspectView = {
-    status: string;
-    message?: string;
-    kitCode?: string;
-    parts?: Part[];
-    kitsFound?: number;
-    expectedKitCount?: number;
-  };
+type Part = { ic: string; des: string; qty: number };
+type InspectView = {
+	status: string;
+	message?: string;
+	kitCode?: string;
+	parts?: Part[];
+	kitsFound?: number;
+	expectedKitCount?: number;
+};
 
-  let barcode = "JOB-12345";
-  let result: InspectView | null = null;
-  let loading = false;
-  let cameraIndex = 0;
+let barcode = "JOB-12345";
+let result: InspectView | null = null;
+let loading = false;
+let cameraIndex = 0;
 
-  async function startSidecar() {
-    try {
-      const res = await invoke("start_vision_sidecar");
-      console.log(res);
-    } catch (err) {
-      console.error(err);
-    }
-  }
+function errorMessage(err: unknown, fallback: string): string {
+	return err instanceof Error && err.message ? err.message : fallback;
+}
 
-  async function runInspect() {
-    loading = true;
-    result = null;
-    try {
-      const res = await fetch("http://127.0.0.1:8008/inspect", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ barcode })
-      });
-      if (!res.ok) throw new Error(await res.text());
-      result = await res.json();
-    } catch (err: any) {
-      result = { status: "fail", message: err.message || "Request failed" };
-    } finally {
-      loading = false;
-    }
-  }
+async function startSidecar() {
+	try {
+		const res = await invoke("start_vision_sidecar");
+		console.log(res);
+	} catch (err) {
+		console.error(err);
+	}
+}
 
-  async function decodeAndInspect() {
-    try {
-      const res = await fetch(`http://127.0.0.1:8008/camera/decode?index=${cameraIndex}`);
-      const decoded = await res.json();
+async function runInspect() {
+	loading = true;
+	result = null;
+	try {
+		const res = await fetch("http://127.0.0.1:8008/inspect", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ barcode }),
+		});
+		if (!res.ok) throw new Error(await res.text());
+		result = await res.json();
+	} catch (err: unknown) {
+		result = { status: "fail", message: errorMessage(err, "Request failed") };
+	} finally {
+		loading = false;
+	}
+}
 
-      if (decoded.status === "pass" && decoded.codes?.length) {
-        barcode = decoded.codes[0].data;
-        await runInspect();
-      } else {
-        result = { status: "fail", message: decoded.message || "No code detected" };
-      }
-    } catch (err: any) {
-      result = { status: "fail", message: err.message || "Decode failed" };
-    }
-  }
+async function decodeAndInspect() {
+	try {
+		const res = await fetch(
+			`http://127.0.0.1:8008/camera/decode?index=${cameraIndex}`,
+		);
+		const decoded = await res.json();
+
+		if (decoded.status === "pass" && decoded.codes?.length) {
+			barcode = decoded.codes[0].data;
+			await runInspect();
+		} else {
+			result = {
+				status: "fail",
+				message: decoded.message || "No code detected",
+			};
+		}
+	} catch (err: unknown) {
+		result = { status: "fail", message: errorMessage(err, "Decode failed") };
+	}
+}
 </script>
 
 <div>
-  <button on:click={startSidecar}>Start Vision Sidecar</button>
+  <button type="button" on:click={startSidecar}>Start Vision Sidecar</button>
 
   <div style="margin-top: 1rem;">
     <label>
       Barcode:
       <input bind:value={barcode} />
     </label>
-    <button on:click={runInspect} disabled={loading}>
+    <button type="button" on:click={runInspect} disabled={loading}>
       {loading ? "Inspecting..." : "Inspect"}
     </button>
   </div>
@@ -88,7 +98,7 @@
       style="max-width: 480px; border: 1px solid #ccc; margin-top: 0.5rem;"
     />
     <br />
-    <button on:click={decodeAndInspect} disabled={loading}>Decode QR / Barcode</button>
+    <button type="button" on:click={decodeAndInspect} disabled={loading}>Decode QR / Barcode</button>
   </div>
 
   {#if result}
