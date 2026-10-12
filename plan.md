@@ -38,9 +38,45 @@ Independent bench stations (NUCs) that:
   - Model management (import ONNX, view active model)
 
 ### Data & integration
-- BoM lookup interface: `barcode → { parts: [{code, qty, ...}], expectedKitCount? }`
+- BoM lookup interface: `barcode → { des, expectedKitCount?, parts: [{ic, des, qty}] }`
+- Lookup key = kit IC (e.g. `6PBBK001`)
 - Pluggable source (file now, MSSQL later) via admin setting
 - Results logging (local + optional central)
+
+#### Example BoM JSON shape (Option A)
+```json
+{
+  "6PBBK001": {
+    "des": "Accessory Kit Bolt Bag 001",
+    "expectedKitCount": 1,
+    "parts": [
+      { "ic": "2BBMNM08", "qty": 18, "des": "M8 Nut Nyloc z" }
+    ]
+  }
+}
+```
+
+#### Example SQL (MSSQL)
+Kit header + lines. Adjust table/column names to match the real schema.
+
+```sql
+-- Kit description
+SELECT des
+FROM IR
+WHERE ic = @kitIc;          -- @kitIc = barcode payload, e.g. '6PBBK001'
+
+-- Parts for the kit (already filtered: no 3*, no 2P* packaging, etc.)
+SELECT
+    p.ic,
+    p.des,
+    p.qty
+FROM KitLines p             -- or BOM / IR lines table
+WHERE p.kit_ic = @kitIc
+  AND p.ic NOT LIKE '3%'
+  AND p.ic NOT LIKE '2P%';
+```
+
+The app expects the combined result in the JSON shape above. `expectedKitCount` can come from a label-print count or be omitted.
 
 ### Implementation phases
 

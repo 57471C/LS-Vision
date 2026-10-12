@@ -1,6 +1,6 @@
 {
   "6PBBK001": {
-    "kitCode": "6PBBK001",
+    "des": "Accessory Kit Bolt Bag 001",
     "expectedKitCount": 1,
     "parts": [
       { "ic": "2BBMNM08", "qty": 18, "des": "M8 Nut Nyloc z" },
@@ -10,7 +10,7 @@
     ]
   },
   "6PBBGR01": {
-    "kitCode": "6PBBGR01",
+    "des": "pBB Grab Rail ST",
     "expectedKitCount": 2,
     "parts": [
       { "ic": "2BBMNM08", "qty": 6, "des": "M8 Nut Nyloc z" },
