@@ -10,6 +10,7 @@ type InspectView = {
 	parts?: Part[];
 	kitsFound?: number;
 	expectedKitCount?: number;
+	info?: string;
 };
 
 let barcode = "JOB-12345";
@@ -43,6 +44,25 @@ async function runInspect() {
 		result = await res.json();
 	} catch (err: unknown) {
 		result = { status: "fail", message: errorMessage(err, "Request failed") };
+	} finally {
+		loading = false;
+	}
+}
+
+async function testSampleImage() {
+	loading = true;
+	result = null;
+	try {
+		const res = await fetch("http://127.0.0.1:8008/inspect/sample", {
+			method: "POST",
+		});
+		if (!res.ok) throw new Error(await res.text());
+		result = await res.json();
+	} catch (err: unknown) {
+		result = {
+			status: "fail",
+			message: errorMessage(err, "Sample test failed"),
+		};
 	} finally {
 		loading = false;
 	}
@@ -125,6 +145,14 @@ async function decodeAndInspect() {
 			>
 				Decode QR / Barcode
 			</button>
+			<button
+				type="button"
+				class="w-fit border-2 border-neutral-950 bg-white px-5 py-3 text-lg font-bold disabled:bg-neutral-400"
+				on:click={testSampleImage}
+				disabled={loading}
+			>
+				Test sample image
+			</button>
 		</div>
 
 		{#if result}
@@ -163,6 +191,9 @@ async function decodeAndInspect() {
 								{/each}
 							</tbody>
 						</table>
+					{/if}
+					{#if result.info}
+						<p class="text-sm text-neutral-600">{result.info}</p>
 					{/if}
 					{#if result.kitsFound != null || result.expectedKitCount != null}
 						<p class="text-sm text-neutral-600">

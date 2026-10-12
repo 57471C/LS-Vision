@@ -30,6 +30,10 @@ app.add_middleware(
 )
 
 BOM_PATH = Path(__file__).parent / "sample-bom.json"
+SAMPLE_DIR = Path(__file__).parent / "test-images"
+DEFAULT_SAMPLE = "Example3.jpg"
+# Areas within this multiple of the group median stay in the same size band.
+SIZE_GROUP_RATIO = 2.0
 
 # Fixed square on the bench. Change at runtime with POST /barcode/roi.
 CAMERA_INDEX = 0
@@ -266,6 +270,120 @@ def read_barcode(req: Optional[BarcodeRequest] = Body(default=None)):
         "roi": used_roi,
         "frame": frame_size,
         "codes": codes,
+    }
+
+def _sample_path(name):
+    if not name or Path(name).name != name or name.startswith("."):
+        return None
+    path = (SAMPLE_DIR / name).resolve()
+    try:
+        path.relative_to(SAMPLE_DIR.resolve())
+    except ValueError:
+        return None
+    return path
+
+def _contour_areas(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (7, 7), 0)
+    dark = cv2.adaptiveThreshold(
+        blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 41, 6
+    )
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.morphologyEx(dark, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    image_area = gray.shape[0] * gray.shape[1]
+    areas = []
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < image_area * 0.00015 or area > image_area * 0.02:
+            continue
+        _, _, width, height = cv2.boundingRect(contour)
+        short_side = min(width, height)
+        long_side = max(width, height)
+        if short_side < 10 or long_side / float(short_side) > 8:
+            continue
+        if area / float(width * height) < 0.2:
+            continue
+        areas.append(area)
+    areas.sort()
+    return areas
+
+def _group_by_size(areas):
+    groups = []
+    for area in areas:
+        if not groups:
+            groups.append([area])
+            continue
+        current = groups[-1]
+        median = current[len(current) // 2]
+        if area <= median * SIZE_GROUP_RATIO and area <= current[0] * (SIZE_GROUP_RATIO ** 2):
+            current.append(area)
+        else:
+            groups.append([area])
+    return groups
+
+def _size_parts(groups):
+    labels = ["S", "M", "L", "XL", "XXL"]
+    descriptions = {
+        "S": "Small",
+        "M": "Medium",
+        "L": "Large",
+        "XL": "Extra large",
+        "XXL": "Largest",
+    }
+    parts = []
+    for index, group in enumerate(groups):
+        label = labels[index] if index < len(labels) else f"S{index + 1}"
+        name = descriptions.get(label, "Size group")
+        low = int(round(group[0]))
+        high = int(round(group[-1]))
+        parts.append({
+            "ic": label,
+            "des": f"{name} blobs, about {low:,}–{high:,} px",
+            "qty": len(group),
+        })
+    return parts
+
+@app.post("/inspect/sample")
+def inspect_sample(name: str = DEFAULT_SAMPLE):
+    path = _sample_path(name)
+    if path is None or not path.is_file():
+        return {
+            "status": "fail",
+            "message": "Sample image not found",
+            "kitCode": Path(name).name if name else DEFAULT_SAMPLE,
+            "parts": [],
+        }
+
+    image = cv2.imread(str(path))
+    if image is None:
+        return {
+            "status": "fail",
+            "message": f"Could not read {path.name}",
+            "kitCode": path.stem,
+            "parts": [],
+        }
+
+    areas = _contour_areas(image)
+    groups = _group_by_size(areas)
+    parts = _size_parts(groups)
+    if not parts:
+        return {
+            "status": "fail",
+            "message": f"No blobs found in {path.name}",
+            "kitCode": path.stem,
+            "parts": [],
+            "info": "Info only: classical contour count, not a BoM check.",
+        }
+
+    return {
+        "status": "pass",
+        "message": f"Rough size groups from {path.name}",
+        "kitCode": path.stem,
+        "parts": parts,
+        "info": f"Info only: {len(areas)} blobs counted. Classical contour count, not a BoM check.",
     }
 
 @app.post("/inspect")
