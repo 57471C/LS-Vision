@@ -7,6 +7,7 @@ type InspectView = {
 	status: string;
 	message?: string;
 	kitCode?: string;
+	des?: string;
 	parts?: Part[];
 	kitsFound?: number;
 	expectedKitCount?: number;
@@ -170,6 +171,9 @@ async function decodeAndInspect() {
 					{#if result.kitCode}
 						<p class="text-3xl font-black tracking-tight">Kit {result.kitCode}</p>
 					{/if}
+					{#if result.des}
+  <p class="text-lg text-neutral-700">{result.des}</p>
+{/if}
 					{#if result.message}
 						<p class="text-lg">{result.message}</p>
 					{/if}

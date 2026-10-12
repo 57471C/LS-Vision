@@ -464,7 +464,8 @@ def inspect(req: InspectRequest):
         "barcode": req.barcode,
         "status": "pass",
         "message": f"BoM loaded – {kits_present} kit(s) on bench",
-        "kitCode": job.get("kitCode"),
+        "kitCode": req.barcode,
+        "des": job.get("des"),
         "expectedKitCount": job.get("expectedKitCount"),  # display only
         "parts": job.get("parts", []),
         "kitsFound": kits_present,
