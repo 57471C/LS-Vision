@@ -5,6 +5,8 @@
   let result: any = null;
   let error: string | null = null;
   let loading = false;
+  let cameraIndex = 0;
+  let decodeResult: any = null;
 
   async function startSidecar() {
     try {
@@ -33,6 +35,21 @@
       loading = false;
     }
   }
+
+  async function decodeAndInspect() {
+    try {
+      const res = await fetch(`http://127.0.0.1:8008/camera/decode?index=${cameraIndex}`);
+      const decoded = await res.json();
+      decodeResult = decoded;
+
+      if (decoded.status === "pass" && decoded.codes?.length) {
+        barcode = decoded.codes[0].data;
+        await runInspect();
+      }
+    } catch (err: any) {
+      decodeResult = { status: "fail", message: err.message };
+    }
+  }
 </script>
 
 <div>
@@ -59,4 +76,26 @@
       <pre>{JSON.stringify(result, null, 2)}</pre>
     </div>
   {/if}
+
+  <div style="margin-top: 1rem;">
+    <label>
+      Camera:
+      <select bind:value={cameraIndex}>
+        <option value={0}>0 (default)</option>
+        <option value={1}>1</option>
+      </select>
+    </label>
+    <br />
+    <img
+      src="http://127.0.0.1:8008/camera/stream?index={cameraIndex}"
+      alt="camera"
+      style="max-width: 480px; border: 1px solid #ccc; margin-top: 0.5rem;"
+    />
+    <br />
+    <button on:click={decodeAndInspect}>Decode QR / Barcode</button>
+
+    {#if decodeResult}
+      <pre>{JSON.stringify(decodeResult, null, 2)}</pre>
+    {/if}
+  </div>
 </div>
