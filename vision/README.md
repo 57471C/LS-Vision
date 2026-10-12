@@ -4,18 +4,25 @@ Python sidecar for LS-Vision (OpenCV + Ultralytics YOLO).
 
 This is the current vision engine. It is designed so inference can later move to ONNX-in-Rust without changing the contract with the Tauri app.
 
-## Setup
+## Setup (first time)
 
-```bash
+```powershell
 cd vision
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1   # Windows
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
-## Run (development)
+## Activate the environment (every new terminal)
 
-```bash
+```powershell
+cd C:\Scripts\LS-Vision\vision
+.\.venv\Scripts\Activate.ps1
+```
+
+You should see `(.venv)` in the prompt. Then you can run:
+
+```powershell
 python main.py
 ```
 

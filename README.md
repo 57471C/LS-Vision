@@ -31,7 +31,18 @@ npm install
 npm run tauri dev
 ```
 
-Python sidecar dependencies live in `vision/` (see `vision/requirements.txt`).
+### Python sidecar
+
+Dependencies live in `vision/`. Activate the virtual environment in any terminal where you run Python:
+
+```powershell
+cd vision
+.\.venv\Scripts\Activate.ps1
+```
+
+(First-time setup: `python -m venv .venv` then `pip install -r requirements.txt`.)
+
+See [vision/README.md](vision/README.md) for full sidecar details.
 
 ## Project status
 
