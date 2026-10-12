@@ -11,6 +11,7 @@ type InspectView = {
 	kitsFound?: number;
 	expectedKitCount?: number;
 	info?: string;
+	image?: string;
 };
 
 let barcode = "JOB-12345";
@@ -191,6 +192,13 @@ async function decodeAndInspect() {
 								{/each}
 							</tbody>
 						</table>
+					{/if}
+					{#if result.image}
+						<img
+							src={result.image}
+							alt="Annotated sample"
+							class="w-full border-4 border-neutral-950 bg-neutral-200"
+						/>
 					{/if}
 					{#if result.info}
 						<p class="text-sm text-neutral-600">{result.info}</p>

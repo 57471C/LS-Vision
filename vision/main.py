@@ -1,3 +1,4 @@
+import base64
 from typing import Optional
 
 import cv2
@@ -282,7 +283,13 @@ def _sample_path(name):
         return None
     return path
 
-def _contour_areas(image):
+def _size_label(index):
+    labels = ["S", "M", "L", "XL", "XXL"]
+    if index < len(labels):
+        return labels[index]
+    return f"S{index + 1}"
+
+def _detected_blobs(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (7, 7), 0)
     dark = cv2.adaptiveThreshold(
@@ -294,38 +301,44 @@ def _contour_areas(image):
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     image_area = gray.shape[0] * gray.shape[1]
-    areas = []
+    blobs = []
     for contour in contours:
         area = cv2.contourArea(contour)
         if area < image_area * 0.00015 or area > image_area * 0.02:
             continue
-        _, _, width, height = cv2.boundingRect(contour)
+        x, y, width, height = cv2.boundingRect(contour)
         short_side = min(width, height)
         long_side = max(width, height)
         if short_side < 10 or long_side / float(short_side) > 8:
             continue
         if area / float(width * height) < 0.2:
             continue
-        areas.append(area)
-    areas.sort()
-    return areas
+        blobs.append({
+            "area": area,
+            "x": int(x),
+            "y": int(y),
+            "w": int(width),
+            "h": int(height),
+        })
+    blobs.sort(key=lambda blob: blob["area"])
+    return blobs
 
-def _group_by_size(areas):
+def _group_by_size(blobs):
     groups = []
-    for area in areas:
+    for blob in blobs:
+        area = blob["area"]
         if not groups:
-            groups.append([area])
+            groups.append([blob])
             continue
         current = groups[-1]
-        median = current[len(current) // 2]
-        if area <= median * SIZE_GROUP_RATIO and area <= current[0] * (SIZE_GROUP_RATIO ** 2):
-            current.append(area)
+        median = current[len(current) // 2]["area"]
+        if area <= median * SIZE_GROUP_RATIO and area <= current[0]["area"] * (SIZE_GROUP_RATIO ** 2):
+            current.append(blob)
         else:
-            groups.append([area])
+            groups.append([blob])
     return groups
 
 def _size_parts(groups):
-    labels = ["S", "M", "L", "XL", "XXL"]
     descriptions = {
         "S": "Small",
         "M": "Medium",
@@ -335,16 +348,61 @@ def _size_parts(groups):
     }
     parts = []
     for index, group in enumerate(groups):
-        label = labels[index] if index < len(labels) else f"S{index + 1}"
+        label = _size_label(index)
         name = descriptions.get(label, "Size group")
-        low = int(round(group[0]))
-        high = int(round(group[-1]))
+        low = int(round(group[0]["area"]))
+        high = int(round(group[-1]["area"]))
         parts.append({
             "ic": label,
             "des": f"{name} blobs, about {low:,}–{high:,} px",
             "qty": len(group),
         })
     return parts
+
+def _annotate_blobs(image, groups):
+    annotated = image.copy()
+    colors = {
+        "S": (0, 170, 0),
+        "M": (0, 165, 255),
+        "L": (255, 120, 0),
+        "XL": (40, 40, 220),
+    }
+    scale = max(image.shape[0], image.shape[1]) / 1200.0
+    thickness = max(2, int(round(scale * 2)))
+    font_scale = max(0.45, scale * 0.5)
+    for index, group in enumerate(groups):
+        label = _size_label(index)
+        color = colors.get(label, (255, 255, 255))
+        for blob in group:
+            x, y, width, height = blob["x"], blob["y"], blob["w"], blob["h"]
+            cv2.rectangle(annotated, (x, y), (x + width, y + height), color, thickness)
+            (text_width, text_height), baseline = cv2.getTextSize(
+                label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, max(1, thickness - 1)
+            )
+            chip_top = max(0, y - text_height - baseline - 6)
+            chip_bottom = chip_top + text_height + baseline + 6
+            cv2.rectangle(
+                annotated,
+                (x, chip_top),
+                (x + text_width + 8, chip_bottom),
+                color,
+                -1,
+            )
+            cv2.putText(
+                annotated,
+                label,
+                (x + 4, chip_bottom - baseline - 2),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale,
+                (255, 255, 255),
+                max(1, thickness - 1),
+                cv2.LINE_AA,
+            )
+    ok, buffer = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+    if not ok:
+        return None
+    encoded = base64.b64encode(buffer.tobytes()).decode("ascii")
+    return f"data:image/jpeg;base64,{encoded}"
 
 @app.post("/inspect/sample")
 def inspect_sample(name: str = DEFAULT_SAMPLE):
@@ -366,8 +424,8 @@ def inspect_sample(name: str = DEFAULT_SAMPLE):
             "parts": [],
         }
 
-    areas = _contour_areas(image)
-    groups = _group_by_size(areas)
+    blobs = _detected_blobs(image)
+    groups = _group_by_size(blobs)
     parts = _size_parts(groups)
     if not parts:
         return {
@@ -383,7 +441,8 @@ def inspect_sample(name: str = DEFAULT_SAMPLE):
         "message": f"Rough size groups from {path.name}",
         "kitCode": path.stem,
         "parts": parts,
-        "info": f"Info only: {len(areas)} blobs counted. Classical contour count, not a BoM check.",
+        "info": f"Info only: {len(blobs)} blobs counted. Classical contour count, not a BoM check.",
+        "image": _annotate_blobs(image, groups),
     }
 
 @app.post("/inspect")
