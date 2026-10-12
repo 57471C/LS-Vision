@@ -1,18 +1,20 @@
 {
-  "JOB-12345": {
-    "expectedKitCount": 4,
+  "1736719": {
+    "kitCode": "6PBBK001",
+    "expectedKitCount": 1,
     "parts": [
-      { "code": "M6x16", "qty": 8, "description": "M6x16 bolt" },
-      { "code": "M6x20", "qty": 4, "description": "M6x20 bolt" },
-      { "code": "M6-nut", "qty": 12, "description": "M6 nut" },
-      { "code": "M6-washer", "qty": 12, "description": "M6 washer" }
+      { "ic": "2BBMNM08", "qty": 18, "des": "M8 Nut Nyloc z" },
+      { "ic": "2BBMNM06", "qty": 4, "des": "M6 Nut Nyloc z" },
+      { "ic": "2BB08C2HZ", "qty": 18, "des": "M8x20 8.8 HexBolt z" },
+      { "ic": "2BB06B2SZ", "qty": 4, "des": "M6x16 8.8 SetScrew z" }
     ]
   },
   "JOB-67890": {
-    "expectedKitCount": 1,
+    "kitCode": "6PBBGR01",
+    "expectedKitCount": 2,
     "parts": [
-      { "code": "M8x25", "qty": 6, "description": "M8x25 bolt" },
-      { "code": "M8-nut", "qty": 6, "description": "M8 nut" }
+      { "ic": "2BBMNM08", "qty": 6, "des": "M8 Nut Nyloc z" },
+      { "ic": "2BB08C2HZ", "qty": 4, "des": "M8x20 8.8 HexBolt z" }
     ]
   }
 }
