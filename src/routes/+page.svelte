@@ -19,6 +19,11 @@ let barcode = "JOB-12345";
 let result: InspectView | null = null;
 let loading = false;
 let cameraIndex = 0;
+let feedOn = true;
+
+function toggleFeed() {
+	feedOn = !feedOn;
+}
 
 function errorMessage(err: unknown, fallback: string): string {
 	return err instanceof Error && err.message ? err.message : fallback;
@@ -134,11 +139,26 @@ async function decodeAndInspect() {
 					<option value={1}>1</option>
 				</select>
 			</label>
-			<img
-				src="http://127.0.0.1:8008/camera/stream?index={cameraIndex}"
-				alt="camera"
-				class="w-full max-w-xl border-4 border-neutral-950 bg-neutral-200"
-			/>
+			<div class="flex items-start gap-3">
+				<div class="min-w-0 max-w-xl flex-1">
+					{#if feedOn}
+						<img
+							src="http://127.0.0.1:8008/camera/stream?index={cameraIndex}"
+							alt="camera"
+							class="w-full border-4 border-neutral-950 bg-neutral-200"
+						/>
+					{:else}
+						<div class="aspect-video w-full border-4 border-neutral-950 bg-neutral-200"></div>
+					{/if}
+				</div>
+				<button
+					type="button"
+					class="shrink-0 border-2 border-neutral-950 bg-white px-4 py-3 text-base font-bold"
+					on:click={toggleFeed}
+				>
+					{feedOn ? "Stop feed" : "Start feed"}
+				</button>
+			</div>
 			<button
 				type="button"
 				class="w-fit border-4 border-neutral-950 bg-neutral-950 px-6 py-4 text-xl font-black text-white disabled:bg-neutral-400"
