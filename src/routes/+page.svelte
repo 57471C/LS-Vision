@@ -70,147 +70,107 @@ async function decodeAndInspect() {
 }
 </script>
 
-<div>
-  <button type="button" on:click={startSidecar}>Start Vision Sidecar</button>
+<div class="min-h-screen bg-neutral-100 text-neutral-950">
+	<div class="mx-auto flex max-w-3xl flex-col gap-6 p-6">
+		<div class="flex flex-wrap items-center justify-between gap-4">
+			<h1 class="text-2xl font-black tracking-tight">LS-Vision</h1>
+			<button
+				type="button"
+				class="border-2 border-neutral-950 bg-white px-4 py-3 text-base font-bold"
+				on:click={startSidecar}
+			>
+				Start Vision Sidecar
+			</button>
+		</div>
 
-  <div style="margin-top: 1rem;">
-    <label>
-      Barcode:
-      <input bind:value={barcode} />
-    </label>
-    <button type="button" on:click={runInspect} disabled={loading}>
-      {loading ? "Inspecting..." : "Inspect"}
-    </button>
-  </div>
+		<div class="flex flex-wrap items-end gap-3">
+			<label class="flex flex-col gap-1 text-sm font-bold uppercase tracking-wide">
+				Barcode
+				<input
+					class="w-64 border-2 border-neutral-950 bg-white px-3 py-3 text-lg font-semibold normal-case tracking-normal"
+					bind:value={barcode}
+				/>
+			</label>
+			<button
+				type="button"
+				class="border-2 border-neutral-950 bg-neutral-950 px-5 py-3 text-lg font-bold text-white disabled:bg-neutral-400"
+				on:click={runInspect}
+				disabled={loading}
+			>
+				{loading ? "Inspecting..." : "Inspect"}
+			</button>
+		</div>
 
-  <div style="margin-top: 1rem;">
-    <label>
-      Camera:
-      <select bind:value={cameraIndex}>
-        <option value={0}>0 (default)</option>
-        <option value={1}>1</option>
-      </select>
-    </label>
-    <br />
-    <img
-      src="http://127.0.0.1:8008/camera/stream?index={cameraIndex}"
-      alt="camera"
-      style="max-width: 480px; border: 1px solid #ccc; margin-top: 0.5rem;"
-    />
-    <br />
-    <button type="button" on:click={decodeAndInspect} disabled={loading}>Decode QR / Barcode</button>
-  </div>
+		<div class="flex flex-col gap-3">
+			<label class="flex flex-col gap-1 text-sm font-bold uppercase tracking-wide">
+				Camera
+				<select
+					class="w-48 border-2 border-neutral-950 bg-white px-3 py-3 text-lg font-semibold normal-case tracking-normal"
+					bind:value={cameraIndex}
+				>
+					<option value={0}>0 (default)</option>
+					<option value={1}>1</option>
+				</select>
+			</label>
+			<img
+				src="http://127.0.0.1:8008/camera/stream?index={cameraIndex}"
+				alt="camera"
+				class="w-full max-w-xl border-4 border-neutral-950 bg-neutral-200"
+			/>
+			<button
+				type="button"
+				class="w-fit border-4 border-neutral-950 bg-neutral-950 px-6 py-4 text-xl font-black text-white disabled:bg-neutral-400"
+				on:click={decodeAndInspect}
+				disabled={loading}
+			>
+				Decode QR / Barcode
+			</button>
+		</div>
 
-  {#if result}
-    <section class="panel" class:pass={result.status === "pass"} class:fail={result.status !== "pass"}>
-      <p class="status">{result.status}</p>
-      {#if result.kitCode}
-        <p class="kit">Kit {result.kitCode}</p>
-      {/if}
-      {#if result.message}
-        <p class="message">{result.message}</p>
-      {/if}
-      {#if result.parts?.length}
-        <table>
-          <thead>
-            <tr>
-              <th>IC</th>
-              <th>Description</th>
-              <th>Qty</th>
-            </tr>
-          </thead>
-          <tbody>
-            {#each result.parts as part, i (i)}
-              <tr>
-                <td>{part.ic}</td>
-                <td>{part.des}</td>
-                <td>{part.qty}</td>
-              </tr>
-            {/each}
-          </tbody>
-        </table>
-      {/if}
-      {#if result.kitsFound != null || result.expectedKitCount != null}
-        <p class="info">
-          Info only: {result.kitsFound ?? "—"} kit(s) found, {result.expectedKitCount ?? "—"} expected
-        </p>
-      {/if}
-    </section>
-  {/if}
+		{#if result}
+			<section class="overflow-hidden border-4 border-neutral-950 bg-white">
+				<p
+					class="px-5 py-6 text-6xl font-black uppercase leading-none tracking-wide text-white {result.status ===
+					'pass'
+						? 'bg-green-700'
+						: 'bg-red-700'}"
+				>
+					{result.status}
+				</p>
+				<div class="flex flex-col gap-3 p-5">
+					{#if result.kitCode}
+						<p class="text-3xl font-black tracking-tight">Kit {result.kitCode}</p>
+					{/if}
+					{#if result.message}
+						<p class="text-lg">{result.message}</p>
+					{/if}
+					{#if result.parts?.length}
+						<table class="w-full border-collapse text-left text-lg">
+							<thead>
+								<tr class="border-b-2 border-neutral-950 text-sm uppercase tracking-wide">
+									<th class="py-2 pr-3 font-bold">IC</th>
+									<th class="py-2 pr-3 font-bold">Description</th>
+									<th class="py-2 text-right font-bold">Qty</th>
+								</tr>
+							</thead>
+							<tbody>
+								{#each result.parts as part, i (i)}
+									<tr class="border-b border-neutral-300">
+										<td class="py-2 pr-3 font-mono font-semibold">{part.ic}</td>
+										<td class="py-2 pr-3">{part.des}</td>
+										<td class="py-2 text-right font-bold">{part.qty}</td>
+									</tr>
+								{/each}
+							</tbody>
+						</table>
+					{/if}
+					{#if result.kitsFound != null || result.expectedKitCount != null}
+						<p class="text-sm text-neutral-600">
+							Info only: {result.kitsFound ?? "—"} kit(s) found, {result.expectedKitCount ?? "—"} expected
+						</p>
+					{/if}
+				</div>
+			</section>
+		{/if}
+	</div>
 </div>
-
-<style>
-  .panel {
-    margin-top: 1rem;
-    padding: 1rem;
-    border: 3px solid #ccc;
-    max-width: 36rem;
-  }
-
-  .panel.pass {
-    border-color: #1b7f3a;
-    background: #e8f6ec;
-  }
-
-  .panel.fail {
-    border-color: #b42318;
-    background: #fdecea;
-  }
-
-  .status {
-    margin: 0;
-    font-size: 3rem;
-    font-weight: 800;
-    line-height: 1;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
-  }
-
-  .panel.pass .status {
-    color: #1b7f3a;
-  }
-
-  .panel.fail .status {
-    color: #b42318;
-  }
-
-  .kit {
-    margin: 0.75rem 0 0;
-    font-size: 1.25rem;
-    font-weight: 700;
-  }
-
-  .message {
-    margin: 0.5rem 0 0;
-  }
-
-  table {
-    width: 100%;
-    margin-top: 0.75rem;
-    border-collapse: collapse;
-  }
-
-  th,
-  td {
-    padding: 0.35rem 0.5rem;
-    text-align: left;
-    border-bottom: 1px solid rgba(0, 0, 0, 0.12);
-  }
-
-  th {
-    font-size: 0.8rem;
-    text-transform: uppercase;
-    letter-spacing: 0.03em;
-  }
-
-  td:last-child,
-  th:last-child {
-    text-align: right;
-  }
-
-  .info {
-    margin: 0.75rem 0 0;
-    color: #444;
-    font-size: 0.95rem;
-  }
-</style>
