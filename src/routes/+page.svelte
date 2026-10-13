@@ -1,6 +1,7 @@
 <script lang="ts">
 // biome-ignore-all lint/correctness/noUnusedVariables: Biome 2.4 does not treat Svelte template references as uses
 import { invoke } from "@tauri-apps/api/core";
+import { onDestroy, onMount } from "svelte";
 
 type Part = { ic: string; des: string; qty: number };
 type InspectView = {
@@ -15,15 +16,112 @@ type InspectView = {
 	image?: string;
 };
 
+type WatchBody = InspectView & {
+	snapshot?: boolean;
+	barcode?: string;
+	image?: string;
+};
+
+type SnapshotView = {
+	kitCode: string;
+	image: string;
+	takenAt: string;
+};
+
+const WATCH_MS = 12000;
+
 let barcode = "JOB-12345";
 let result: InspectView | null = null;
 let loading = false;
 let cameraIndex = 0;
 let feedOn = true;
+let snapshot: SnapshotView | null = null;
+let watchTimer: ReturnType<typeof setInterval> | null = null;
+let watchInFlight = false;
+let pageAlive = true;
+
+function stopWatch() {
+	if (watchTimer !== null) {
+		clearInterval(watchTimer);
+		watchTimer = null;
+	}
+}
+
+function startWatch() {
+	stopWatch();
+	void watchFeed();
+	watchTimer = setInterval(() => {
+		void watchFeed();
+	}, WATCH_MS);
+}
 
 function toggleFeed() {
 	feedOn = !feedOn;
+	if (feedOn) startWatch();
+	else stopWatch();
 }
+
+function inspectView(body: WatchBody): InspectView {
+	return {
+		status: body.status,
+		message: body.message,
+		kitCode: body.kitCode,
+		des: body.des,
+		parts: body.parts,
+		kitsFound: body.kitsFound,
+		expectedKitCount: body.expectedKitCount,
+		info: body.info,
+	};
+}
+
+function showSnapshot(body: WatchBody) {
+	if (!body.image) return;
+	const kitCode = body.kitCode || body.barcode || barcode;
+	barcode = kitCode;
+	snapshot = {
+		kitCode,
+		image: body.image,
+		takenAt: new Date().toLocaleTimeString(),
+	};
+	result = inspectView(body);
+}
+
+async function watchFeed() {
+	if (!feedOn || watchInFlight || loading) return;
+	watchInFlight = true;
+	const index = cameraIndex;
+	try {
+		const res = await fetch(
+			`http://127.0.0.1:8008/camera/snapshot?index=${index}`,
+		);
+		if (!res.ok) return;
+		const body = (await res.json()) as WatchBody;
+		if (
+			!pageAlive ||
+			loading ||
+			!feedOn ||
+			index !== cameraIndex ||
+			!body.snapshot ||
+			!body.image
+		) {
+			return;
+		}
+		showSnapshot(body);
+	} catch {
+		// A missed poll leaves the last still and the last BoM result.
+	} finally {
+		watchInFlight = false;
+	}
+}
+
+onMount(() => {
+	if (feedOn) startWatch();
+});
+
+onDestroy(() => {
+	pageAlive = false;
+	stopWatch();
+});
 
 function errorMessage(err: unknown, fallback: string): string {
 	return err instanceof Error && err.message ? err.message : fallback;
@@ -76,29 +174,39 @@ async function testSampleImage() {
 }
 
 async function decodeAndInspect() {
+	loading = true;
 	try {
 		const res = await fetch(
-			`http://127.0.0.1:8008/camera/decode?index=${cameraIndex}`,
+			`http://127.0.0.1:8008/camera/snapshot?index=${cameraIndex}`,
 		);
-		const decoded = await res.json();
-
-		if (decoded.status === "pass" && decoded.codes?.length) {
-			barcode = decoded.codes[0].data;
-			await runInspect();
-		} else {
+		const body = (await res.json()) as WatchBody;
+		if (!res.ok) throw new Error(body.message || "Decode failed");
+		if (body.snapshot && body.image) {
+			showSnapshot(body);
+			return;
+		}
+		if (body.barcode) {
+			barcode = body.barcode;
 			result = {
 				status: "fail",
-				message: decoded.message || "No code detected",
+				message: body.message || "Barcode not found in BoM",
 			};
+			return;
 		}
+		result = {
+			status: "fail",
+			message: body.message || "No code detected",
+		};
 	} catch (err: unknown) {
 		result = { status: "fail", message: errorMessage(err, "Decode failed") };
+	} finally {
+		loading = false;
 	}
 }
 </script>
 
 <div class="min-h-screen bg-neutral-100 text-neutral-950">
-	<div class="mx-auto flex max-w-3xl flex-col gap-6 p-6">
+	<div class="mx-auto flex max-w-6xl flex-col gap-6 p-6">
 		<div class="flex flex-wrap items-center justify-between gap-4">
 			<h1 class="text-2xl font-black tracking-tight">LS-Vision</h1>
 			<div class="flex items-center gap-3">
@@ -181,6 +289,9 @@ async function decodeAndInspect() {
 					{feedOn ? "Stop feed" : "Start feed"}
 				</button>
 			</div>
+			<p class="text-sm font-semibold text-neutral-600">
+				{feedOn ? "Watching the feed every 12s." : "Auto snapshot is paused."}
+			</p>
 			<button
 				type="button"
 				class="w-fit border-4 border-neutral-950 bg-neutral-950 px-6 py-4 text-xl font-black text-white disabled:bg-neutral-400"
@@ -199,63 +310,92 @@ async function decodeAndInspect() {
 			</button>
 		</div>
 
-		{#if result}
-			<section class="overflow-hidden border-4 border-neutral-950 bg-white">
+		<div class="grid items-start gap-4 lg:grid-cols-[minmax(0,1fr)_22rem]">
+			<div class="min-w-0">
+				{#if result}
+					<section class="overflow-hidden border-4 border-neutral-950 bg-white">
+						<p
+							class="px-5 py-6 text-6xl font-black uppercase leading-none tracking-wide text-white {result.status ===
+							'pass'
+								? 'bg-green-700'
+								: 'bg-red-700'}"
+						>
+							{result.status}
+						</p>
+						<div class="flex flex-col gap-3 p-5">
+							{#if result.kitCode}
+								<p class="text-3xl font-black tracking-tight">Kit {result.kitCode}</p>
+							{/if}
+							{#if result.des}
+								<p class="text-lg text-neutral-700">{result.des}</p>
+							{/if}
+							{#if result.message}
+								<p class="text-lg">{result.message}</p>
+							{/if}
+							{#if result.parts?.length}
+								<table class="w-full border-collapse text-left text-lg">
+									<thead>
+										<tr class="border-b-2 border-neutral-950 text-sm uppercase tracking-wide">
+											<th class="py-2 pr-3 font-bold">IC</th>
+											<th class="py-2 pr-3 font-bold">Description</th>
+											<th class="py-2 text-right font-bold">Qty</th>
+										</tr>
+									</thead>
+									<tbody>
+										{#each result.parts as part, i (i)}
+											<tr class="border-b border-neutral-300">
+												<td class="py-2 pr-3 font-mono font-semibold">{part.ic}</td>
+												<td class="py-2 pr-3">{part.des}</td>
+												<td class="py-2 text-right font-bold">{part.qty}</td>
+											</tr>
+										{/each}
+									</tbody>
+								</table>
+							{/if}
+							{#if result.image}
+								<img
+									src={result.image}
+									alt="Annotated sample"
+									class="w-full border-4 border-neutral-950 bg-neutral-200"
+								/>
+							{/if}
+							{#if result.info}
+								<p class="text-sm text-neutral-600">{result.info}</p>
+							{/if}
+							{#if result.kitsFound != null || result.expectedKitCount != null}
+								<p class="text-sm text-neutral-600">
+									Info only: {result.kitsFound ?? "—"} kit(s) found, {result.expectedKitCount ??
+										"—"} expected
+								</p>
+							{/if}
+						</div>
+					</section>
+				{/if}
+			</div>
+			<aside class="min-w-0 border-4 border-neutral-950 bg-white">
 				<p
-					class="px-5 py-6 text-6xl font-black uppercase leading-none tracking-wide text-white {result.status ===
-					'pass'
-						? 'bg-green-700'
-						: 'bg-red-700'}"
+					class="px-4 py-4 text-3xl font-black uppercase leading-none tracking-wide {snapshot
+						? 'bg-neutral-950 text-white'
+						: 'bg-neutral-200 text-neutral-950'}"
 				>
-					{result.status}
+					{snapshot ? "Snapshot taken" : "No snapshot"}
 				</p>
-				<div class="flex flex-col gap-3 p-5">
-					{#if result.kitCode}
-						<p class="text-3xl font-black tracking-tight">Kit {result.kitCode}</p>
-					{/if}
-					{#if result.des}
-  <p class="text-lg text-neutral-700">{result.des}</p>
-{/if}
-					{#if result.message}
-						<p class="text-lg">{result.message}</p>
-					{/if}
-					{#if result.parts?.length}
-						<table class="w-full border-collapse text-left text-lg">
-							<thead>
-								<tr class="border-b-2 border-neutral-950 text-sm uppercase tracking-wide">
-									<th class="py-2 pr-3 font-bold">IC</th>
-									<th class="py-2 pr-3 font-bold">Description</th>
-									<th class="py-2 text-right font-bold">Qty</th>
-								</tr>
-							</thead>
-							<tbody>
-								{#each result.parts as part, i (i)}
-									<tr class="border-b border-neutral-300">
-										<td class="py-2 pr-3 font-mono font-semibold">{part.ic}</td>
-										<td class="py-2 pr-3">{part.des}</td>
-										<td class="py-2 text-right font-bold">{part.qty}</td>
-									</tr>
-								{/each}
-							</tbody>
-						</table>
-					{/if}
-					{#if result.image}
+				<div class="flex flex-col gap-3 p-4">
+					{#if snapshot}
+						<p class="text-3xl font-black tracking-tight">Kit {snapshot.kitCode}</p>
+						<p class="text-sm text-neutral-600">Taken {snapshot.takenAt}</p>
 						<img
-							src={result.image}
-							alt="Annotated sample"
+							src={snapshot.image}
+							alt="Snapshot of kit {snapshot.kitCode}"
 							class="w-full border-4 border-neutral-950 bg-neutral-200"
 						/>
-					{/if}
-					{#if result.info}
-						<p class="text-sm text-neutral-600">{result.info}</p>
-					{/if}
-					{#if result.kitsFound != null || result.expectedKitCount != null}
-						<p class="text-sm text-neutral-600">
-							Info only: {result.kitsFound ?? "—"} kit(s) found, {result.expectedKitCount ?? "—"} expected
+					{:else}
+						<p class="text-lg text-neutral-700">
+							A still is saved when the camera reads a barcode that is in the BoM.
 						</p>
 					{/if}
 				</div>
-			</section>
-		{/if}
+			</aside>
+		</div>
 	</div>
 </div>
