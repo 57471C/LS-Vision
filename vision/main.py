@@ -257,6 +257,10 @@ def mssql_connection_string(mssql):
         _odbc_pair("SERVER", server),
         _odbc_pair("DATABASE", database),
     ]
+    # Driver 18 encrypts by default and rejects an untrusted certificate unless
+    # Encrypt is set explicitly. optional matches a server that is not forcing TLS.
+    parts.append("Encrypt=optional")
+    parts.append("TrustServerCertificate=yes")
     if auth == "sql":
         parts.append(_odbc_pair("UID", user))
         parts.append(_odbc_pair("PWD", password))
@@ -275,8 +279,14 @@ def _connect_mssql(mssql):
         import pyodbc
     except ImportError as exc:
         raise RuntimeError("pyodbc is not installed. SQL Server lookup is unavailable.") from exc
+    # Set before the handshake. The string keyword is ignored when Encrypt is Strict.
+    # 1223 is SQL_COPT_SS_ENCRYPT (0 = off/optional). 1228 trusts the server certificate.
     try:
-        connection = pyodbc.connect(connection_string, timeout=5)
+        connection = pyodbc.connect(
+            connection_string,
+            timeout=5,
+            attrs_before={1223: 0, 1228: 1},
+        )
     except Exception as exc:
         message = _scrub_secret(str(exc), mssql.get("password") or "")
         raise RuntimeError(f"Could not query MSSQL: {message}") from None
