@@ -164,7 +164,7 @@ onMount(() => {
 					<label class="flex items-center gap-3 text-lg font-semibold">
 						<input type="radio" name="bom-source" value="mssql" bind:group={source} />
 						MSSQL
-						<span class="text-base font-normal text-neutral-600">not connected yet</span>
+						<span class="text-base font-normal text-neutral-600">vision/bom_queries.sql</span>
 					</label>
 				</fieldset>
 
@@ -240,7 +240,7 @@ onMount(() => {
 								required={auth === "sql"}
 							/>
 						</label>
-						<p class="text-sm text-neutral-600">MSSQL lookup is not implemented yet.</p>
+						<p class="text-sm text-neutral-600">Inspect runs the queries in vision/bom_queries.sql.</p>
 					</div>
 				{/if}
 
