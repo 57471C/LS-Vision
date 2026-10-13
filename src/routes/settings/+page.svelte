@@ -119,151 +119,181 @@ onMount(() => {
 });
 </script>
 
-<div class="min-h-screen bg-neutral-100 text-neutral-950">
-	<div class="mx-auto flex max-w-xl flex-col gap-6 p-6">
-		<div class="flex items-center justify-between gap-4">
-			<h1 class="text-2xl font-black tracking-tight">Settings</h1>
-			<a href="/" class="border-2 border-neutral-950 bg-white px-4 py-3 text-base font-bold">Operator</a>
+<div class="flex h-dvh max-h-dvh flex-col overflow-hidden overscroll-none bg-neutral-950 text-neutral-100">
+	<header class="flex shrink-0 items-center justify-between gap-3 border-b border-neutral-800 bg-neutral-900 px-4 py-2">
+		<div class="flex items-baseline gap-3">
+			<h1 class="text-lg font-semibold tracking-tight">Settings</h1>
+			<p class="text-xs font-medium uppercase tracking-widest text-neutral-500">Admin</p>
 		</div>
+		<a
+			href="/"
+			class="inline-flex min-h-11 items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100"
+		>
+			Operator
+		</a>
+	</header>
 
-		{#if !unlocked}
-			<section class="flex flex-col gap-3 border-4 border-neutral-950 bg-white p-5">
-				<label class="flex flex-col gap-1 text-sm font-bold uppercase tracking-wide">
-					Password
-					<input
-						type="password"
-						autocomplete="off"
-						class="border-2 border-neutral-950 bg-white px-3 py-3 text-lg font-semibold normal-case tracking-normal"
-						bind:value={password}
-						on:keydown={(event) => event.key === "Enter" && unlock()}
-					/>
-				</label>
-				<button
-					type="button"
-					class="w-fit border-2 border-neutral-950 bg-neutral-950 px-5 py-3 text-lg font-bold text-white"
-					on:click={unlock}
-				>
-					Unlock
-				</button>
-				{#if gateMessage}
-					<p class="text-lg font-bold text-red-700">{gateMessage}</p>
-				{/if}
-			</section>
-		{:else}
-			<form
-				class="flex flex-col gap-4 border-4 border-neutral-950 bg-white p-5"
-				on:submit|preventDefault={saveSource}
-			>
-				<fieldset class="flex flex-col gap-3">
-					<legend class="text-sm font-bold uppercase tracking-wide">BoM source</legend>
-					<label class="flex items-center gap-3 text-lg font-semibold">
-						<input type="radio" name="bom-source" value="json" bind:group={source} />
-						JSON file
-						<span class="text-base font-normal text-neutral-600">vision/sample-bom.json</span>
+	<main class="min-h-0 flex-1 overflow-y-auto">
+		<div class="mx-auto flex max-w-2xl flex-col gap-4 p-4">
+			{#if !unlocked}
+				<section class="flex flex-col gap-3 border border-neutral-700 bg-neutral-900 p-4">
+					<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+						Password
+						<input
+							type="password"
+							autocomplete="off"
+							class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
+							bind:value={password}
+							on:keydown={(event) => event.key === "Enter" && unlock()}
+						/>
 					</label>
-					<label class="flex items-center gap-3 text-lg font-semibold">
-						<input type="radio" name="bom-source" value="mssql" bind:group={source} />
-						MSSQL
-						<span class="text-base font-normal text-neutral-600">vision/bom_queries.sql</span>
-					</label>
-				</fieldset>
-
-				{#if source === "mssql"}
-					<div class="flex flex-col gap-3">
-						<fieldset class="flex flex-col gap-2">
-							<legend class="text-sm font-bold uppercase tracking-wide">Authentication</legend>
-							<label class="flex items-center gap-3 text-lg font-semibold">
-								<input
-									type="radio"
-									name="mssql-auth"
-									value="windows"
-									bind:group={auth}
-									on:change={onAuthChange}
-								/>
-								Windows Authentication
-							</label>
-							<label class="flex items-center gap-3 text-lg font-semibold">
-								<input
-									type="radio"
-									name="mssql-auth"
-									value="sql"
-									bind:group={auth}
-									on:change={onAuthChange}
-								/>
-								SQL Server Authentication
-							</label>
-						</fieldset>
-						<label class="flex flex-col gap-1 text-sm font-bold uppercase tracking-wide">
-							Server
-							<input
-								class="border-2 border-neutral-950 px-3 py-3 text-lg font-semibold normal-case tracking-normal"
-								bind:value={mssql.server}
-								autocomplete="off"
-							/>
-						</label>
-						<label class="flex flex-col gap-1 text-sm font-bold uppercase tracking-wide">
-							Database
-							<input
-								class="border-2 border-neutral-950 px-3 py-3 text-lg font-semibold normal-case tracking-normal"
-								bind:value={mssql.database}
-								autocomplete="off"
-							/>
-						</label>
-						<label class="flex flex-col gap-1 text-sm font-bold uppercase tracking-wide">
-							<span>
-								Username
-								{#if auth === "sql"}
-									<span class="font-normal normal-case text-red-700">Required</span>
-								{/if}
-							</span>
-							<input
-								class="border-2 border-neutral-950 px-3 py-3 text-lg font-semibold normal-case tracking-normal disabled:bg-neutral-200"
-								bind:value={mssql.user}
-								autocomplete="off"
-								disabled={auth === "windows"}
-								required={auth === "sql"}
-							/>
-						</label>
-						<label class="flex flex-col gap-1 text-sm font-bold uppercase tracking-wide">
-							<span>
-								Password
-								{#if auth === "sql"}
-									<span class="font-normal normal-case text-red-700">Required</span>
-								{/if}
-							</span>
-							<input
-								type="password"
-								class="border-2 border-neutral-950 px-3 py-3 text-lg font-semibold normal-case tracking-normal disabled:bg-neutral-200"
-								bind:value={mssqlPassword}
-								autocomplete="new-password"
-								disabled={auth === "windows"}
-								required={auth === "sql"}
-							/>
-						</label>
-						<p class="text-sm text-neutral-600">Inspect runs the queries in vision/bom_queries.sql.</p>
-					</div>
-				{/if}
-
-				<div class="flex flex-wrap items-center gap-3">
-					<button
-						type="submit"
-						class="border-2 border-neutral-950 bg-neutral-950 px-5 py-3 text-lg font-bold text-white disabled:bg-neutral-400"
-						disabled={saving}
-					>
-						{saving ? "Saving..." : "Save"}
-					</button>
 					<button
 						type="button"
-						class="border-2 border-neutral-950 bg-white px-4 py-3 text-base font-bold"
-						on:click={lock}
+						class="inline-flex min-h-11 w-fit items-center border border-blue-500 bg-blue-600 px-4 text-sm font-semibold text-white"
+						on:click={unlock}
 					>
-						Lock
+						Unlock
 					</button>
-				</div>
-				{#if notice}
-					<p class="text-lg">{notice}</p>
-				{/if}
-			</form>
-		{/if}
-	</div>
+					{#if gateMessage}
+						<p class="text-sm font-semibold text-red-400">{gateMessage}</p>
+					{/if}
+				</section>
+			{:else}
+				<form
+					class="flex flex-col gap-4 border border-neutral-700 bg-neutral-900 p-4"
+					on:submit|preventDefault={saveSource}
+				>
+					<fieldset class="flex flex-col gap-3">
+						<legend class="text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+							BoM source
+						</legend>
+						<label class="flex items-center gap-3 text-base font-medium">
+							<input
+								class="h-4 w-4 accent-blue-500"
+								type="radio"
+								name="bom-source"
+								value="json"
+								bind:group={source}
+							/>
+							JSON file
+							<span class="text-sm font-normal text-neutral-400">vision/sample-bom.json</span>
+						</label>
+						<label class="flex items-center gap-3 text-base font-medium">
+							<input
+								class="h-4 w-4 accent-blue-500"
+								type="radio"
+								name="bom-source"
+								value="mssql"
+								bind:group={source}
+							/>
+							MSSQL
+							<span class="text-sm font-normal text-neutral-400">vision/bom_queries.sql</span>
+						</label>
+					</fieldset>
+
+					{#if source === "mssql"}
+						<div class="flex flex-col gap-3 border-t border-neutral-800 pt-4">
+							<fieldset class="flex flex-col gap-2">
+								<legend class="text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+									Authentication
+								</legend>
+								<label class="flex items-center gap-3 text-base font-medium">
+									<input
+										class="h-4 w-4 accent-blue-500"
+										type="radio"
+										name="mssql-auth"
+										value="windows"
+										bind:group={auth}
+										on:change={onAuthChange}
+									/>
+									Windows Authentication
+								</label>
+								<label class="flex items-center gap-3 text-base font-medium">
+									<input
+										class="h-4 w-4 accent-blue-500"
+										type="radio"
+										name="mssql-auth"
+										value="sql"
+										bind:group={auth}
+										on:change={onAuthChange}
+									/>
+									SQL Server Authentication
+								</label>
+							</fieldset>
+							<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+								Server
+								<input
+									class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
+									bind:value={mssql.server}
+									autocomplete="off"
+								/>
+							</label>
+							<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+								Database
+								<input
+									class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
+									bind:value={mssql.database}
+									autocomplete="off"
+								/>
+							</label>
+							<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+								<span>
+									Username
+									{#if auth === "sql"}
+										<span class="font-normal normal-case tracking-normal text-red-400">Required</span>
+									{/if}
+								</span>
+								<input
+									class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100 disabled:bg-neutral-800 disabled:text-neutral-500"
+									bind:value={mssql.user}
+									autocomplete="off"
+									disabled={auth === "windows"}
+									required={auth === "sql"}
+								/>
+							</label>
+							<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+								<span>
+									Password
+									{#if auth === "sql"}
+										<span class="font-normal normal-case tracking-normal text-red-400">Required</span>
+									{/if}
+								</span>
+								<input
+									type="password"
+									class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100 disabled:bg-neutral-800 disabled:text-neutral-500"
+									bind:value={mssqlPassword}
+									autocomplete="new-password"
+									disabled={auth === "windows"}
+									required={auth === "sql"}
+								/>
+							</label>
+							<p class="text-sm text-neutral-400">
+								Inspect runs the queries in vision/bom_queries.sql.
+							</p>
+						</div>
+					{/if}
+
+					<div class="flex flex-wrap items-center gap-2">
+						<button
+							type="submit"
+							class="inline-flex min-h-11 items-center border border-blue-500 bg-blue-600 px-4 text-sm font-semibold text-white disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
+							disabled={saving}
+						>
+							{saving ? "Saving..." : "Save"}
+						</button>
+						<button
+							type="button"
+							class="inline-flex min-h-11 items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100"
+							on:click={lock}
+						>
+							Lock
+						</button>
+					</div>
+					{#if notice}
+						<p class="text-sm text-neutral-200">{notice}</p>
+					{/if}
+				</form>
+			{/if}
+		</div>
+	</main>
 </div>

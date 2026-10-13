@@ -28,7 +28,7 @@ type SnapshotView = {
 	takenAt: string;
 };
 
-const WATCH_MS = 8000;
+const STREAM_MS = 8000;
 
 let barcode = "JOB-12345";
 let result: InspectView | null = null;
@@ -36,24 +36,34 @@ let loading = false;
 let cameraIndex = 0;
 let feedOn = true;
 let snapshot: SnapshotView | null = null;
-let watchTimer: ReturnType<typeof setInterval> | null = null;
+let streamLeft = STREAM_MS / 1000;
+let streamTimer: ReturnType<typeof setInterval> | null = null;
 let watchInFlight = false;
 let pageAlive = true;
+let sidecarUp = false;
+let healthTimer: ReturnType<typeof setInterval> | null = null;
 
 function stopWatch() {
-	if (watchTimer !== null) {
-		clearInterval(watchTimer);
-		watchTimer = null;
+	if (streamTimer !== null) {
+		clearInterval(streamTimer);
+		streamTimer = null;
 	}
 }
 
 function startWatch() {
 	if (snapshot) return;
 	stopWatch();
+	streamLeft = STREAM_MS / 1000;
 	void watchFeed();
-	watchTimer = setInterval(() => {
-		void watchFeed();
-	}, WATCH_MS);
+	streamTimer = setInterval(() => {
+		if (!feedOn || snapshot) return;
+		if (streamLeft <= 1) {
+			streamLeft = STREAM_MS / 1000;
+			void watchFeed();
+		} else {
+			streamLeft -= 1;
+		}
+	}, 1000);
 }
 
 function toggleFeed() {
@@ -122,13 +132,31 @@ async function watchFeed() {
 	}
 }
 
+async function checkSidecar() {
+	if (!pageAlive) return;
+	try {
+		const res = await fetch("http://127.0.0.1:8008/health");
+		sidecarUp = res.ok;
+	} catch {
+		sidecarUp = false;
+	}
+}
+
 onMount(() => {
+	void checkSidecar();
+	healthTimer = setInterval(() => {
+		void checkSidecar();
+	}, 3000);
 	if (feedOn) startWatch();
 });
 
 onDestroy(() => {
 	pageAlive = false;
 	stopWatch();
+	if (healthTimer !== null) {
+		clearInterval(healthTimer);
+		healthTimer = null;
+	}
 });
 
 function errorMessage(err: unknown, fallback: string): string {
@@ -142,9 +170,14 @@ async function startSidecar() {
 	} catch (err) {
 		console.error(err);
 	}
+	void checkSidecar();
+	setTimeout(() => {
+		void checkSidecar();
+	}, 1500);
 }
 
 async function runInspect() {
+	if (loading) return;
 	loading = true;
 	result = null;
 	try {
@@ -213,34 +246,34 @@ async function decodeAndInspect() {
 }
 </script>
 
-<div class="flex min-h-screen flex-col bg-slate-950 text-slate-100">
-	<header class="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 bg-slate-900 px-4 py-2">
+<div class="flex h-dvh max-h-dvh flex-col overflow-hidden overscroll-none bg-neutral-950 text-neutral-100">
+	<header class="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-neutral-800 bg-neutral-900 px-4 py-2">
 		<div class="flex items-baseline gap-3">
 			<h1 class="text-lg font-semibold tracking-tight">LS-Vision</h1>
-			<p class="text-xs font-medium uppercase tracking-widest text-slate-500">Operator</p>
+			<p class="text-xs font-medium uppercase tracking-widest text-neutral-500">Operator</p>
 		</div>
 		<div class="flex flex-wrap items-center gap-2">
 			<p
 				class="inline-flex min-h-9 items-center gap-2 border px-2.5 text-xs font-semibold uppercase tracking-wide {snapshot
 					? 'border-amber-700/80 bg-amber-950 text-amber-200'
 					: feedOn
-						? 'border-slate-600 bg-slate-800 text-slate-100'
-						: 'border-slate-700 bg-slate-900 text-slate-400'}"
+						? 'border-neutral-600 bg-neutral-800 text-neutral-100'
+						: 'border-neutral-700 bg-neutral-900 text-neutral-400'}"
 			>
 				<span
 					class="h-2 w-2 shrink-0 {snapshot
 						? 'bg-amber-400'
 						: feedOn
 							? 'bg-green-400'
-							: 'bg-slate-500'}"
+							: 'bg-neutral-500'}"
 					aria-hidden="true"
 				></span>
-				{snapshot ? "Watch stopped" : feedOn ? "Watching · 8s" : "Watch paused"}
+				{snapshot ? "Stream stopped" : feedOn ? `Streaming · ${streamLeft}s` : "Stream paused"}
 			</p>
 			<a
 				href="/settings"
 				aria-label="Settings"
-				class="inline-flex h-11 w-11 items-center justify-center border border-slate-600 bg-slate-800 text-slate-100"
+				class="inline-flex h-11 w-11 items-center justify-center border border-neutral-600 bg-neutral-800 text-neutral-100"
 			>
 				<svg
 					xmlns="http://www.w3.org/2000/svg"
@@ -259,7 +292,9 @@ async function decodeAndInspect() {
 			</a>
 			<button
 				type="button"
-				class="inline-flex min-h-11 items-center border border-slate-600 bg-slate-800 px-3 text-sm font-semibold text-slate-100"
+				class="inline-flex min-h-11 items-center border px-3 text-sm font-semibold text-white {sidecarUp
+					? 'border-green-700 bg-green-600'
+					: 'border-red-800 bg-red-600'}"
 				on:click={startSidecar}
 			>
 				Start Vision Sidecar
@@ -267,18 +302,21 @@ async function decodeAndInspect() {
 		</div>
 	</header>
 
-	<div class="flex flex-wrap items-end gap-2 border-b border-slate-800 bg-slate-900 px-4 py-2">
-		<label class="flex min-w-56 flex-1 flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-slate-400">
+	<form
+		class="flex shrink-0 flex-wrap items-end gap-2 border-b border-neutral-800 bg-neutral-900 px-4 py-2"
+		on:submit|preventDefault={runInspect}
+	>
+		<label class="flex min-w-56 flex-1 flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
 			Barcode
 			<input
-				class="w-full border border-slate-600 bg-slate-950 px-3 py-2 font-mono text-lg font-medium normal-case tracking-normal text-slate-100"
+				class="w-full border border-neutral-600 bg-neutral-950 px-3 py-2 font-mono text-lg font-medium normal-case tracking-normal text-neutral-100"
 				bind:value={barcode}
 			/>
 		</label>
-		<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-slate-400">
+		<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
 			Camera
 			<select
-				class="min-h-11 border border-slate-600 bg-slate-950 px-3 font-mono text-base normal-case tracking-normal text-slate-100"
+				class="min-h-11 border border-neutral-600 bg-neutral-950 px-3 font-mono text-base normal-case tracking-normal text-neutral-100"
 				bind:value={cameraIndex}
 			>
 				<option value={0}>0</option>
@@ -287,15 +325,7 @@ async function decodeAndInspect() {
 		</label>
 		<button
 			type="button"
-			class="inline-flex min-h-11 items-center border border-slate-200 bg-slate-100 px-4 text-sm font-semibold text-slate-950 disabled:border-slate-700 disabled:bg-slate-800 disabled:text-slate-500"
-			on:click={runInspect}
-			disabled={loading}
-		>
-			{loading ? "Inspecting..." : "Inspect"}
-		</button>
-		<button
-			type="button"
-			class="inline-flex min-h-11 items-center border border-slate-200 bg-slate-100 px-4 text-sm font-semibold text-slate-950 disabled:border-slate-700 disabled:bg-slate-800 disabled:text-slate-500"
+			class="inline-flex min-h-11 items-center border border-blue-500 bg-blue-600 px-4 text-sm font-semibold text-white disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
 			on:click={decodeAndInspect}
 			disabled={loading}
 		>
@@ -303,7 +333,7 @@ async function decodeAndInspect() {
 		</button>
 		<button
 			type="button"
-			class="inline-flex min-h-11 items-center border border-slate-600 bg-slate-800 px-4 text-sm font-semibold text-slate-100 disabled:text-slate-500"
+			class="inline-flex min-h-11 items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100 disabled:text-neutral-500"
 			on:click={testSampleImage}
 			disabled={loading}
 		>
@@ -311,86 +341,82 @@ async function decodeAndInspect() {
 		</button>
 		<button
 			type="button"
-			class="inline-flex min-h-11 items-center border border-slate-600 bg-slate-800 px-4 text-sm font-semibold text-slate-100"
+			class="inline-flex min-h-11 items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100"
 			on:click={toggleFeed}
 		>
 			{feedOn ? "Stop feed" : "Start feed"}
 		</button>
-	</div>
+	</form>
 
-	<div class="grid min-h-0 flex-1 gap-3 p-3 lg:grid-cols-[minmax(0,1.7fr)_minmax(22rem,28rem)]">
-		<section class="flex min-h-[28rem] min-w-0 flex-col border border-slate-700 bg-black">
-			<div class="flex items-center justify-between border-b border-slate-800 px-3 py-1.5">
-				<h2 class="text-[11px] font-semibold uppercase tracking-widest text-slate-500">
+	<div class="grid min-h-0 flex-1 gap-3 overflow-hidden p-3 lg:grid-cols-[minmax(0,1.7fr)_minmax(22rem,28rem)]">
+		<section class="flex min-h-0 min-w-0 flex-col overflow-hidden border border-neutral-700 bg-black">
+			<div class="flex shrink-0 items-center justify-between border-b border-neutral-800 px-3 py-1.5">
+				<h2 class="text-[11px] font-semibold uppercase tracking-widest text-neutral-500">
 					{snapshot ? "Snapshot" : "Camera"}
 				</h2>
 				{#if snapshot}
-					<p class="text-xs text-amber-200">Automatic watch is stopped</p>
+					<p class="text-xs text-amber-200">Automatic stream is stopped</p>
 				{/if}
 			</div>
-			<div class="relative min-h-0 flex-1">
+			<div class="relative min-h-0 flex-1 overflow-hidden">
 				{#if snapshot}
 					<img
 						src={snapshot.image}
 						alt="Snapshot of kit {snapshot.kitCode}"
-						class="h-full max-h-[calc(100vh-11rem)] w-full object-contain"
+						class="absolute inset-0 h-full w-full object-contain"
 					/>
-					<div
-						class="absolute inset-x-0 bottom-0 flex flex-wrap items-end justify-between gap-3 bg-gradient-to-t from-slate-950 via-slate-950/85 to-transparent px-4 pt-16 pb-3"
-					>
-						<div>
-							<p class="font-mono text-3xl font-semibold leading-none text-white">{snapshot.kitCode}</p>
-							<p class="mt-1 text-sm text-slate-300">Taken {snapshot.takenAt}</p>
-						</div>
-						<button
-							type="button"
-							class="inline-flex min-h-11 items-center border border-slate-200 bg-slate-100 px-4 text-sm font-semibold text-slate-950"
-							on:click={resumeLiveFeed}
-						>
-							Resume live feed
-						</button>
+					<div class="absolute left-3 top-3 bg-neutral-950/80 px-3 py-2">
+						<p class="font-mono text-3xl font-semibold leading-none text-white">{snapshot.kitCode}</p>
+						<p class="mt-1 text-sm text-neutral-300">Taken {snapshot.takenAt}</p>
 					</div>
+					<button
+						type="button"
+						class="absolute bottom-3 right-3 inline-flex min-h-11 items-center border border-yellow-300 bg-yellow-400 px-4 text-sm font-semibold text-neutral-950"
+						on:click={resumeLiveFeed}
+					>
+						Resume live feed
+					</button>
 				{:else if feedOn}
 					<img
 						src="http://127.0.0.1:8008/camera/stream?index={cameraIndex}"
 						alt="Camera feed"
-						class="h-full max-h-[calc(100vh-11rem)] w-full object-contain"
+						class="absolute inset-0 h-full w-full object-contain"
 					/>
 				{:else}
-					<div class="flex h-full min-h-[24rem] items-center justify-center text-lg text-slate-500">
+					<div class="absolute inset-0 flex items-center justify-center text-lg text-neutral-500">
 						Feed stopped
 					</div>
 				{/if}
 			</div>
 		</section>
 
-		<section class="flex min-w-0 flex-col border border-slate-700 bg-slate-900">
-			<h2 class="border-b border-slate-800 px-3 py-1.5 text-[11px] font-semibold uppercase tracking-widest text-slate-500">
+		<section class="flex min-h-0 min-w-0 flex-col overflow-hidden border border-neutral-700 bg-neutral-900">
+			<h2 class="shrink-0 border-b border-neutral-800 px-3 py-1.5 text-[11px] font-semibold uppercase tracking-widest text-neutral-500">
 				Result
 			</h2>
 			{#if result}
 				<p
-					class="px-4 py-5 text-5xl font-black uppercase leading-none tracking-widest {result.status ===
+					class="shrink-0 px-4 py-4 text-4xl font-black uppercase leading-none tracking-widest {result.status ===
 					'pass'
-						? 'bg-green-500 text-slate-950'
+						? 'bg-green-500 text-neutral-950'
 						: 'bg-red-600 text-white'}"
 				>
 					{result.status}
 				</p>
-				<div class="flex flex-col gap-3 p-4">
+				<div class="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4">
 					{#if result.kitCode}
 						<p class="font-mono text-2xl font-semibold tracking-tight">{result.kitCode}</p>
 					{/if}
 					{#if result.des}
-						<p class="text-base text-slate-300">{result.des}</p>
+						<p class="text-base text-neutral-300">{result.des}</p>
 					{/if}
 					{#if result.message}
-						<p class="text-base text-slate-200">{result.message}</p>
+						<p class="text-base text-neutral-200">{result.message}</p>
 					{/if}
 					{#if result.parts?.length}
 						<table class="w-full border-collapse text-left text-sm">
 							<thead>
-								<tr class="border-b border-slate-600 text-[11px] uppercase tracking-widest text-slate-400">
+								<tr class="border-b border-neutral-600 text-[11px] uppercase tracking-widest text-neutral-400">
 									<th class="py-2 pr-3 font-semibold">IC</th>
 									<th class="py-2 pr-3 font-semibold">Description</th>
 									<th class="py-2 text-right font-semibold">Qty</th>
@@ -398,9 +424,9 @@ async function decodeAndInspect() {
 							</thead>
 							<tbody>
 								{#each result.parts as part, i (i)}
-									<tr class="border-b border-slate-800">
+									<tr class="border-b border-neutral-800">
 										<td class="py-2 pr-3 font-mono font-medium">{part.ic}</td>
-										<td class="py-2 pr-3 text-slate-200">{part.des}</td>
+										<td class="py-2 pr-3 text-neutral-200">{part.des}</td>
 										<td class="py-2 text-right font-semibold">{part.qty}</td>
 									</tr>
 								{/each}
@@ -411,22 +437,22 @@ async function decodeAndInspect() {
 						<img
 							src={result.image}
 							alt="Annotated sample"
-							class="w-full border border-slate-700 bg-black"
+							class="w-full border border-neutral-700 bg-black"
 						/>
 					{/if}
 					{#if result.info}
-						<p class="text-sm text-slate-400">{result.info}</p>
+						<p class="text-sm text-neutral-400">{result.info}</p>
 					{/if}
 					{#if result.kitsFound != null || result.expectedKitCount != null}
-						<p class="text-sm text-slate-400">
+						<p class="text-sm text-neutral-400">
 							Info only: {result.kitsFound ?? "—"} kit(s) found, {result.expectedKitCount ?? "—"} expected
 						</p>
 					{/if}
 				</div>
 			{:else}
 				<div class="px-4 py-8">
-					<p class="text-lg font-medium text-slate-300">No result yet</p>
-					<p class="mt-1 text-sm text-slate-500">Decode a barcode or press Inspect.</p>
+					<p class="text-lg font-medium text-neutral-300">No result yet</p>
+					<p class="mt-1 text-sm text-neutral-500">Decode a barcode or press Enter.</p>
 				</div>
 			{/if}
 		</section>
