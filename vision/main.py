@@ -9,6 +9,8 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import uvicorn
 import json
+import re
+from decimal import Decimal
 from pathlib import Path
 
 # pyzbar's bundled libzbar needs MSVCR120.dll (VC++ 2013 x64). If that runtime
@@ -32,6 +34,15 @@ app.add_middleware(
 )
 
 BOM_PATH = Path(__file__).parent / "sample-bom.json"
+# Local BoM source choice. A missing file means the JSON sample BoM.
+# The settings-page unlock password is not stored here.
+# A SQL Server Authentication password is stored with the other connection fields.
+# config.local.json is the connection file. bom-source.json is read only when it is absent.
+BOM_SOURCE_PATH = Path(__file__).parent / "bom-source.json"
+CONFIG_LOCAL_PATH = Path(__file__).parent / "config.local.json"
+BOM_QUERIES_PATH = Path(__file__).parent / "bom_queries.sql"
+BOM_QUERIES_EXAMPLE_PATH = Path(__file__).parent / "bom_queries.example.sql"
+DEFAULT_SQL_DRIVER = "ODBC Driver 18 for SQL Server"
 SAMPLE_DIR = Path(__file__).parent / "test-images"
 DEFAULT_SAMPLE = "Example3.jpg"
 # Areas within this multiple of the group median stay in the same size band.
@@ -73,6 +84,323 @@ class RoiUpdate(BaseModel):
     y: int
     w: int
     h: int
+
+class BomSourceUpdate(BaseModel):
+    source: str
+    server: Optional[str] = ""
+    database: Optional[str] = ""
+    auth: Optional[str] = "windows"
+    user: Optional[str] = ""
+    password: Optional[str] = ""
+
+def _blank_bom_source():
+    return {
+        "source": "json",
+        "mssql": {
+            "driver": DEFAULT_SQL_DRIVER,
+            "server": "",
+            "database": "",
+            "auth": "windows",
+            "user": "",
+            "password": "",
+        },
+    }
+
+def _read_json_dict(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            saved = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(saved, dict):
+        return None
+    return saved
+
+def _apply_saved_source(config, saved):
+    source = saved.get("source")
+    if source in ("json", "mssql"):
+        config["source"] = source
+    mssql = saved.get("mssql")
+    if isinstance(mssql, dict):
+        for key in ("server", "database", "user", "password"):
+            value = mssql.get(key)
+            if isinstance(value, str):
+                config["mssql"][key] = value
+        driver = mssql.get("driver")
+        if isinstance(driver, str) and driver.strip():
+            config["mssql"]["driver"] = driver.strip()
+        if mssql.get("auth") in ("windows", "sql"):
+            config["mssql"]["auth"] = mssql["auth"]
+    # Windows Authentication does not use a SQL login.
+    if config["mssql"]["auth"] == "windows":
+        config["mssql"]["user"] = ""
+        config["mssql"]["password"] = ""
+    return config
+
+def load_bom_source():
+    config = _blank_bom_source()
+    if CONFIG_LOCAL_PATH.exists():
+        saved = _read_json_dict(CONFIG_LOCAL_PATH)
+        if saved is None:
+            return config
+        return _apply_saved_source(config, saved)
+    if BOM_SOURCE_PATH.exists():
+        saved = _read_json_dict(BOM_SOURCE_PATH)
+        if saved is None:
+            return config
+        return _apply_saved_source(config, saved)
+    return config
+
+def save_bom_source(config):
+    stored = {
+        "source": config["source"],
+        "mssql": {
+            "driver": config["mssql"].get("driver") or DEFAULT_SQL_DRIVER,
+            "server": config["mssql"]["server"],
+            "database": config["mssql"]["database"],
+            "auth": config["mssql"]["auth"],
+            "user": config["mssql"]["user"],
+            "password": config["mssql"]["password"],
+        },
+    }
+    CONFIG_LOCAL_PATH.write_text(
+        json.dumps(stored, indent=2) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    return stored
+
+# A line that is only GO, "-- ---", or "-- split" divides the two BoM queries.
+_QUERY_SPLIT = re.compile(r"^(?:go|--\s*(?:-{3,}|={3,}|split))\s*$", re.IGNORECASE)
+
+def _has_select(sql):
+    return re.search(r"\bselect\b", sql, re.IGNORECASE) is not None
+
+def _starts_with_select(sql):
+    for line in sql.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("--"):
+            continue
+        return re.match(r"select\b", stripped, re.IGNORECASE) is not None
+    return False
+
+def split_bom_queries(text):
+    """Return (kit header SQL, parts SQL), split on a marker or a blank line."""
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+
+    def index_at(marker):
+        for index, line in enumerate(lines):
+            stripped = line.strip()
+            is_split = _QUERY_SPLIT.match(stripped) is not None if marker else stripped == ""
+            if not is_split:
+                continue
+            header = "\n".join(lines[:index])
+            parts = "\n".join(lines[index + 1 :])
+            # The parts query has to start a new SELECT, so a blank line inside
+            # the header statement is not the split.
+            if _has_select(header) and _starts_with_select(parts):
+                return index
+        return None
+
+    split_at = index_at(True)
+    if split_at is None:
+        split_at = index_at(False)
+    if split_at is None:
+        return None
+    header = "\n".join(lines[:split_at]).strip()
+    parts = "\n".join(lines[split_at + 1 :]).strip()
+    return header, parts
+
+def load_bom_queries():
+    if BOM_QUERIES_PATH.exists():
+        path = BOM_QUERIES_PATH
+    elif BOM_QUERIES_EXAMPLE_PATH.exists():
+        path = BOM_QUERIES_EXAMPLE_PATH
+    else:
+        raise FileNotFoundError(
+            "BoM queries were not found. Add vision/bom_queries.sql or vision/bom_queries.example.sql."
+        )
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise FileNotFoundError(f"Could not read {path.name}.") from exc
+    split = split_bom_queries(text)
+    if split is None:
+        raise ValueError(
+            "BoM query file must contain a kit header query and a parts query, separated by a blank line."
+        )
+    return split
+
+def _odbc_brace(value):
+    return "{" + value.replace("}", "}}") + "}"
+
+def _odbc_pair(key, value):
+    if any(character in value for character in ";{}="):
+        return f"{key}={_odbc_brace(value)}"
+    return f"{key}={value}"
+
+def mssql_connection_string(mssql):
+    server = (mssql.get("server") or "").strip()
+    database = (mssql.get("database") or "").strip()
+    if not server or not database:
+        raise ValueError(
+            "MSSQL server and database are required. Save them on the Settings page or in vision/config.local.json."
+        )
+    auth = mssql.get("auth") or "windows"
+    user = (mssql.get("user") or "").strip()
+    password = mssql.get("password") or ""
+    if auth == "sql" and (not user or not str(password).strip()):
+        raise ValueError("Username and password are required for SQL Server Authentication.")
+    driver = (mssql.get("driver") or DEFAULT_SQL_DRIVER).strip() or DEFAULT_SQL_DRIVER
+    parts = [
+        f"DRIVER={_odbc_brace(driver)}",
+        _odbc_pair("SERVER", server),
+        _odbc_pair("DATABASE", database),
+    ]
+    # Driver 18 encrypts by default and rejects an untrusted certificate unless
+    # Encrypt is set explicitly. optional matches a server that is not forcing TLS.
+    parts.append("Encrypt=optional")
+    parts.append("TrustServerCertificate=yes")
+    if auth == "sql":
+        parts.append(_odbc_pair("UID", user))
+        parts.append(_odbc_pair("PWD", password))
+    else:
+        parts.append("Trusted_Connection=yes")
+    return ";".join(parts) + ";"
+
+def _scrub_secret(text, secret):
+    if secret:
+        return text.replace(secret, "********")
+    return text
+
+def _connect_mssql(mssql):
+    connection_string = mssql_connection_string(mssql)
+    try:
+        import pyodbc
+    except ImportError as exc:
+        raise RuntimeError("pyodbc is not installed. SQL Server lookup is unavailable.") from exc
+    # Set before the handshake. The string keyword is ignored when Encrypt is Strict.
+    # 1223 is SQL_COPT_SS_ENCRYPT (0 = off/optional). 1228 trusts the server certificate.
+    try:
+        connection = pyodbc.connect(
+            connection_string,
+            timeout=5,
+            attrs_before={1223: 0, 1228: 1},
+        )
+    except Exception as exc:
+        message = _scrub_secret(str(exc), mssql.get("password") or "")
+        raise RuntimeError(f"Could not query MSSQL: {message}") from None
+    connection.autocommit = True
+    return connection
+
+def _bind_kit_ic(sql):
+    return re.sub(r"@kitIC\b", "?", sql, flags=re.IGNORECASE)
+
+def _query_rows(cursor, sql, kit_ic):
+    bound = _bind_kit_ic(sql)
+    cursor.execute(bound, (kit_ic,) * bound.count("?"))
+    if cursor.description is None:
+        return []
+    columns = [column[0] for column in cursor.description]
+    return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+def _row_value(row, *names):
+    lookup = {str(key).lower(): value for key, value in row.items()}
+    for name in names:
+        if name in lookup:
+            return lookup[name]
+    return None
+
+def _as_number(value):
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else value
+    if isinstance(value, Decimal):
+        if value == value.to_integral_value():
+            return int(value)
+        return float(value)
+    number = float(str(value).strip())
+    return int(number) if number.is_integer() else number
+
+def _as_text(value):
+    if value is None:
+        return ""
+    return str(value).strip()
+
+def _job_from_rows(header_rows, part_rows):
+    header = header_rows[0]
+    expected = _row_value(header, "expectedkitcount", "expected_kit_count", "labelcount")
+    parts = []
+    for row in part_rows:
+        ic = _as_text(_row_value(row, "ic", "cc"))
+        if not ic:
+            continue
+        qty = _as_number(_row_value(row, "qty", "quantity"))
+        parts.append(
+            {
+                "ic": ic,
+                "des": _as_text(_row_value(row, "des", "description")),
+                "qty": 0 if qty is None else qty,
+            }
+        )
+    return {
+        "des": _as_text(_row_value(header, "des", "kitname", "kit_name", "description")),
+        "expectedKitCount": None if expected is None else _as_number(expected),
+        "parts": parts,
+    }
+
+def _inspect_fail(barcode, message):
+    return {
+        "barcode": barcode,
+        "status": "fail",
+        "message": message,
+        "kits": [],
+    }
+
+def _inspect_pass(barcode, job):
+    kits_present = 2  # placeholder until real detection; change as needed for testing
+    return {
+        "barcode": barcode,
+        "status": "pass",
+        "message": f"BoM loaded – {kits_present} kit(s) on bench",
+        "kitCode": barcode,
+        "des": job.get("des"),
+        "expectedKitCount": job.get("expectedKitCount"),
+        "parts": job.get("parts", []),
+        "kitsFound": kits_present,
+        "kits": [
+            {"id": i + 1, "status": "pass", "missing": [], "extra": []}
+            for i in range(kits_present)
+        ],
+    }
+
+def _mssql_error_message(exc, source):
+    password = ""
+    mssql = source.get("mssql") if isinstance(source, dict) else None
+    if isinstance(mssql, dict):
+        password = mssql.get("password") or ""
+    text = _scrub_secret(str(exc).strip() or exc.__class__.__name__, password)
+    if isinstance(exc, (FileNotFoundError, ValueError, RuntimeError)):
+        return text
+    return f"Could not query MSSQL: {text}"
+
+def _inspect_mssql(barcode, source):
+    header_sql, parts_sql = load_bom_queries()
+    connection = _connect_mssql(source["mssql"])
+    try:
+        cursor = connection.cursor()
+        header_rows = _query_rows(cursor, header_sql, barcode)
+        if not header_rows:
+            return _inspect_fail(barcode, "Barcode not found in BoM")
+        part_rows = _query_rows(cursor, parts_sql, barcode)
+    finally:
+        connection.close()
+    return _inspect_pass(barcode, _job_from_rows(header_rows, part_rows))
 
 def load_bom():
     if not BOM_PATH.exists():
@@ -605,35 +933,58 @@ def inspect_sample(name: str = DEFAULT_SAMPLE):
         "image": _annotate_blobs(image, groups),
     }
 
+@app.get("/settings/bom-source")
+def get_bom_source():
+    return load_bom_source()
+
+@app.post("/settings/bom-source")
+def update_bom_source(body: BomSourceUpdate):
+    if body.source not in ("json", "mssql"):
+        return {"status": "fail", "message": "BoM source must be json or mssql"}
+    if body.auth not in ("windows", "sql"):
+        return {"status": "fail", "message": "Authentication must be windows or sql"}
+    user = (body.user or "").strip()
+    password = body.password or ""
+    if body.auth == "windows":
+        user = ""
+        password = ""
+    elif not user or not password.strip():
+        return {
+            "status": "fail",
+            "message": "Username and password are required for SQL Server Authentication",
+        }
+    existing = load_bom_source()
+    config = _blank_bom_source()
+    config["source"] = body.source
+    config["mssql"]["driver"] = existing["mssql"].get("driver") or DEFAULT_SQL_DRIVER
+    config["mssql"]["server"] = (body.server or "").strip()
+    config["mssql"]["database"] = (body.database or "").strip()
+    config["mssql"]["auth"] = body.auth
+    config["mssql"]["user"] = user
+    config["mssql"]["password"] = password
+    saved = save_bom_source(config)
+    if body.source == "mssql":
+        message = "Saved. Inspect queries MSSQL using vision/bom_queries.sql."
+    else:
+        message = "Saved. Inspect uses vision/sample-bom.json."
+    return {"status": "pass", "message": message, **saved}
+
 @app.post("/inspect")
 def inspect(req: InspectRequest):
+    source = load_bom_source()
+    if source["source"] == "mssql":
+        try:
+            return _inspect_mssql(req.barcode, source)
+        except Exception as exc:
+            return _inspect_fail(req.barcode, _mssql_error_message(exc, source))
+
     bom = load_bom()
     job = bom.get(req.barcode)
 
     if not job:
-        return {
-            "barcode": req.barcode,
-            "status": "fail",
-            "message": "Barcode not found in BoM",
-            "kits": []
-        }
+        return _inspect_fail(req.barcode, "Barcode not found in BoM")
 
-    kits_present = 2  # placeholder until real detection; change as needed for testing
-
-    return {
-        "barcode": req.barcode,
-        "status": "pass",
-        "message": f"BoM loaded – {kits_present} kit(s) on bench",
-        "kitCode": req.barcode,
-        "des": job.get("des"),
-        "expectedKitCount": job.get("expectedKitCount"),  # display only
-        "parts": job.get("parts", []),
-        "kitsFound": kits_present,
-        "kits": [
-            {"id": i + 1, "status": "pass", "missing": [], "extra": []}
-            for i in range(kits_present)
-        ]
-    }
+    return _inspect_pass(req.barcode, job)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=8008)

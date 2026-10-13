@@ -1,0 +1,11 @@
+{
+  "source": "json",
+  "mssql": {
+    "driver": "ODBC Driver 18 for SQL Server",
+    "server": "localhost",
+    "database": "YourDatabase",
+    "auth": "windows",
+    "user": "",
+    "password": ""
+  }
+}

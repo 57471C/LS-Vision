@@ -101,13 +101,35 @@ async function decodeAndInspect() {
 	<div class="mx-auto flex max-w-3xl flex-col gap-6 p-6">
 		<div class="flex flex-wrap items-center justify-between gap-4">
 			<h1 class="text-2xl font-black tracking-tight">LS-Vision</h1>
-			<button
-				type="button"
-				class="border-2 border-neutral-950 bg-white px-4 py-3 text-base font-bold"
-				on:click={startSidecar}
-			>
-				Start Vision Sidecar
-			</button>
+			<div class="flex items-center gap-3">
+				<a
+					href="/settings"
+					aria-label="Settings"
+					class="inline-flex h-12 w-12 items-center justify-center border-2 border-neutral-950 bg-white"
+				>
+					<svg
+						xmlns="http://www.w3.org/2000/svg"
+						viewBox="0 0 24 24"
+						class="h-6 w-6"
+						fill="none"
+						stroke="currentColor"
+						stroke-width="2"
+						aria-hidden="true"
+					>
+						<circle cx="12" cy="12" r="3" />
+						<path
+							d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9c.3.6.9 1.1 1.5 1.1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1.1z"
+						/>
+					</svg>
+				</a>
+				<button
+					type="button"
+					class="border-2 border-neutral-950 bg-white px-4 py-3 text-base font-bold"
+					on:click={startSidecar}
+				>
+					Start Vision Sidecar
+				</button>
+			</div>
 		</div>
 
 		<div class="flex flex-wrap items-end gap-3">
