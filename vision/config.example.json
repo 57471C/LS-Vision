@@ -7,5 +7,9 @@
     "auth": "windows",
     "user": "",
     "password": ""
+  },
+  "erp": {
+    "name": "",
+    "url": ""
   }
 }

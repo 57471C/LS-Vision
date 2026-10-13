@@ -10,8 +10,11 @@ from pydantic import BaseModel
 import uvicorn
 import json
 import re
+import urllib.error
+import urllib.request
 from decimal import Decimal
 from pathlib import Path
+from urllib.parse import urlparse
 
 # pyzbar's bundled libzbar needs MSVCR120.dll (VC++ 2013 x64). If that runtime
 # is missing, keep /health and /inspect up and report the error from decode routes.
@@ -37,7 +40,8 @@ BOM_PATH = Path(__file__).parent / "sample-bom.json"
 # Local BoM source choice. A missing file means the JSON sample BoM.
 # The settings-page unlock password is not stored here.
 # A SQL Server Authentication password is stored with the other connection fields.
-# config.local.json is the connection file. bom-source.json is read only when it is absent.
+# config.local.json stores the BoM source and the operator ERP button.
+# bom-source.json is read only when config.local.json is absent.
 BOM_SOURCE_PATH = Path(__file__).parent / "bom-source.json"
 CONFIG_LOCAL_PATH = Path(__file__).parent / "config.local.json"
 BOM_QUERIES_PATH = Path(__file__).parent / "bom_queries.sql"
@@ -93,6 +97,13 @@ class BomSourceUpdate(BaseModel):
     user: Optional[str] = ""
     password: Optional[str] = ""
 
+class ErpUpdate(BaseModel):
+    name: Optional[str] = ""
+    url: Optional[str] = ""
+
+def _blank_erp():
+    return {"name": "", "url": ""}
+
 def _blank_bom_source():
     return {
         "source": "json",
@@ -104,6 +115,7 @@ def _blank_bom_source():
             "user": "",
             "password": "",
         },
+        "erp": _blank_erp(),
     }
 
 def _read_json_dict(path):
@@ -137,21 +149,110 @@ def _apply_saved_source(config, saved):
         config["mssql"]["password"] = ""
     return config
 
+def _apply_saved_erp(config, saved):
+    erp = saved.get("erp")
+    if not isinstance(erp, dict):
+        return config
+    name = erp.get("name")
+    url = erp.get("url")
+    if isinstance(name, str):
+        config["erp"]["name"] = name.strip()
+    if isinstance(url, str):
+        config["erp"]["url"] = url.strip()
+    return config
+
+def _clean_erp(name, url):
+    name = " ".join((name or "").split())
+    url = (url or "").strip()
+    if len(name) > 40:
+        return None, "Button name must be 40 characters or fewer"
+    if len(url) > 2000:
+        return None, "URL is too long"
+    if not url:
+        if name:
+            return None, "URL is required"
+        return _blank_erp(), None
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return None, "URL must start with http:// or https://"
+    if not name:
+        name = "ERP"
+    return {"name": name, "url": url}, None
+
+def _frame_ancestors_allow(csp):
+    """Return True, False, or None when the header has no frame-ancestors."""
+    for directive in (csp or "").split(";"):
+        parts = directive.strip().split()
+        if not parts or parts[0].lower() != "frame-ancestors":
+            continue
+        sources = [item.lower() for item in parts[1:]]
+        if not sources or "'none'" in sources:
+            return False
+        if "*" in sources:
+            return True
+        # 'self' is the ERP origin. The vision page is the parent, so that
+        # does not make the iframe allowed.
+        for source in sources:
+            if "127.0.0.1" in source or "localhost" in source or "tauri.localhost" in source:
+                return True
+        return False
+    return None
+
+def _headers_allow_frame(headers):
+    raw = headers.get("X-Frame-Options") if headers is not None else None
+    if raw:
+        directive = raw.split(",")[0].strip().lower()
+        if directive in ("deny", "sameorigin"):
+            return False
+    values = []
+    if headers is not None and hasattr(headers, "get_all"):
+        values = headers.get_all("Content-Security-Policy") or []
+    elif headers is not None:
+        single = headers.get("Content-Security-Policy")
+        if single:
+            values = [single]
+    for csp in values:
+        allowed = _frame_ancestors_allow(csp)
+        if allowed is False:
+            return False
+    return True
+
+def _erp_can_frame(url):
+    if not url:
+        return False
+    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    response = None
+    try:
+        response = urllib.request.urlopen(request, timeout=8)
+    except urllib.error.HTTPError as exc:
+        response = exc
+    except Exception:
+        return False
+    try:
+        return _headers_allow_frame(response.headers)
+    finally:
+        close = getattr(response, "close", None)
+        if close is not None:
+            close()
+
 def load_bom_source():
     config = _blank_bom_source()
     if CONFIG_LOCAL_PATH.exists():
         saved = _read_json_dict(CONFIG_LOCAL_PATH)
         if saved is None:
             return config
-        return _apply_saved_source(config, saved)
+        _apply_saved_source(config, saved)
+        return _apply_saved_erp(config, saved)
     if BOM_SOURCE_PATH.exists():
         saved = _read_json_dict(BOM_SOURCE_PATH)
         if saved is None:
             return config
-        return _apply_saved_source(config, saved)
+        _apply_saved_source(config, saved)
+        return _apply_saved_erp(config, saved)
     return config
 
 def save_bom_source(config):
+    erp = config.get("erp") or _blank_erp()
     stored = {
         "source": config["source"],
         "mssql": {
@@ -161,6 +262,10 @@ def save_bom_source(config):
             "auth": config["mssql"]["auth"],
             "user": config["mssql"]["user"],
             "password": config["mssql"]["password"],
+        },
+        "erp": {
+            "name": erp.get("name") or "",
+            "url": erp.get("url") or "",
         },
     }
     CONFIG_LOCAL_PATH.write_text(
@@ -1039,12 +1144,47 @@ def update_bom_source(body: BomSourceUpdate):
     config["mssql"]["auth"] = body.auth
     config["mssql"]["user"] = user
     config["mssql"]["password"] = password
+    config["erp"] = existing.get("erp") or _blank_erp()
     saved = save_bom_source(config)
     if body.source == "mssql":
         message = "Saved. Inspect queries MSSQL using vision/bom_queries.sql."
     else:
         message = "Saved. Inspect uses vision/sample-bom.json."
     return {"status": "pass", "message": message, **saved}
+
+@app.get("/settings/erp")
+def get_erp():
+    erp = load_bom_source().get("erp") or _blank_erp()
+    return {"name": erp.get("name") or "", "url": erp.get("url") or ""}
+
+@app.get("/settings/erp/frame")
+def erp_frame():
+    erp = load_bom_source().get("erp") or _blank_erp()
+    url = erp.get("url") or ""
+    return {
+        "name": erp.get("name") or "",
+        "url": url,
+        "frame": _erp_can_frame(url) if url else False,
+    }
+
+@app.post("/settings/erp")
+def update_erp(body: ErpUpdate):
+    cleaned, error = _clean_erp(body.name, body.url)
+    if error:
+        return {"status": "fail", "message": error}
+    config = load_bom_source()
+    config["erp"] = cleaned
+    saved = save_bom_source(config)
+    if cleaned["url"]:
+        message = "Saved. The operator page shows this ERP button."
+    else:
+        message = "Saved. The ERP button stays hidden until a URL is set."
+    return {
+        "status": "pass",
+        "message": message,
+        "name": saved["erp"]["name"],
+        "url": saved["erp"]["url"],
+    }
 
 def lookup_bom(barcode):
     source = load_bom_source()

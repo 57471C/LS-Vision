@@ -1,7 +1,8 @@
 <script lang="ts">
 // biome-ignore-all lint/correctness/noUnusedVariables: Biome 2.4 does not treat Svelte template references as uses
 import { invoke } from "@tauri-apps/api/core";
-import { onDestroy, onMount } from "svelte";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { onDestroy, onMount, tick } from "svelte";
 
 type Part = { ic: string; des: string; qty: number };
 type InspectView = {
@@ -42,6 +43,14 @@ let watchInFlight = false;
 let pageAlive = true;
 let sidecarUp = false;
 let healthTimer: ReturnType<typeof setInterval> | null = null;
+let erpName = "";
+let erpUrl = "";
+let erpOpen = false;
+let iframeFailed = false;
+let erpChecking = false;
+let erpAttempt = 0;
+let erpLoadedUrl = "";
+let erpCloseButton: HTMLButtonElement | null = null;
 
 function stopWatch() {
 	if (streamTimer !== null) {
@@ -132,13 +141,89 @@ async function watchFeed() {
 	}
 }
 
+async function loadErp() {
+	try {
+		const res = await fetch("http://127.0.0.1:8008/settings/erp");
+		if (!res.ok) return;
+		const data = await res.json();
+		const nextName = typeof data.name === "string" ? data.name.trim() : "";
+		const nextUrl = typeof data.url === "string" ? data.url.trim() : "";
+		if (nextUrl !== erpUrl) {
+			erpAttempt += 1;
+			erpOpen = false;
+			iframeFailed = false;
+			erpChecking = false;
+			erpLoadedUrl = "";
+		}
+		erpName = nextName;
+		erpUrl = nextUrl;
+	} catch {
+		// A missed read leaves the last button in place.
+	}
+}
+
 async function checkSidecar() {
 	if (!pageAlive) return;
+	const wasUp = sidecarUp;
 	try {
 		const res = await fetch("http://127.0.0.1:8008/health");
 		sidecarUp = res.ok;
 	} catch {
 		sidecarUp = false;
+	}
+	if (pageAlive && sidecarUp && !wasUp) void loadErp();
+}
+
+async function openErp() {
+	if (!erpUrl) return;
+	erpOpen = true;
+	await tick();
+	erpCloseButton?.focus();
+	// The ERP page stays loaded behind the vision view. Opening it again
+	// must not navigate the iframe, or a menu selection is lost.
+	if (erpLoadedUrl === erpUrl && !iframeFailed) return;
+	const attempt = ++erpAttempt;
+	iframeFailed = false;
+	erpChecking = true;
+	erpLoadedUrl = "";
+	try {
+		const res = await fetch("http://127.0.0.1:8008/settings/erp/frame", {
+			signal: AbortSignal.timeout(12000),
+		});
+		if (!res.ok) throw new Error(await res.text());
+		const data = await res.json();
+		if (attempt !== erpAttempt) return;
+		if (data.frame === true) {
+			erpLoadedUrl = erpUrl;
+		} else {
+			iframeFailed = true;
+		}
+		erpChecking = false;
+	} catch {
+		if (attempt !== erpAttempt) return;
+		iframeFailed = true;
+		erpChecking = false;
+	}
+}
+
+function closeErp() {
+	erpOpen = false;
+}
+
+function onErpKey(event: KeyboardEvent) {
+	if (event.key === "Escape" && erpOpen) closeErp();
+}
+
+function onIframeError() {
+	iframeFailed = true;
+}
+
+async function openErpInBrowser() {
+	if (!erpUrl) return;
+	try {
+		await openUrl(erpUrl);
+	} catch {
+		window.open(erpUrl, "_blank", "noopener,noreferrer");
 	}
 }
 
@@ -246,7 +331,9 @@ async function decodeAndInspect() {
 }
 </script>
 
-<div class="flex h-dvh max-h-dvh flex-col overflow-hidden overscroll-none bg-neutral-950 text-neutral-100">
+<svelte:window on:keydown={onErpKey} />
+
+<div class="relative flex h-dvh max-h-dvh flex-col overflow-hidden overscroll-none bg-neutral-950 text-neutral-100">
 	<header class="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-neutral-800 bg-neutral-900 px-4 py-2">
 		<div class="flex items-baseline gap-3">
 			<h1 class="text-lg font-semibold tracking-tight">LS-Vision</h1>
@@ -346,6 +433,15 @@ async function decodeAndInspect() {
 		>
 			{feedOn ? "Stop feed" : "Start feed"}
 		</button>
+		{#if erpUrl}
+			<button
+				type="button"
+				class="inline-flex min-h-11 items-center border border-amber-300 bg-amber-400 px-4 text-sm font-semibold text-neutral-950"
+				on:click={openErp}
+			>
+				{erpName || "ERP"}
+			</button>
+		{/if}
 	</form>
 
 	<div class="grid min-h-0 flex-1 gap-3 overflow-hidden p-3 lg:grid-cols-[minmax(0,1.7fr)_minmax(22rem,28rem)]">
@@ -456,5 +552,64 @@ async function decodeAndInspect() {
 				</div>
 			{/if}
 		</section>
+	</div>
+
+	<button
+		type="button"
+		bind:this={erpCloseButton}
+		class="absolute inset-y-0 left-0 z-50 flex w-12 flex-col items-center justify-center gap-3 border-r border-neutral-700 bg-neutral-900 text-yellow-300 transition-transform duration-300 ease-out motion-reduce:transition-none {erpOpen
+			? 'pointer-events-auto translate-x-0'
+			: 'pointer-events-none -translate-x-full'}"
+		aria-label="Back to vision"
+		aria-hidden={erpOpen ? "false" : "true"}
+		tabindex={erpOpen ? 0 : -1}
+		on:click={closeErp}
+	>
+		<svg
+			xmlns="http://www.w3.org/2000/svg"
+			viewBox="0 0 24 24"
+			class="h-6 w-6"
+			fill="none"
+			stroke="currentColor"
+			stroke-width="2"
+			aria-hidden="true"
+		>
+			<path d="M15 18l-6-6 6-6" />
+		</svg>
+		<span class="text-xs font-semibold uppercase tracking-widest [writing-mode:vertical-rl]">
+			Back
+		</span>
+	</button>
+	<div
+		class="absolute inset-y-0 left-12 right-0 z-40 border-l border-neutral-800 bg-neutral-950 transition-transform duration-300 ease-out motion-reduce:transition-none {erpOpen
+			? 'pointer-events-auto translate-x-0'
+			: 'pointer-events-none translate-x-full'}"
+		aria-hidden={erpOpen ? "false" : "true"}
+	>
+		{#if erpLoadedUrl}
+			<iframe
+				title={erpName || "ERP"}
+				src={erpLoadedUrl}
+				class="h-full w-full border-0 bg-white"
+				on:error={onIframeError}
+			></iframe>
+		{/if}
+		{#if iframeFailed}
+			<div class="absolute inset-0 flex flex-col items-center justify-center gap-4 bg-neutral-950 px-8 text-center">
+				<p class="text-lg font-medium text-neutral-100">Could not load this page in the panel.</p>
+				<p class="max-w-xl break-all font-mono text-sm text-neutral-400">{erpUrl}</p>
+				<button
+					type="button"
+					class="inline-flex min-h-11 items-center border border-yellow-300 bg-yellow-400 px-4 text-sm font-semibold text-neutral-950"
+					on:click={openErpInBrowser}
+				>
+					Open in system browser
+				</button>
+			</div>
+		{:else if erpChecking && !erpLoadedUrl}
+			<div class="absolute inset-0 flex items-center justify-center bg-neutral-950">
+				<p class="text-lg text-neutral-300">Opening {erpName || "ERP"}...</p>
+			</div>
+		{/if}
 	</div>
 </div>
