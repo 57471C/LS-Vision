@@ -13,5 +13,5 @@ __pycache__/
 # Local BoM source choice. Absent file means the JSON sample BoM.
 vision/bom-source.json
 vision/bom_queries.sql
-# Local MSSQL connection written by Settings. Copy vision/config.example.json to start.
+# Local settings written by the Settings page. Copy vision/config.example.json to start.
 vision/config.local.json

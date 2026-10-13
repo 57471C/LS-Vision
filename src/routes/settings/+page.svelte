@@ -18,6 +18,10 @@ let mssql: MssqlFields = { server: "", database: "", user: "" };
 let mssqlPassword = "";
 let notice = "";
 let saving = false;
+let erpName = "";
+let erpUrl = "";
+let erpNotice = "";
+let savingErp = false;
 
 function errorMessage(err: unknown, fallback: string): string {
 	return err instanceof Error && err.message ? err.message : fallback;
@@ -37,11 +41,24 @@ async function loadSource() {
 			user: auth === "windows" ? "" : (data.mssql?.user ?? ""),
 		};
 		mssqlPassword = auth === "windows" ? "" : (data.mssql?.password ?? "");
+		await loadErp();
 	} catch (err: unknown) {
 		notice = errorMessage(
 			err,
 			"Could not load the BoM source. Is the vision sidecar running?",
 		);
+	}
+}
+
+async function loadErp() {
+	try {
+		const res = await fetch("http://127.0.0.1:8008/settings/erp");
+		if (!res.ok) throw new Error(await res.text());
+		const data = await res.json();
+		erpName = typeof data.name === "string" ? data.name : "";
+		erpUrl = typeof data.url === "string" ? data.url : "";
+	} catch (err: unknown) {
+		erpNotice = errorMessage(err, "Could not load the ERP button");
 	}
 }
 
@@ -70,6 +87,29 @@ function lock() {
 	gateMessage = "";
 	mssqlPassword = "";
 	sessionStorage.removeItem(UNLOCK_KEY);
+}
+
+async function saveErp() {
+	savingErp = true;
+	erpNotice = "";
+	try {
+		const res = await fetch("http://127.0.0.1:8008/settings/erp", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ name: erpName, url: erpUrl }),
+		});
+		const data = await res.json().catch(() => ({}));
+		if (!res.ok || data.status === "fail") {
+			throw new Error(data.message || (await res.text()) || "Save failed");
+		}
+		erpName = typeof data.name === "string" ? data.name : erpName;
+		erpUrl = typeof data.url === "string" ? data.url : erpUrl;
+		erpNotice = data.message || "Saved";
+	} catch (err: unknown) {
+		erpNotice = errorMessage(err, "Could not save the ERP button");
+	} finally {
+		savingErp = false;
+	}
 }
 
 async function saveSource() {
@@ -291,6 +331,50 @@ onMount(() => {
 					</div>
 					{#if notice}
 						<p class="text-sm text-neutral-200">{notice}</p>
+					{/if}
+				</form>
+
+				<form
+					class="flex flex-col gap-4 border border-neutral-700 bg-neutral-900 p-4"
+					on:submit|preventDefault={saveErp}
+				>
+					<fieldset class="flex flex-col gap-3">
+						<legend class="text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+							ERP
+						</legend>
+						<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+							Button name
+							<input
+								class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
+								bind:value={erpName}
+								maxlength="40"
+								autocomplete="off"
+								placeholder="ERP"
+							/>
+						</label>
+						<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+							URL
+							<input
+								type="url"
+								class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
+								bind:value={erpUrl}
+								autocomplete="off"
+								placeholder="https://"
+							/>
+						</label>
+						<p class="text-sm text-neutral-400">
+							The operator page shows a button with this name. It slides the URL over the vision view. Leave the URL empty to hide the button.
+						</p>
+					</fieldset>
+					<button
+						type="submit"
+						class="inline-flex min-h-11 w-fit items-center border border-blue-500 bg-blue-600 px-4 text-sm font-semibold text-white disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
+						disabled={savingErp}
+					>
+						{savingErp ? "Saving..." : "Save"}
+					</button>
+					{#if erpNotice}
+						<p class="text-sm text-neutral-200">{erpNotice}</p>
 					{/if}
 				</form>
 			{/if}
