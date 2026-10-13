@@ -12,3 +12,4 @@ __pycache__/
 *.pyc
 # Local BoM source choice. Absent file means the JSON sample BoM.
 vision/bom-source.json
+vision/bom_queries.sql

@@ -6,12 +6,14 @@ const DEV_PASSWORD = "admin";
 const UNLOCK_KEY = "ls-vision-settings-open";
 
 type BomSource = "json" | "mssql";
+type AuthMode = "windows" | "sql";
 type MssqlFields = { server: string; database: string; user: string };
 
 let unlocked = false;
 let password = "";
 let gateMessage = "";
 let source: BomSource = "json";
+let auth: AuthMode = "windows";
 let mssql: MssqlFields = { server: "", database: "", user: "" };
 let mssqlPassword = "";
 let notice = "";
@@ -28,12 +30,13 @@ async function loadSource() {
 		if (!res.ok) throw new Error(await res.text());
 		const data = await res.json();
 		source = data.source === "mssql" ? "mssql" : "json";
+		auth = data.mssql?.auth === "sql" ? "sql" : "windows";
 		mssql = {
 			server: data.mssql?.server ?? "",
 			database: data.mssql?.database ?? "",
-			user: data.mssql?.user ?? "",
+			user: auth === "windows" ? "" : (data.mssql?.user ?? ""),
 		};
-		mssqlPassword = "";
+		mssqlPassword = auth === "windows" ? "" : (data.mssql?.password ?? "");
 	} catch (err: unknown) {
 		notice = errorMessage(
 			err,
@@ -54,6 +57,13 @@ function unlock() {
 	loadSource();
 }
 
+function onAuthChange() {
+	if (auth === "windows") {
+		mssql.user = "";
+		mssqlPassword = "";
+	}
+}
+
 function lock() {
 	unlocked = false;
 	password = "";
@@ -63,6 +73,14 @@ function lock() {
 }
 
 async function saveSource() {
+	if (auth === "windows") {
+		mssql.user = "";
+		mssqlPassword = "";
+	} else if (!mssql.user.trim() || !mssqlPassword.trim()) {
+		notice =
+			"Username and password are required for SQL Server Authentication.";
+		return;
+	}
 	saving = true;
 	notice = "";
 	try {
@@ -73,13 +91,18 @@ async function saveSource() {
 				source,
 				server: mssql.server,
 				database: mssql.database,
-				user: mssql.user,
+				auth,
+				user: auth === "windows" ? "" : mssql.user,
+				password: auth === "windows" ? "" : mssqlPassword,
 			}),
 		});
 		if (!res.ok) throw new Error(await res.text());
 		const data = await res.json();
 		if (data.status !== "pass") throw new Error(data.message || "Save failed");
 		source = data.source === "mssql" ? "mssql" : source;
+		auth = data.mssql?.auth === "sql" ? "sql" : "windows";
+		mssql.user = data.mssql?.user ?? "";
+		mssqlPassword = data.mssql?.password ?? "";
 		notice = data.message || "Saved";
 	} catch (err: unknown) {
 		notice = errorMessage(err, "Could not save the BoM source");
@@ -127,7 +150,10 @@ onMount(() => {
 				{/if}
 			</section>
 		{:else}
-			<section class="flex flex-col gap-4 border-4 border-neutral-950 bg-white p-5">
+			<form
+				class="flex flex-col gap-4 border-4 border-neutral-950 bg-white p-5"
+				on:submit|preventDefault={saveSource}
+			>
 				<fieldset class="flex flex-col gap-3">
 					<legend class="text-sm font-bold uppercase tracking-wide">BoM source</legend>
 					<label class="flex items-center gap-3 text-lg font-semibold">
@@ -144,6 +170,29 @@ onMount(() => {
 
 				{#if source === "mssql"}
 					<div class="flex flex-col gap-3">
+						<fieldset class="flex flex-col gap-2">
+							<legend class="text-sm font-bold uppercase tracking-wide">Authentication</legend>
+							<label class="flex items-center gap-3 text-lg font-semibold">
+								<input
+									type="radio"
+									name="mssql-auth"
+									value="windows"
+									bind:group={auth}
+									on:change={onAuthChange}
+								/>
+								Windows Authentication
+							</label>
+							<label class="flex items-center gap-3 text-lg font-semibold">
+								<input
+									type="radio"
+									name="mssql-auth"
+									value="sql"
+									bind:group={auth}
+									on:change={onAuthChange}
+								/>
+								SQL Server Authentication
+							</label>
+						</fieldset>
 						<label class="flex flex-col gap-1 text-sm font-bold uppercase tracking-wide">
 							Server
 							<input
@@ -161,33 +210,44 @@ onMount(() => {
 							/>
 						</label>
 						<label class="flex flex-col gap-1 text-sm font-bold uppercase tracking-wide">
-							User
+							<span>
+								Username
+								{#if auth === "sql"}
+									<span class="font-normal normal-case text-red-700">Required</span>
+								{/if}
+							</span>
 							<input
-								class="border-2 border-neutral-950 px-3 py-3 text-lg font-semibold normal-case tracking-normal"
+								class="border-2 border-neutral-950 px-3 py-3 text-lg font-semibold normal-case tracking-normal disabled:bg-neutral-200"
 								bind:value={mssql.user}
 								autocomplete="off"
+								disabled={auth === "windows"}
+								required={auth === "sql"}
 							/>
 						</label>
 						<label class="flex flex-col gap-1 text-sm font-bold uppercase tracking-wide">
-							Password
+							<span>
+								Password
+								{#if auth === "sql"}
+									<span class="font-normal normal-case text-red-700">Required</span>
+								{/if}
+							</span>
 							<input
 								type="password"
-								class="border-2 border-neutral-950 px-3 py-3 text-lg font-semibold normal-case tracking-normal"
+								class="border-2 border-neutral-950 px-3 py-3 text-lg font-semibold normal-case tracking-normal disabled:bg-neutral-200"
 								bind:value={mssqlPassword}
 								autocomplete="new-password"
+								disabled={auth === "windows"}
+								required={auth === "sql"}
 							/>
 						</label>
-						<p class="text-sm text-neutral-600">
-							Password is not saved. MSSQL lookup is not implemented yet.
-						</p>
+						<p class="text-sm text-neutral-600">MSSQL lookup is not implemented yet.</p>
 					</div>
 				{/if}
 
 				<div class="flex flex-wrap items-center gap-3">
 					<button
-						type="button"
+						type="submit"
 						class="border-2 border-neutral-950 bg-neutral-950 px-5 py-3 text-lg font-bold text-white disabled:bg-neutral-400"
-						on:click={saveSource}
 						disabled={saving}
 					>
 						{saving ? "Saving..." : "Save"}
@@ -203,7 +263,7 @@ onMount(() => {
 				{#if notice}
 					<p class="text-lg">{notice}</p>
 				{/if}
-			</section>
+			</form>
 		{/if}
 	</div>
 </div>

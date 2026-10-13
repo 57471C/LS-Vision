@@ -33,7 +33,8 @@ app.add_middleware(
 
 BOM_PATH = Path(__file__).parent / "sample-bom.json"
 # Local BoM source choice. A missing file means the JSON sample BoM.
-# The settings password is not stored here.
+# The settings-page unlock password is not stored here.
+# A SQL Server Authentication password is stored with the other connection fields.
 BOM_SOURCE_PATH = Path(__file__).parent / "bom-source.json"
 SAMPLE_DIR = Path(__file__).parent / "test-images"
 DEFAULT_SAMPLE = "Example3.jpg"
@@ -81,14 +82,20 @@ class BomSourceUpdate(BaseModel):
     source: str
     server: Optional[str] = ""
     database: Optional[str] = ""
+    auth: Optional[str] = "windows"
     user: Optional[str] = ""
-    # Accepted so a client can send the field, then dropped. It is not saved.
-    password: Optional[str] = None
+    password: Optional[str] = ""
 
 def _blank_bom_source():
     return {
         "source": "json",
-        "mssql": {"server": "", "database": "", "user": ""},
+        "mssql": {
+            "server": "",
+            "database": "",
+            "auth": "windows",
+            "user": "",
+            "password": "",
+        },
     }
 
 def load_bom_source():
@@ -105,10 +112,16 @@ def load_bom_source():
         config["source"] = source
     mssql = saved.get("mssql")
     if isinstance(mssql, dict):
-        for key in ("server", "database", "user"):
+        for key in ("server", "database", "user", "password"):
             value = mssql.get(key)
             if isinstance(value, str):
                 config["mssql"][key] = value
+        if mssql.get("auth") in ("windows", "sql"):
+            config["mssql"]["auth"] = mssql["auth"]
+    # Windows Authentication does not use a SQL login.
+    if config["mssql"]["auth"] == "windows":
+        config["mssql"]["user"] = ""
+        config["mssql"]["password"] = ""
     return config
 
 def save_bom_source(config):
@@ -117,7 +130,9 @@ def save_bom_source(config):
         "mssql": {
             "server": config["mssql"]["server"],
             "database": config["mssql"]["database"],
+            "auth": config["mssql"]["auth"],
             "user": config["mssql"]["user"],
+            "password": config["mssql"]["password"],
         },
     }
     BOM_SOURCE_PATH.write_text(json.dumps(stored, indent=2) + "\n", encoding="utf-8")
@@ -662,11 +677,25 @@ def get_bom_source():
 def update_bom_source(body: BomSourceUpdate):
     if body.source not in ("json", "mssql"):
         return {"status": "fail", "message": "BoM source must be json or mssql"}
+    if body.auth not in ("windows", "sql"):
+        return {"status": "fail", "message": "Authentication must be windows or sql"}
+    user = (body.user or "").strip()
+    password = body.password or ""
+    if body.auth == "windows":
+        user = ""
+        password = ""
+    elif not user or not password.strip():
+        return {
+            "status": "fail",
+            "message": "Username and password are required for SQL Server Authentication",
+        }
     config = _blank_bom_source()
     config["source"] = body.source
     config["mssql"]["server"] = (body.server or "").strip()
     config["mssql"]["database"] = (body.database or "").strip()
-    config["mssql"]["user"] = (body.user or "").strip()
+    config["mssql"]["auth"] = body.auth
+    config["mssql"]["user"] = user
+    config["mssql"]["password"] = password
     saved = save_bom_source(config)
     if body.source == "mssql":
         message = "Saved. MSSQL BoM lookup is not implemented yet."
