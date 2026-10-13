@@ -484,6 +484,46 @@ def _decode(image):
         })
     return codes
 
+def _pyzbar_load_error():
+    return (
+        "pyzbar failed to load libzbar. Install the Visual C++ 2013 x64 redistributable (MSVCR120.dll). "
+        + (_PYZBAR_ERROR or "")
+    )
+
+def _jpeg_data_url(image):
+    ok, buffer = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+    if not ok:
+        return None
+    encoded = base64.b64encode(buffer.tobytes()).decode("ascii")
+    return f"data:image/jpeg;base64,{encoded}"
+
+def _grab_frame(index):
+    cap = get_camera(index)
+    ret, frame = cap.read()
+    if not ret or frame is None:
+        return None
+    return frame
+
+def _codes_from_frame(frame):
+    decoded = pyzbar.decode(frame)
+    results = []
+    for obj in decoded:
+        try:
+            text = obj.data.decode("utf-8")
+        except UnicodeDecodeError:
+            text = obj.data.decode("latin-1", errors="replace")
+        results.append({
+            "type": obj.type,
+            "data": _clean_code(text),
+            "rect": {
+                "x": obj.rect.left,
+                "y": obj.rect.top,
+                "w": obj.rect.width,
+                "h": obj.rect.height,
+            },
+        })
+    return results
+
 @app.get("/health")
 def health():
     return {"status": "ok", "engine": "python-sidecar"}
@@ -503,31 +543,72 @@ def camera_stream(index: int = 0):
 
 @app.get("/camera/decode")
 def camera_decode(index: int = 0):
-    cap = get_camera(index)
-    ret, frame = cap.read()
-    if not ret:
+    frame = _grab_frame(index)
+    if frame is None:
         return {"status": "fail", "message": "No frame"}
 
     if pyzbar is None:
         return {
             "status": "fail",
-            "message": "pyzbar failed to load libzbar. Install the Visual C++ 2013 x64 redistributable (MSVCR120.dll). " + (_PYZBAR_ERROR or ""),
+            "message": _pyzbar_load_error(),
             "codes": [],
         }
 
-    decoded = pyzbar.decode(frame)
-    results = []
-    for obj in decoded:
-        results.append({
-            "type": obj.type,
-            "data": _clean_code(obj.data.decode("utf-8")),
-            "rect": {"x": obj.rect.left, "y": obj.rect.top, "w": obj.rect.width, "h": obj.rect.height}
-        })
-
+    results = _codes_from_frame(frame)
     return {
         "status": "pass" if results else "fail",
         "message": f"Found {len(results)} code(s)" if results else "No code detected",
         "codes": results
+    }
+
+@app.get("/camera/snapshot")
+def camera_snapshot(index: int = 0):
+    # Freeze this frame only when its barcode is in the current BoM (JSON or MSSQL).
+    frame = _grab_frame(index)
+    if frame is None:
+        return {"status": "fail", "snapshot": False, "message": "No frame"}
+
+    if pyzbar is None:
+        return {
+            "status": "fail",
+            "snapshot": False,
+            "message": _pyzbar_load_error(),
+            "codes": [],
+        }
+
+    codes = _codes_from_frame(frame)
+    if not codes:
+        return {
+            "status": "idle",
+            "snapshot": False,
+            "message": "No code detected",
+            "codes": [],
+        }
+
+    barcode = codes[0]["data"]
+    looked = lookup_bom(barcode)
+    if looked.get("status") != "pass":
+        return {
+            "status": "fail",
+            "snapshot": False,
+            "barcode": barcode,
+            "message": looked.get("message") or "Barcode not found in BoM",
+            "codes": codes,
+        }
+
+    image = _jpeg_data_url(frame)
+    if not image:
+        return {
+            "status": "fail",
+            "snapshot": False,
+            "barcode": barcode,
+            "message": "Could not encode the frame",
+        }
+
+    return {
+        **looked,
+        "snapshot": True,
+        "image": image,
     }
 
 @app.get("/cameras")
@@ -886,11 +967,7 @@ def _annotate_blobs(image, groups):
                 max(1, thickness - 1),
                 cv2.LINE_AA,
             )
-    ok, buffer = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-    if not ok:
-        return None
-    encoded = base64.b64encode(buffer.tobytes()).decode("ascii")
-    return f"data:image/jpeg;base64,{encoded}"
+    return _jpeg_data_url(annotated)
 
 @app.post("/inspect/sample")
 def inspect_sample(name: str = DEFAULT_SAMPLE):
@@ -969,22 +1046,23 @@ def update_bom_source(body: BomSourceUpdate):
         message = "Saved. Inspect uses vision/sample-bom.json."
     return {"status": "pass", "message": message, **saved}
 
-@app.post("/inspect")
-def inspect(req: InspectRequest):
+def lookup_bom(barcode):
     source = load_bom_source()
     if source["source"] == "mssql":
         try:
-            return _inspect_mssql(req.barcode, source)
+            return _inspect_mssql(barcode, source)
         except Exception as exc:
-            return _inspect_fail(req.barcode, _mssql_error_message(exc, source))
+            return _inspect_fail(barcode, _mssql_error_message(exc, source))
 
     bom = load_bom()
-    job = bom.get(req.barcode)
-
+    job = bom.get(barcode)
     if not job:
-        return _inspect_fail(req.barcode, "Barcode not found in BoM")
+        return _inspect_fail(barcode, "Barcode not found in BoM")
+    return _inspect_pass(barcode, job)
 
-    return _inspect_pass(req.barcode, job)
+@app.post("/inspect")
+def inspect(req: InspectRequest):
+    return lookup_bom(req.barcode)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=8008)
