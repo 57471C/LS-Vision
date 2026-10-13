@@ -2,6 +2,7 @@ import base64
 from typing import Optional
 
 import cv2
+import numpy as np
 from fastapi import Body, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -35,6 +36,11 @@ SAMPLE_DIR = Path(__file__).parent / "test-images"
 DEFAULT_SAMPLE = "Example3.jpg"
 # Areas within this multiple of the group median stay in the same size band.
 SIZE_GROUP_RATIO = 2.0
+# Min-area-rect aspect is long side / short side.
+# Nuts, washers, and isolators are near square. Bolts are long and thin.
+ROUND_ASPECT_MAX = 1.6
+BOLT_ASPECT_MIN = 2.0
+BOLT_ASPECT_MAX = 8.0
 
 # Fixed square on the bench. Change at runtime with POST /barcode/roi.
 CAMERA_INDEX = 0
@@ -122,6 +128,12 @@ def _crop_roi(frame, roi):
     clamped = {"x": x, "y": y, "w": rw, "h": rh}
     return frame[y:y + rh, x:x + rw], clamped
 
+def _clean_code(text):
+    # Trailing "/" was a temporary Code 39 suffix. Revisit when labels move to QR.
+    if text.endswith("/"):
+        return text[:-1]
+    return text
+
 def _decode(image):
     if pyzbar is None:
         return []
@@ -132,7 +144,7 @@ def _decode(image):
         except UnicodeDecodeError:
             text = barcode.data.decode("latin-1", errors="replace")
         codes.append({
-            "data": text,
+            "data": _clean_code(text),
             "type": barcode.type,
         })
     return codes
@@ -173,7 +185,7 @@ def camera_decode(index: int = 0):
     for obj in decoded:
         results.append({
             "type": obj.type,
-            "data": obj.data.decode("utf-8"),
+            "data": _clean_code(obj.data.decode("utf-8")),
             "rect": {"x": obj.rect.left, "y": obj.rect.top, "w": obj.rect.width, "h": obj.rect.height}
         })
 
@@ -289,6 +301,48 @@ def _size_label(index):
         return labels[index]
     return f"S{index + 1}"
 
+def _fill_holes(binary):
+    # Flood from a background corner. That fills the bench, not holes inside a part.
+    if binary.size == 0 or binary[0, 0] != 0:
+        return binary
+    flood = binary.copy()
+    height, width = binary.shape[:2]
+    ff_mask = np.zeros((height + 2, width + 2), np.uint8)
+    cv2.floodFill(flood, ff_mask, (0, 0), 255)
+    return cv2.bitwise_or(binary, cv2.bitwise_not(flood))
+
+def _split_touching(mask):
+    # Open/close cuts thin bridges. Parts that still touch keep separate distance
+    # peaks, and watershed cuts between those peaks.
+    distance = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+    peak_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    dilated = cv2.dilate(distance, peak_kernel)
+    peaks = ((distance >= dilated - 1e-3) & (distance >= 4)).astype(np.uint8)
+    count, markers = cv2.connectedComponents(peaks)
+    if count <= 1:
+        return mask
+    marks = np.zeros(mask.shape, np.int32)
+    marks[peaks > 0] = markers[peaks > 0]
+    marks += 1
+    marks[(mask > 0) & (peaks == 0)] = 0
+    labels = cv2.watershed(cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR), marks)
+    split = np.zeros(mask.shape, np.uint8)
+    split[labels > 1] = 255
+    # A one-pixel watershed line still joins contours on the diagonal.
+    cut = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    return cv2.erode(split, cut)
+
+def _part_shape(contour):
+    (_, (rect_w, rect_h), _) = cv2.minAreaRect(contour)
+    short_side = min(rect_w, rect_h)
+    long_side = max(rect_w, rect_h)
+    if short_side < 8:
+        return None
+    aspect = long_side / float(short_side)
+    if aspect <= ROUND_ASPECT_MAX or BOLT_ASPECT_MIN <= aspect <= BOLT_ASPECT_MAX:
+        return aspect
+    return None
+
 def _detected_blobs(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (7, 7), 0)
@@ -296,22 +350,25 @@ def _detected_blobs(image):
         blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 41, 6
     )
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    # Open drops speckle. Close seals cracks inside a part. Open again so that
+    # close cannot glue touching parts back together.
     mask = cv2.morphologyEx(dark, cv2.MORPH_OPEN, kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = _fill_holes(mask)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = _split_touching(mask)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     image_area = gray.shape[0] * gray.shape[1]
     blobs = []
     for contour in contours:
         area = cv2.contourArea(contour)
-        if area < image_area * 0.00015 or area > image_area * 0.02:
+        if area < image_area * 0.0001 or area > image_area * 0.02:
+            continue
+        if _part_shape(contour) is None:
             continue
         x, y, width, height = cv2.boundingRect(contour)
-        short_side = min(width, height)
-        long_side = max(width, height)
-        if short_side < 10 or long_side / float(short_side) > 8:
-            continue
-        if area / float(width * height) < 0.2:
+        if width < 1 or height < 1 or area / float(width * height) < 0.2:
             continue
         blobs.append({
             "area": area,
