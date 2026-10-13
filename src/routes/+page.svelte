@@ -48,6 +48,7 @@ function stopWatch() {
 }
 
 function startWatch() {
+	if (snapshot) return;
 	stopWatch();
 	void watchFeed();
 	watchTimer = setInterval(() => {
@@ -59,6 +60,11 @@ function toggleFeed() {
 	feedOn = !feedOn;
 	if (feedOn) startWatch();
 	else stopWatch();
+}
+
+function resumeLiveFeed() {
+	snapshot = null;
+	if (feedOn) startWatch();
 }
 
 function inspectView(body: WatchBody): InspectView {
@@ -84,10 +90,11 @@ function showSnapshot(body: WatchBody) {
 		takenAt: new Date().toLocaleTimeString(),
 	};
 	result = inspectView(body);
+	stopWatch();
 }
 
 async function watchFeed() {
-	if (!feedOn || watchInFlight || loading) return;
+	if (!feedOn || snapshot || watchInFlight || loading) return;
 	watchInFlight = true;
 	const index = cameraIndex;
 	try {
@@ -100,6 +107,7 @@ async function watchFeed() {
 			!pageAlive ||
 			loading ||
 			!feedOn ||
+			snapshot ||
 			index !== cameraIndex ||
 			!body.snapshot ||
 			!body.image
@@ -205,236 +213,222 @@ async function decodeAndInspect() {
 }
 </script>
 
-<div class="min-h-screen bg-neutral-100 text-neutral-950">
-	<header class="border-b-4 border-neutral-950 bg-neutral-950 text-white">
-		<div class="mx-auto flex max-w-[1600px] flex-wrap items-center justify-between gap-4 px-6 py-4">
-			<div>
-				<p class="text-sm font-bold uppercase tracking-widest text-neutral-300">Operator</p>
-				<h1 class="text-4xl font-black tracking-tight">LS-Vision</h1>
-			</div>
-			<div class="flex flex-wrap items-center gap-3">
-				<a
-					href="/settings"
-					aria-label="Settings"
-					class="inline-flex h-14 w-14 items-center justify-center border-2 border-white bg-white text-neutral-950"
+<div class="flex min-h-screen flex-col bg-slate-950 text-slate-100">
+	<header class="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 bg-slate-900 px-4 py-2">
+		<div class="flex items-baseline gap-3">
+			<h1 class="text-lg font-semibold tracking-tight">LS-Vision</h1>
+			<p class="text-xs font-medium uppercase tracking-widest text-slate-500">Operator</p>
+		</div>
+		<div class="flex flex-wrap items-center gap-2">
+			<p
+				class="inline-flex min-h-9 items-center gap-2 border px-2.5 text-xs font-semibold uppercase tracking-wide {snapshot
+					? 'border-amber-700/80 bg-amber-950 text-amber-200'
+					: feedOn
+						? 'border-slate-600 bg-slate-800 text-slate-100'
+						: 'border-slate-700 bg-slate-900 text-slate-400'}"
+			>
+				<span
+					class="h-2 w-2 shrink-0 {snapshot
+						? 'bg-amber-400'
+						: feedOn
+							? 'bg-green-400'
+							: 'bg-slate-500'}"
+					aria-hidden="true"
+				></span>
+				{snapshot ? "Watch stopped" : feedOn ? "Watching · 8s" : "Watch paused"}
+			</p>
+			<a
+				href="/settings"
+				aria-label="Settings"
+				class="inline-flex h-11 w-11 items-center justify-center border border-slate-600 bg-slate-800 text-slate-100"
+			>
+				<svg
+					xmlns="http://www.w3.org/2000/svg"
+					viewBox="0 0 24 24"
+					class="h-5 w-5"
+					fill="none"
+					stroke="currentColor"
+					stroke-width="2"
+					aria-hidden="true"
 				>
-					<svg
-						xmlns="http://www.w3.org/2000/svg"
-						viewBox="0 0 24 24"
-						class="h-7 w-7"
-						fill="none"
-						stroke="currentColor"
-						stroke-width="2"
-						aria-hidden="true"
-					>
-						<circle cx="12" cy="12" r="3" />
-						<path
-							d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9c.3.6.9 1.1 1.5 1.1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1.1z"
-						/>
-					</svg>
-				</a>
-				<button
-					type="button"
-					class="inline-flex min-h-14 items-center border-2 border-white bg-white px-5 text-lg font-bold text-neutral-950"
-					on:click={startSidecar}
-				>
-					Start Vision Sidecar
-				</button>
-			</div>
+					<circle cx="12" cy="12" r="3" />
+					<path
+						d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9c.3.6.9 1.1 1.5 1.1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1.1z"
+					/>
+				</svg>
+			</a>
+			<button
+				type="button"
+				class="inline-flex min-h-11 items-center border border-slate-600 bg-slate-800 px-3 text-sm font-semibold text-slate-100"
+				on:click={startSidecar}
+			>
+				Start Vision Sidecar
+			</button>
 		</div>
 	</header>
 
-	<main class="mx-auto flex max-w-[1600px] flex-col gap-6 px-6 py-6">
-		<section class="flex flex-wrap items-end gap-4 border-4 border-neutral-950 bg-white p-4">
-			<label class="flex min-w-64 flex-1 flex-col gap-2 text-sm font-black uppercase tracking-widest">
-				Barcode
-				<input
-					class="w-full border-2 border-neutral-950 bg-white px-3 py-3 text-2xl font-semibold normal-case tracking-normal"
-					bind:value={barcode}
-				/>
-			</label>
-			<button
-				type="button"
-				class="inline-flex min-h-14 items-center border-2 border-neutral-950 bg-neutral-950 px-5 text-lg font-bold text-white disabled:border-neutral-400 disabled:bg-neutral-400 disabled:text-neutral-950"
-				on:click={runInspect}
-				disabled={loading}
+	<div class="flex flex-wrap items-end gap-2 border-b border-slate-800 bg-slate-900 px-4 py-2">
+		<label class="flex min-w-56 flex-1 flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-slate-400">
+			Barcode
+			<input
+				class="w-full border border-slate-600 bg-slate-950 px-3 py-2 font-mono text-lg font-medium normal-case tracking-normal text-slate-100"
+				bind:value={barcode}
+			/>
+		</label>
+		<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-slate-400">
+			Camera
+			<select
+				class="min-h-11 border border-slate-600 bg-slate-950 px-3 font-mono text-base normal-case tracking-normal text-slate-100"
+				bind:value={cameraIndex}
 			>
-				{loading ? "Inspecting..." : "Inspect"}
-			</button>
+				<option value={0}>0</option>
+				<option value={1}>1</option>
+			</select>
+		</label>
+		<button
+			type="button"
+			class="inline-flex min-h-11 items-center border border-slate-200 bg-slate-100 px-4 text-sm font-semibold text-slate-950 disabled:border-slate-700 disabled:bg-slate-800 disabled:text-slate-500"
+			on:click={runInspect}
+			disabled={loading}
+		>
+			{loading ? "Inspecting..." : "Inspect"}
+		</button>
+		<button
+			type="button"
+			class="inline-flex min-h-11 items-center border border-slate-200 bg-slate-100 px-4 text-sm font-semibold text-slate-950 disabled:border-slate-700 disabled:bg-slate-800 disabled:text-slate-500"
+			on:click={decodeAndInspect}
+			disabled={loading}
+		>
+			Decode QR / Barcode
+		</button>
+		<button
+			type="button"
+			class="inline-flex min-h-11 items-center border border-slate-600 bg-slate-800 px-4 text-sm font-semibold text-slate-100 disabled:text-slate-500"
+			on:click={testSampleImage}
+			disabled={loading}
+		>
+			Test sample image
+		</button>
+		<button
+			type="button"
+			class="inline-flex min-h-11 items-center border border-slate-600 bg-slate-800 px-4 text-sm font-semibold text-slate-100"
+			on:click={toggleFeed}
+		>
+			{feedOn ? "Stop feed" : "Start feed"}
+		</button>
+	</div>
+
+	<div class="grid min-h-0 flex-1 gap-3 p-3 lg:grid-cols-[minmax(0,1.7fr)_minmax(22rem,28rem)]">
+		<section class="flex min-h-[28rem] min-w-0 flex-col border border-slate-700 bg-black">
+			<div class="flex items-center justify-between border-b border-slate-800 px-3 py-1.5">
+				<h2 class="text-[11px] font-semibold uppercase tracking-widest text-slate-500">
+					{snapshot ? "Snapshot" : "Camera"}
+				</h2>
+				{#if snapshot}
+					<p class="text-xs text-amber-200">Automatic watch is stopped</p>
+				{/if}
+			</div>
+			<div class="relative min-h-0 flex-1">
+				{#if snapshot}
+					<img
+						src={snapshot.image}
+						alt="Snapshot of kit {snapshot.kitCode}"
+						class="h-full max-h-[calc(100vh-11rem)] w-full object-contain"
+					/>
+					<div
+						class="absolute inset-x-0 bottom-0 flex flex-wrap items-end justify-between gap-3 bg-gradient-to-t from-slate-950 via-slate-950/85 to-transparent px-4 pt-16 pb-3"
+					>
+						<div>
+							<p class="font-mono text-3xl font-semibold leading-none text-white">{snapshot.kitCode}</p>
+							<p class="mt-1 text-sm text-slate-300">Taken {snapshot.takenAt}</p>
+						</div>
+						<button
+							type="button"
+							class="inline-flex min-h-11 items-center border border-slate-200 bg-slate-100 px-4 text-sm font-semibold text-slate-950"
+							on:click={resumeLiveFeed}
+						>
+							Resume live feed
+						</button>
+					</div>
+				{:else if feedOn}
+					<img
+						src="http://127.0.0.1:8008/camera/stream?index={cameraIndex}"
+						alt="Camera feed"
+						class="h-full max-h-[calc(100vh-11rem)] w-full object-contain"
+					/>
+				{:else}
+					<div class="flex h-full min-h-[24rem] items-center justify-center text-lg text-slate-500">
+						Feed stopped
+					</div>
+				{/if}
+			</div>
 		</section>
 
-		<div class="grid items-stretch gap-6 lg:grid-cols-2">
-			<section class="flex min-w-0 flex-col gap-4">
-				<div class="flex flex-wrap items-end justify-between gap-3">
-					<h2 class="text-sm font-black uppercase tracking-widest">Camera</h2>
-					<label class="flex items-center gap-3 text-sm font-black uppercase tracking-widest">
-						Index
-						<select
-							class="min-h-14 border-2 border-neutral-950 bg-white px-3 text-lg font-semibold normal-case tracking-normal"
-							bind:value={cameraIndex}
-						>
-							<option value={0}>0 (default)</option>
-							<option value={1}>1</option>
-						</select>
-					</label>
-				</div>
-				<div class="border-4 border-neutral-950 bg-neutral-200">
-					{#if feedOn}
-						<img
-							src="http://127.0.0.1:8008/camera/stream?index={cameraIndex}"
-							alt="Camera feed"
-							class="h-[22rem] w-full bg-neutral-200 object-contain"
-						/>
-					{:else}
-						<div
-							class="flex h-[22rem] w-full items-center justify-center bg-neutral-200 text-2xl font-black"
-						>
-							Feed stopped
-						</div>
-					{/if}
-				</div>
-				<div class="flex flex-wrap items-center gap-3">
-					<button
-						type="button"
-						class="inline-flex min-h-14 items-center border-2 border-neutral-950 bg-white px-5 text-lg font-bold"
-						on:click={toggleFeed}
-					>
-						{feedOn ? "Stop feed" : "Start feed"}
-					</button>
-					<p
-						class="inline-flex min-h-10 items-center gap-2 border-2 border-neutral-950 px-3 text-sm font-black uppercase tracking-wide {feedOn
-							? 'bg-white'
-							: 'bg-neutral-200'}"
-					>
-						<span
-							class="h-3 w-3 shrink-0 {feedOn ? 'bg-green-700' : 'bg-neutral-950'}"
-							aria-hidden="true"
-						></span>
-						{feedOn ? "Watching the feed · 8s" : "Watch paused"}
-					</p>
-				</div>
-				<div class="flex flex-wrap items-center gap-3">
-					<button
-						type="button"
-						class="inline-flex min-h-14 items-center border-2 border-neutral-950 bg-neutral-950 px-5 text-lg font-black text-white disabled:border-neutral-400 disabled:bg-neutral-400 disabled:text-neutral-950"
-						on:click={decodeAndInspect}
-						disabled={loading}
-					>
-						Decode QR / Barcode
-					</button>
-					<button
-						type="button"
-						class="inline-flex min-h-14 items-center border-2 border-neutral-950 bg-white px-5 text-lg font-bold disabled:border-neutral-400 disabled:bg-neutral-400"
-						on:click={testSampleImage}
-						disabled={loading}
-					>
-						Test sample image
-					</button>
-				</div>
-			</section>
-
-			<aside class="flex min-w-0 flex-col border-4 border-neutral-950 bg-white">
-				<div
-					class="border-b-4 border-neutral-950 px-5 py-4 {snapshot
-						? 'bg-neutral-950 text-white'
-						: 'bg-neutral-100 text-neutral-950'}"
-				>
-					<p class="text-sm font-black uppercase tracking-widest">
-						{snapshot ? "Snapshot taken" : "Snapshot"}
-					</p>
-					{#if snapshot}
-						<p class="mt-2 text-5xl font-black leading-none tracking-tight">{snapshot.kitCode}</p>
-						<p class="mt-3 text-lg font-semibold">Taken {snapshot.takenAt}</p>
-					{:else}
-						<p class="mt-2 text-4xl font-black leading-none tracking-tight">No snapshot yet</p>
-					{/if}
-				</div>
-				<div class="flex flex-1 flex-col p-4">
-					{#if snapshot}
-						<img
-							src={snapshot.image}
-							alt="Snapshot of kit {snapshot.kitCode}"
-							class="h-[22rem] w-full border-4 border-neutral-950 bg-neutral-200 object-contain"
-						/>
-					{:else}
-						<div
-							class="flex h-[22rem] w-full flex-col items-center justify-center gap-3 border-4 border-dashed border-neutral-950 bg-neutral-100 px-6 text-center"
-						>
-							<p class="text-3xl font-black">Waiting for a BoM barcode</p>
-							<p class="max-w-md text-lg leading-snug">
-								A still appears here when the camera reads a code that is in the BoM.
-							</p>
-						</div>
-					{/if}
-				</div>
-			</aside>
-		</div>
-
-		<section class="flex flex-col gap-3">
-			<h2 class="text-sm font-black uppercase tracking-widest">Result</h2>
+		<section class="flex min-w-0 flex-col border border-slate-700 bg-slate-900">
+			<h2 class="border-b border-slate-800 px-3 py-1.5 text-[11px] font-semibold uppercase tracking-widest text-slate-500">
+				Result
+			</h2>
 			{#if result}
-				<div class="overflow-hidden border-4 border-neutral-950 bg-white">
-					<p
-						class="px-5 py-6 text-6xl font-black uppercase leading-none tracking-wide text-white {result.status ===
-						'pass'
-							? 'bg-green-700'
-							: 'bg-red-700'}"
-					>
-						{result.status}
-					</p>
-					<div class="flex flex-col gap-4 p-5">
-						{#if result.kitCode}
-							<p class="text-4xl font-black tracking-tight">Kit {result.kitCode}</p>
-						{/if}
-						{#if result.des}
-							<p class="text-xl text-neutral-800">{result.des}</p>
-						{/if}
-						{#if result.message}
-							<p class="text-xl">{result.message}</p>
-						{/if}
-						{#if result.parts?.length}
-							<table class="w-full border-collapse text-left text-lg">
-								<thead>
-									<tr class="border-b-2 border-neutral-950 text-sm uppercase tracking-wide">
-										<th class="py-3 pr-3 font-bold">IC</th>
-										<th class="py-3 pr-3 font-bold">Description</th>
-										<th class="py-3 text-right font-bold">Qty</th>
+				<p
+					class="px-4 py-5 text-5xl font-black uppercase leading-none tracking-widest {result.status ===
+					'pass'
+						? 'bg-green-500 text-slate-950'
+						: 'bg-red-600 text-white'}"
+				>
+					{result.status}
+				</p>
+				<div class="flex flex-col gap-3 p-4">
+					{#if result.kitCode}
+						<p class="font-mono text-2xl font-semibold tracking-tight">{result.kitCode}</p>
+					{/if}
+					{#if result.des}
+						<p class="text-base text-slate-300">{result.des}</p>
+					{/if}
+					{#if result.message}
+						<p class="text-base text-slate-200">{result.message}</p>
+					{/if}
+					{#if result.parts?.length}
+						<table class="w-full border-collapse text-left text-sm">
+							<thead>
+								<tr class="border-b border-slate-600 text-[11px] uppercase tracking-widest text-slate-400">
+									<th class="py-2 pr-3 font-semibold">IC</th>
+									<th class="py-2 pr-3 font-semibold">Description</th>
+									<th class="py-2 text-right font-semibold">Qty</th>
+								</tr>
+							</thead>
+							<tbody>
+								{#each result.parts as part, i (i)}
+									<tr class="border-b border-slate-800">
+										<td class="py-2 pr-3 font-mono font-medium">{part.ic}</td>
+										<td class="py-2 pr-3 text-slate-200">{part.des}</td>
+										<td class="py-2 text-right font-semibold">{part.qty}</td>
 									</tr>
-								</thead>
-								<tbody>
-									{#each result.parts as part, i (i)}
-										<tr class="border-b border-neutral-300">
-											<td class="py-3 pr-3 font-mono font-semibold">{part.ic}</td>
-											<td class="py-3 pr-3">{part.des}</td>
-											<td class="py-3 text-right font-bold">{part.qty}</td>
-										</tr>
-									{/each}
-								</tbody>
-							</table>
-						{/if}
-						{#if result.image}
-							<img
-								src={result.image}
-								alt="Annotated sample"
-								class="w-full border-4 border-neutral-950 bg-neutral-200"
-							/>
-						{/if}
-						{#if result.info}
-							<p class="text-base text-neutral-800">{result.info}</p>
-						{/if}
-						{#if result.kitsFound != null || result.expectedKitCount != null}
-							<p class="text-base text-neutral-800">
-								Info only: {result.kitsFound ?? "—"} kit(s) found, {result.expectedKitCount ?? "—"} expected
-							</p>
-						{/if}
-					</div>
+								{/each}
+							</tbody>
+						</table>
+					{/if}
+					{#if result.image}
+						<img
+							src={result.image}
+							alt="Annotated sample"
+							class="w-full border border-slate-700 bg-black"
+						/>
+					{/if}
+					{#if result.info}
+						<p class="text-sm text-slate-400">{result.info}</p>
+					{/if}
+					{#if result.kitsFound != null || result.expectedKitCount != null}
+						<p class="text-sm text-slate-400">
+							Info only: {result.kitsFound ?? "—"} kit(s) found, {result.expectedKitCount ?? "—"} expected
+						</p>
+					{/if}
 				</div>
 			{:else}
-				<div class="border-4 border-neutral-950 bg-white px-5 py-8">
-					<p class="text-3xl font-black">No result yet</p>
-					<p class="mt-2 text-lg">Decode a barcode or press Inspect.</p>
+				<div class="px-4 py-8">
+					<p class="text-lg font-medium text-slate-300">No result yet</p>
+					<p class="mt-1 text-sm text-slate-500">Decode a barcode or press Inspect.</p>
 				</div>
 			{/if}
 		</section>
-	</main>
+	</div>
 </div>
