@@ -41,6 +41,13 @@ SIZE_GROUP_RATIO = 2.0
 ROUND_ASPECT_MAX = 1.6
 BOLT_ASPECT_MIN = 2.0
 BOLT_ASPECT_MAX = 8.0
+# Example3 is about 3 megapixels. This keeps small nuts and washers
+# (about 210 px) and still drops the speckle under that.
+MIN_AREA_FRACTION = 0.00007
+# A filled stack smaller than this is left to the global watershed.
+STACK_MIN_AREA = 1500
+# Isolator disks sit above this. Stacked bolts are lumpier.
+STACK_MAX_CIRCULARITY = 0.62
 
 # Fixed square on the bench. Change at runtime with POST /barcode/roi.
 CAMERA_INDEX = 0
@@ -343,6 +350,101 @@ def _part_shape(contour):
         return aspect
     return None
 
+def _circularity(contour):
+    area = cv2.contourArea(contour)
+    peri = cv2.arcLength(contour, True)
+    if peri <= 0 or area <= 0:
+        return 0.0
+    return float(4.0 * np.pi * area / (peri * peri))
+
+def _bolt_bands(row_strength):
+    # Rows where the opened mask is wide are the body of a bolt. The gaps
+    # between stacked bolts fall below this level.
+    peak = float(row_strength.max()) if row_strength.size else 0.0
+    if peak <= 0:
+        return []
+    level = peak * 0.42
+    spans = []
+    start = None
+    for index, strength in enumerate(row_strength.tolist()):
+        if strength >= level and start is None:
+            start = index
+        elif strength < level and start is not None:
+            spans.append([start, index - 1])
+            start = None
+    if start is not None:
+        spans.append([start, row_strength.size - 1])
+    merged = []
+    for span in spans:
+        if merged and span[0] - merged[-1][1] <= 3:
+            merged[-1][1] = span[1]
+        else:
+            merged.append(span)
+    return [(band_start, band_end) for band_start, band_end in merged if band_end - band_start + 1 >= 8]
+
+def _split_stacked(opened, mask):
+    # Close and hole-fill turn a bolt stack into one solid blob, so the global
+    # watershed sees a single peak. The distance transform of the opened mask
+    # still has a ridge per bolt. Cutting the valley between ridges separates
+    # the stack. A single nick can slice a round part, so the cut is kept only
+    # when it yields at least three horizontal bolts.
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    result = mask.copy()
+    dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    smooth = np.array([1, 2, 3, 2, 1], np.float32)
+    smooth /= smooth.sum()
+    for contour in contours:
+        if cv2.contourArea(contour) < STACK_MIN_AREA or _circularity(contour) >= STACK_MAX_CIRCULARITY:
+            continue
+        x, y, width, height = [int(value) for value in cv2.boundingRect(contour)]
+        if height < 36:
+            continue
+        component = np.zeros(mask.shape, np.uint8)
+        cv2.drawContours(component, [contour], -1, 255, -1)
+        local = cv2.bitwise_and(opened, cv2.dilate(component, dilate_kernel))
+        crop_open = local[y:y + height, x:x + width]
+        crop = component[y:y + height, x:x + width]
+        if cv2.countNonZero(crop_open) < 80:
+            continue
+        distance = cv2.distanceTransform(crop_open, cv2.DIST_L2, 3)
+        row_distance = distance.sum(axis=1)
+        row_strength = (crop_open > 0).sum(axis=1).astype(np.float32)
+        if row_strength.size >= 5:
+            row_strength = np.convolve(row_strength, smooth, mode="same")
+            row_distance = np.convolve(row_distance, smooth, mode="same")
+        bands = _bolt_bands(row_strength)
+        if len(bands) < 3:
+            continue
+        cut = crop.copy()
+        for (band_start, band_end), (next_start, _next_end) in zip(bands, bands[1:]):
+            if next_start <= band_end:
+                continue
+            gap = row_distance[band_end:next_start + 1]
+            cut_at = int(band_end + np.argmin(gap))
+            lo = max(0, cut_at - 1)
+            hi = min(cut.shape[0], cut_at + 2)
+            cut[lo:hi, :] = 0
+        pieces, _ = cv2.findContours(cut, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        kept = 0
+        for piece in pieces:
+            piece_area = cv2.contourArea(piece)
+            aspect = _part_shape(piece)
+            _, _, piece_w, piece_h = cv2.boundingRect(piece)
+            if (
+                piece_area >= 180
+                and aspect is not None
+                and aspect >= BOLT_ASPECT_MIN
+                and piece_w > piece_h
+            ):
+                kept += 1
+        if kept < 3:
+            continue
+        region = result[y:y + height, x:x + width]
+        region[crop > 0] = 0
+        region[cut > 0] = 255
+        result[y:y + height, x:x + width] = region
+    return result
+
 def _detected_blobs(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (7, 7), 0)
@@ -352,18 +454,19 @@ def _detected_blobs(image):
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     # Open drops speckle. Close seals cracks inside a part. Open again so that
     # close cannot glue touching parts back together.
-    mask = cv2.morphologyEx(dark, cv2.MORPH_OPEN, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    opened = cv2.morphologyEx(dark, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel)
     mask = _fill_holes(mask)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
     mask = _split_touching(mask)
+    mask = _split_stacked(opened, mask)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     image_area = gray.shape[0] * gray.shape[1]
     blobs = []
     for contour in contours:
         area = cv2.contourArea(contour)
-        if area < image_area * 0.0001 or area > image_area * 0.02:
+        if area < image_area * MIN_AREA_FRACTION or area > image_area * 0.02:
             continue
         if _part_shape(contour) is None:
             continue
