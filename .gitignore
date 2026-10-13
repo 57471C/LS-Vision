@@ -10,3 +10,5 @@ vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 __pycache__/
 *.pyc
+# Local BoM source choice. Absent file means the JSON sample BoM.
+vision/bom-source.json

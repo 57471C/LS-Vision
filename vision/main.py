@@ -32,6 +32,9 @@ app.add_middleware(
 )
 
 BOM_PATH = Path(__file__).parent / "sample-bom.json"
+# Local BoM source choice. A missing file means the JSON sample BoM.
+# The settings password is not stored here.
+BOM_SOURCE_PATH = Path(__file__).parent / "bom-source.json"
 SAMPLE_DIR = Path(__file__).parent / "test-images"
 DEFAULT_SAMPLE = "Example3.jpg"
 # Areas within this multiple of the group median stay in the same size band.
@@ -73,6 +76,52 @@ class RoiUpdate(BaseModel):
     y: int
     w: int
     h: int
+
+class BomSourceUpdate(BaseModel):
+    source: str
+    server: Optional[str] = ""
+    database: Optional[str] = ""
+    user: Optional[str] = ""
+    # Accepted so a client can send the field, then dropped. It is not saved.
+    password: Optional[str] = None
+
+def _blank_bom_source():
+    return {
+        "source": "json",
+        "mssql": {"server": "", "database": "", "user": ""},
+    }
+
+def load_bom_source():
+    config = _blank_bom_source()
+    if not BOM_SOURCE_PATH.exists():
+        return config
+    try:
+        with open(BOM_SOURCE_PATH, encoding="utf-8") as f:
+            saved = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return config
+    source = saved.get("source")
+    if source in ("json", "mssql"):
+        config["source"] = source
+    mssql = saved.get("mssql")
+    if isinstance(mssql, dict):
+        for key in ("server", "database", "user"):
+            value = mssql.get(key)
+            if isinstance(value, str):
+                config["mssql"][key] = value
+    return config
+
+def save_bom_source(config):
+    stored = {
+        "source": config["source"],
+        "mssql": {
+            "server": config["mssql"]["server"],
+            "database": config["mssql"]["database"],
+            "user": config["mssql"]["user"],
+        },
+    }
+    BOM_SOURCE_PATH.write_text(json.dumps(stored, indent=2) + "\n", encoding="utf-8")
+    return stored
 
 def load_bom():
     if not BOM_PATH.exists():
@@ -605,8 +654,36 @@ def inspect_sample(name: str = DEFAULT_SAMPLE):
         "image": _annotate_blobs(image, groups),
     }
 
+@app.get("/settings/bom-source")
+def get_bom_source():
+    return load_bom_source()
+
+@app.post("/settings/bom-source")
+def update_bom_source(body: BomSourceUpdate):
+    if body.source not in ("json", "mssql"):
+        return {"status": "fail", "message": "BoM source must be json or mssql"}
+    config = _blank_bom_source()
+    config["source"] = body.source
+    config["mssql"]["server"] = (body.server or "").strip()
+    config["mssql"]["database"] = (body.database or "").strip()
+    config["mssql"]["user"] = (body.user or "").strip()
+    saved = save_bom_source(config)
+    if body.source == "mssql":
+        message = "Saved. MSSQL BoM lookup is not implemented yet."
+    else:
+        message = "Saved. Inspect uses vision/sample-bom.json."
+    return {"status": "pass", "message": message, **saved}
+
 @app.post("/inspect")
 def inspect(req: InspectRequest):
+    if load_bom_source()["source"] == "mssql":
+        return {
+            "barcode": req.barcode,
+            "status": "fail",
+            "message": "MSSQL BoM source is not implemented yet",
+            "kits": [],
+        }
+
     bom = load_bom()
     job = bom.get(req.barcode)
 
