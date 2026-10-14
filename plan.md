@@ -3,7 +3,7 @@
 ### Goal
 Independent bench stations (NUCs) that:
 - Read one barcode from a fixed square on the bench
-- Pull the BoM (parts + qty) from MSSQL (JSON/CSV for testing)
+- Pull the BoM (parts + qty) from MSSQL (JSON for testing)
 - Detect the kits on the bench
 - Verify every kit against that single BoM
 - Show clear pass/fail (with per-kit detail)
@@ -18,20 +18,20 @@ Independent bench stations (NUCs) that:
 - Vision engine starts as Python sidecar, designed so it can later move to ONNX-in-Rust
 
 ### Station flow
-1. Operator places barcode label in the known square and lays out the kits.
-2. App reads the barcode from the fixed ROI.
-3. Successful read triggers inspection (manual button still available as fallback).
-4. Query BoM source (MSSQL or file) → expected parts + quantities, and expected kit/label count if available.
+1. Operator places parts on bench for inspection
+2. Operator places barcode label in the known square Region of Interest (ROI).
+3. App reads the barcode from the fixed ROI (manual button still available as fallback)
+4. Successful read triggers query BoM source (MSSQL or file) → expected parts + quantities, and expected kit/label count if available.
 5. Detect kit regions on the bench.
 6. For each kit: detect parts, measure critical dimensions (e.g. bolt length), compare to BoM.
-7. Compare number of kits found vs expected count.
-8. Display results: overall pass/fail + per-kit breakdown.
+9. Compare number of kits found vs expected count.
+10. Display results: overall pass/fail + per-kit breakdown.
 
 ### Hardware
 - **Camera**: Basler ace 2 a2A3536-31ucPRO (12.5 MP, IMX676, USB 3.0, C-mount) + Basler Lens C23-0828-16M (8 mm).
 - **Working distance**: ~1200 mm covering the full 590 mm × 1400 mm scannable bench area.
 - **Station PC**: ASUS NUC 16 Pro (RNUC16GDKX76C4N3) — Core Ultra X7 358H, Arc B390 iGPU, 32 GB RAM, 1 TB NVMe, Windows 11 Pro, dual 2.5 GbE.
-- Inference runs on the NUC (OpenVINO / ONNX Runtime targeting the Arc iGPU). Training happens elsewhere.
+- Inference runs on the NUC (OpenVINO / ONNX Runtime targeting the Arc iGPU).
 
 ### UI structure (Svelte)
 - **Operator view** (`src/routes/+page.svelte` and related)  
@@ -47,7 +47,7 @@ Independent bench stations (NUCs) that:
 ### Data & integration
 - BoM lookup interface: `barcode → { des, expectedKitCount?, parts: [{ic, des, qty}] }`
 - Lookup key = kit IC (e.g. `6PBBK001`)
-- Pluggable source (file now, MSSQL later) via admin setting
+- Pluggable source (MSSQL or JSON) via admin setting
 - SQL queries live in a gitignored `vision/bom_queries.sql` (example committed)
 - Results logging (local + optional central)
 
@@ -138,7 +138,6 @@ Train several options, compare on validation set (especially close variants), pi
 - More advanced kit grouping if required
 
 ### Immediate next steps
-1. Finish operator UI polish (dark industrial theme + snapshot replaces live feed).
 2. Collect and label part and kit images in Label Studio.
 3. Train and compare candidate models; export winning ONNX.
 4. Wire detection results into the snapshot view.
