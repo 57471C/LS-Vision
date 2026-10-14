@@ -26,8 +26,16 @@ type WatchBody = InspectView & {
 type SnapshotView = {
 	kitCode: string;
 	image: string;
+	source: string;
 	takenAt: string;
 	detected?: boolean;
+};
+
+type DetectRoi = {
+	x: number;
+	y: number;
+	w: number;
+	h: number;
 };
 
 type Detection = {
@@ -49,6 +57,8 @@ type DetectedCount = {
 };
 
 const DEFAULT_SCAN_SECONDS = 8;
+// Settings unlock is the admin flag for this tab. It is not stored in config.
+const ADMIN_FLAG = "ls-vision-settings-open";
 
 let barcode = "JOB-12345";
 let result: InspectView | null = null;
@@ -62,6 +72,26 @@ let detectMessage = "";
 let detectState: "idle" | "running" | "done" = "idle";
 let detectGeneration = 0;
 let testMode = false;
+let admin = false;
+let detectRoi: DetectRoi | null = null;
+let draftRoi: DetectRoi | null = null;
+let draftMark: {
+	left: number;
+	top: number;
+	width: number;
+	height: number;
+} | null = null;
+let drawing = false;
+let savingRoi = false;
+let roiMessage = "";
+let roiDrag: { x: number; y: number } | null = null;
+let paneImage: HTMLImageElement | null = null;
+let paneFrame: HTMLElement | null = null;
+let paneWidth = 0;
+let paneHeight = 0;
+let frameWidth = 0;
+let frameHeight = 0;
+let frameObserver: ResizeObserver | null = null;
 let imagePicker: HTMLInputElement | null = null;
 let imagePick: ((file: File | null) => void) | null = null;
 let streamMs = DEFAULT_SCAN_SECONDS * 1000;
@@ -110,19 +140,26 @@ function toggleFeed() {
 }
 
 function resumeLiveFeed() {
+	cancelRoiDraw();
 	detectGeneration += 1;
 	snapshot = null;
 	detections = [];
 	detectMessage = "";
 	detectState = "idle";
+	paneWidth = 0;
+	paneHeight = 0;
 	if (feedOn) startWatch();
 }
 
 function holdStill(image: string, kitCode: string) {
+	cancelRoiDraw();
 	detectGeneration += 1;
+	paneWidth = 0;
+	paneHeight = 0;
 	snapshot = {
 		kitCode,
 		image,
+		source: image,
 		takenAt: new Date().toLocaleTimeString(),
 		detected: false,
 	};
@@ -344,6 +381,7 @@ async function checkSidecar() {
 		void loadErp();
 		void loadScan();
 		void loadTestMode();
+		void loadDetectRoi();
 	}
 }
 
@@ -356,6 +394,253 @@ async function loadTestMode() {
 	} catch {
 		// A missed read keeps the current mode.
 	}
+}
+
+function asRoi(value: unknown): DetectRoi | null {
+	if (!value || typeof value !== "object") return null;
+	const row = value as DetectRoi;
+	if (
+		typeof row.x !== "number" ||
+		typeof row.y !== "number" ||
+		typeof row.w !== "number" ||
+		typeof row.h !== "number"
+	) {
+		return null;
+	}
+	if (![row.x, row.y, row.w, row.h].every((n) => Number.isFinite(n)))
+		return null;
+	if (row.w < 0.01 || row.h < 0.01) return null;
+	if (
+		row.x < 0 ||
+		row.y < 0 ||
+		row.x + row.w > 1.001 ||
+		row.y + row.h > 1.001
+	) {
+		return null;
+	}
+	return { x: row.x, y: row.y, w: row.w, h: row.h };
+}
+
+function readAdminFlag() {
+	admin = sessionStorage.getItem(ADMIN_FLAG) === "1";
+}
+
+function rememberPaneSize() {
+	paneWidth = paneImage?.naturalWidth ?? 0;
+	paneHeight = paneImage?.naturalHeight ?? 0;
+}
+
+function measureFrame() {
+	frameWidth = paneFrame?.clientWidth ?? 0;
+	frameHeight = paneFrame?.clientHeight ?? 0;
+}
+
+function zoomFrame(): {
+	left: number;
+	top: number;
+	width: number;
+	height: number;
+} | null {
+	// While drawing, keep the whole still so the new box can start anywhere.
+	if (drawing || !detectRoi) return null;
+	if (paneWidth < 1 || paneHeight < 1 || frameWidth < 1 || frameHeight < 1)
+		return null;
+	const roiW = detectRoi.w * paneWidth;
+	const roiH = detectRoi.h * paneHeight;
+	if (roiW < 1 || roiH < 1) return null;
+	const scale = Math.min(frameWidth / roiW, frameHeight / roiH);
+	const roiViewW = roiW * scale;
+	const roiViewH = roiH * scale;
+	return {
+		left: (frameWidth - roiViewW) / 2 - detectRoi.x * paneWidth * scale,
+		top: (frameHeight - roiViewH) / 2 - detectRoi.y * paneHeight * scale,
+		width: paneWidth * scale,
+		height: paneHeight * scale,
+	};
+}
+
+function showDraft(box: DetectRoi) {
+	const img = paneImage;
+	const frame = paneFrame;
+	if (!img || !frame || (box.w <= 0 && box.h <= 0)) {
+		draftMark = null;
+		return;
+	}
+	const nw = img.naturalWidth;
+	const nh = img.naturalHeight;
+	if (nw < 1 || nh < 1) {
+		draftMark = null;
+		return;
+	}
+	const rect = img.getBoundingClientRect();
+	const frameRect = frame.getBoundingClientRect();
+	if (rect.width < 1 || rect.height < 1) {
+		draftMark = null;
+		return;
+	}
+	const scale = Math.min(rect.width / nw, rect.height / nh);
+	const drawnW = nw * scale;
+	const drawnH = nh * scale;
+	const originX = rect.left + (rect.width - drawnW) / 2 - frameRect.left;
+	const originY = rect.top + (rect.height - drawnH) / 2 - frameRect.top;
+	draftMark = {
+		left: originX + box.x * drawnW,
+		top: originY + box.y * drawnH,
+		width: Math.max(2, box.w * drawnW),
+		height: Math.max(2, box.h * drawnH),
+	};
+}
+
+function cancelRoiDraw() {
+	drawing = false;
+	draftRoi = null;
+	draftMark = null;
+	roiDrag = null;
+}
+
+function beginSetRoi() {
+	if (!admin) return;
+	if (drawing) {
+		cancelRoiDraw();
+		roiMessage = "";
+		return;
+	}
+	if (!snapshot) {
+		roiMessage = "Hold a snapshot, then draw the region.";
+		return;
+	}
+	roiMessage = "";
+	drawing = true;
+	draftRoi = null;
+	draftMark = null;
+	roiDrag = null;
+}
+
+function pointInImage(event: PointerEvent): { x: number; y: number } | null {
+	const img = paneImage;
+	if (!img) return null;
+	const rect = img.getBoundingClientRect();
+	const nw = img.naturalWidth;
+	const nh = img.naturalHeight;
+	if (!nw || !nh || rect.width < 1 || rect.height < 1) return null;
+	const scale = Math.min(rect.width / nw, rect.height / nh);
+	const drawnW = nw * scale;
+	const drawnH = nh * scale;
+	const originX = rect.left + (rect.width - drawnW) / 2;
+	const originY = rect.top + (rect.height - drawnH) / 2;
+	return {
+		x: Math.min(1, Math.max(0, (event.clientX - originX) / drawnW)),
+		y: Math.min(1, Math.max(0, (event.clientY - originY) / drawnH)),
+	};
+}
+
+function rectFromPoints(
+	start: { x: number; y: number },
+	end: { x: number; y: number },
+): DetectRoi {
+	return {
+		x: Math.min(start.x, end.x),
+		y: Math.min(start.y, end.y),
+		w: Math.abs(end.x - start.x),
+		h: Math.abs(end.y - start.y),
+	};
+}
+
+function onRoiPointerDown(event: PointerEvent) {
+	if (!drawing) return;
+	const point = pointInImage(event);
+	if (!point) return;
+	(event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+	roiDrag = point;
+	draftRoi = { x: point.x, y: point.y, w: 0, h: 0 };
+	draftMark = null;
+}
+
+function onRoiPointerMove(event: PointerEvent) {
+	if (!roiDrag) return;
+	const point = pointInImage(event);
+	if (!point) return;
+	const box = rectFromPoints(roiDrag, point);
+	draftRoi = box;
+	showDraft(box);
+}
+
+function onRoiPointerUp(event: PointerEvent) {
+	if (!roiDrag) return;
+	const start = roiDrag;
+	const point = pointInImage(event) ?? start;
+	roiDrag = null;
+	const roi = rectFromPoints(start, point);
+	if (roi.w < 0.01 || roi.h < 0.01) {
+		draftRoi = null;
+		draftMark = null;
+		roiMessage = "Drag a larger rectangle.";
+		return;
+	}
+	draftRoi = roi;
+	showDraft(roi);
+	void saveDetectRoi(roi);
+}
+
+async function loadDetectRoi() {
+	try {
+		const res = await fetch("http://127.0.0.1:8008/settings/detect-roi");
+		if (!res.ok) return;
+		const data = await res.json();
+		detectRoi = asRoi(data.roi);
+	} catch {
+		// A missed read keeps the current region.
+	}
+}
+
+function roundRoi(roi: DetectRoi): DetectRoi {
+	const round = (value: number) => Math.round(value * 10000) / 10000;
+	return { x: round(roi.x), y: round(roi.y), w: round(roi.w), h: round(roi.h) };
+}
+
+async function saveDetectRoi(roi: DetectRoi | null) {
+	if (!admin) return;
+	savingRoi = true;
+	roiMessage = "";
+	try {
+		const res = await fetch("http://127.0.0.1:8008/settings/detect-roi", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ roi: roi ? roundRoi(roi) : null }),
+		});
+		const data = (await res.json().catch(() => ({}))) as {
+			status?: string;
+			message?: string;
+			roi?: unknown;
+		};
+		if (!res.ok || data.status === "fail") {
+			throw new Error(data.message || "Could not save the ROI");
+		}
+		detectRoi = asRoi(data.roi);
+		draftRoi = null;
+		draftMark = null;
+		drawing = false;
+		roiDrag = null;
+		roiMessage = data.message || "Saved.";
+		rerunDetect();
+	} catch (err: unknown) {
+		roiMessage = errorMessage(err, "Could not save the ROI");
+	} finally {
+		savingRoi = false;
+	}
+}
+
+function clearDetectRoi() {
+	if (!admin || savingRoi) return;
+	cancelRoiDraw();
+	void saveDetectRoi(null);
+}
+
+function rerunDetect() {
+	if (!snapshot?.source || !pageAlive) return;
+	detectGeneration += 1;
+	const generation = detectGeneration;
+	void runDetect(generation, { image: snapshot.source });
 }
 
 function chooseImageFile(): Promise<File | null> {
@@ -458,6 +743,7 @@ function closeErp() {
 
 function onErpKey(event: KeyboardEvent) {
 	if (event.key === "Escape" && erpOpen) closeErp();
+	else if (event.key === "Escape" && drawing) cancelRoiDraw();
 }
 
 function onIframeError() {
@@ -474,6 +760,13 @@ async function openErpInBrowser() {
 }
 
 onMount(() => {
+	readAdminFlag();
+	window.addEventListener("focus", readAdminFlag);
+	measureFrame();
+	if (paneFrame) {
+		frameObserver = new ResizeObserver(() => measureFrame());
+		frameObserver.observe(paneFrame);
+	}
 	void checkSidecar();
 	healthTimer = setInterval(() => {
 		void checkSidecar();
@@ -483,6 +776,9 @@ onMount(() => {
 
 onDestroy(() => {
 	pageAlive = false;
+	window.removeEventListener("focus", readAdminFlag);
+	frameObserver?.disconnect();
+	frameObserver = null;
 	stopWatch();
 	if (healthTimer !== null) {
 		clearInterval(healthTimer);
@@ -668,6 +964,24 @@ async function decodeAndInspect() {
 		>
 			{feedOn ? "Stop feed" : "Start feed"}
 		</button>
+		{#if admin}
+			<button
+				type="button"
+				class="inline-flex min-h-11 items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100 disabled:text-neutral-500"
+				on:click={beginSetRoi}
+				disabled={savingRoi}
+			>
+				{drawing ? "Cancel" : "Set ROI"}
+			</button>
+			<button
+				type="button"
+				class="inline-flex min-h-11 items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100 disabled:text-neutral-500"
+				on:click={clearDetectRoi}
+				disabled={savingRoi || !detectRoi}
+			>
+				Clear ROI
+			</button>
+		{/if}
 		{#if erpUrl}
 			<button
 				type="button"
@@ -685,47 +999,137 @@ async function decodeAndInspect() {
 				<h2 class="text-[11px] font-semibold uppercase tracking-widest text-neutral-500">
 					{snapshot ? "Snapshot" : "Camera"}
 				</h2>
-				{#if snapshot}
+				{#if roiMessage}
+					<p class="text-xs text-amber-200">{roiMessage}</p>
+				{:else if snapshot}
 					<p class="text-xs text-amber-200">Automatic stream is stopped</p>
 				{/if}
 			</div>
-			<div class="relative min-h-0 flex-1 overflow-hidden">
+			<div bind:this={paneFrame} class="relative min-h-0 flex-1 overflow-hidden">
+				{#if snapshot || feedOn}
+					{@const zoom = zoomFrame()}
+					<div
+						class="absolute {zoom ? '' : 'inset-0'}"
+						style={zoom
+							? `left:${zoom.left}px;top:${zoom.top}px;width:${zoom.width}px;height:${zoom.height}px;`
+							: ""}
+					>
+						{#if snapshot}
+							<img
+								bind:this={paneImage}
+								src={snapshot.image}
+								alt={snapshot.detected
+									? `Detected parts for kit ${snapshot.kitCode}`
+									: `Snapshot of kit ${snapshot.kitCode}`}
+								class="h-full w-full {zoom ? 'object-fill' : 'object-contain'}"
+								on:load={rememberPaneSize}
+							/>
+						{:else}
+							<img
+								bind:this={paneImage}
+								src="http://127.0.0.1:8008/camera/stream?index={cameraIndex}"
+								alt="Camera feed"
+								class="h-full w-full {zoom ? 'object-fill' : 'object-contain'}"
+								on:load={rememberPaneSize}
+							/>
+						{/if}
+						{#if paneWidth > 0 && paneHeight > 0 && !drawing && detectRoi}
+							{@const x = detectRoi.x * paneWidth}
+							{@const y = detectRoi.y * paneHeight}
+							{@const w = detectRoi.w * paneWidth}
+							{@const h = detectRoi.h * paneHeight}
+							<svg
+								class="pointer-events-none absolute inset-0 z-10 h-full w-full"
+								viewBox="0 0 {paneWidth} {paneHeight}"
+								preserveAspectRatio={zoom ? "none" : "xMidYMid meet"}
+							>
+								<rect x="0" y="0" width={paneWidth} height={y} fill="black" fill-opacity="0.45" />
+								<rect
+									x="0"
+									y={y + h}
+									width={paneWidth}
+									height={paneHeight - (y + h)}
+									fill="black"
+									fill-opacity="0.45"
+								/>
+								<rect x="0" y={y} width={x} height={h} fill="black" fill-opacity="0.45" />
+								<rect
+									x={x + w}
+									y={y}
+									width={paneWidth - (x + w)}
+									height={h}
+									fill="black"
+									fill-opacity="0.45"
+								/>
+								<rect
+									x={x}
+									y={y}
+									width={w}
+									height={h}
+									fill="none"
+									stroke="#fde68a"
+									stroke-opacity="0.75"
+									stroke-width="2"
+									vector-effect="non-scaling-stroke"
+								/>
+							</svg>
+						{/if}
+					</div>
+				{:else}
+					<div class="absolute inset-0 flex items-center justify-center text-lg text-neutral-500">
+						Feed stopped
+					</div>
+				{/if}
 				{#if snapshot}
-					<img
-						src={snapshot.image}
-						alt={snapshot.detected
-							? `Detected parts for kit ${snapshot.kitCode}`
-							: `Snapshot of kit ${snapshot.kitCode}`}
-						class="absolute inset-0 h-full w-full object-contain"
-					/>
-					<div class="absolute left-3 top-3 bg-neutral-950/80 px-3 py-2">
-						<p class="font-mono text-3xl font-semibold leading-none text-white">{snapshot.kitCode}</p>
-						<p class="mt-1 text-sm text-neutral-300">
+					<div
+						class="pointer-events-none absolute left-3 top-3 z-20 bg-neutral-950/80 {detectRoi &&
+						!drawing
+							? 'px-2 py-1'
+							: 'px-3 py-2'}"
+					>
+						<p
+							class="font-mono font-semibold leading-none text-white {detectRoi && !drawing
+								? 'text-sm'
+								: 'text-3xl'}"
+						>
+							{snapshot.kitCode}
+						</p>
+						<p
+							class="mt-1 text-neutral-300 {detectRoi && !drawing ? 'text-[11px]' : 'text-sm'}"
+						>
 							Taken {snapshot.takenAt}
 						</p>
 					</div>
 					{#if detectState === "running"}
-						<p class="absolute bottom-3 left-3 bg-neutral-950/80 px-3 py-2 text-sm font-semibold text-amber-200">
+						<p class="pointer-events-none absolute bottom-3 left-3 z-40 bg-neutral-950/80 px-3 py-2 text-sm font-semibold text-amber-200">
 							Detecting parts...
 						</p>
 					{/if}
 					<button
 						type="button"
-						class="absolute bottom-3 right-3 inline-flex min-h-11 items-center border border-yellow-300 bg-yellow-400 px-4 text-sm font-semibold text-neutral-950"
+						class="absolute bottom-3 right-3 z-40 inline-flex min-h-11 items-center border border-yellow-300 bg-yellow-400 px-4 text-sm font-semibold text-neutral-950"
 						on:click={resumeLiveFeed}
 					>
 						{feedOn ? "Resume live feed" : "Back to feed"}
 					</button>
-				{:else if feedOn}
-					<img
-						src="http://127.0.0.1:8008/camera/stream?index={cameraIndex}"
-						alt="Camera feed"
-						class="absolute inset-0 h-full w-full object-contain"
-					/>
-				{:else}
-					<div class="absolute inset-0 flex items-center justify-center text-lg text-neutral-500">
-						Feed stopped
-					</div>
+				{/if}
+				{#if drawing && snapshot}
+					<div
+						class="absolute inset-0 z-30 cursor-crosshair"
+						on:pointerdown={onRoiPointerDown}
+						on:pointermove={onRoiPointerMove}
+						on:pointerup={onRoiPointerUp}
+						on:pointercancel={onRoiPointerUp}
+					></div>
+					<p class="pointer-events-none absolute left-3 top-3 z-40 bg-neutral-950/80 px-3 py-2 text-sm text-amber-200">
+						Drag a rectangle on the snapshot.
+					</p>
+					{#if draftMark}
+						<div
+							class="pointer-events-none absolute z-50"
+							style="left:{draftMark.left}px;top:{draftMark.top}px;width:{draftMark.width}px;height:{draftMark.height}px;box-sizing:border-box;border:3px dotted #fde68a;background:rgba(253,230,138,0.2);box-shadow:0 0 0 1px #0a0a0a;"
+						></div>
+					{/if}
 				{/if}
 			</div>
 		</section>

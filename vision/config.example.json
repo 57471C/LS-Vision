@@ -1,17 +1,18 @@
 {
-  "source": "json",
-  "mssql": {
-    "driver": "ODBC Driver 18 for SQL Server",
-    "server": "localhost",
-    "database": "YourDatabase",
-    "auth": "windows",
-    "user": "",
-    "password": ""
-  },
-  "erp": {
-    "name": "",
-    "url": ""
-  },
-  "scanSeconds": 8,
-  "testMode": false
+	"source": "json",
+	"mssql": {
+		"driver": "ODBC Driver 18 for SQL Server",
+		"server": "localhost",
+		"database": "YourDatabase",
+		"auth": "windows",
+		"user": "",
+		"password": ""
+	},
+	"erp": {
+		"name": "",
+		"url": ""
+	},
+	"scanSeconds": 8,
+	"testMode": false,
+	"detectRoi": null
 }

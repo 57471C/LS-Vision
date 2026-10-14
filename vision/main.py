@@ -7,7 +7,7 @@ import numpy as np
 from fastapi import Body, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, ValidationError, field_validator, model_validator
 import uvicorn
 import json
 import re
@@ -47,7 +47,7 @@ BOM_PATH = Path(__file__).parent / "sample-bom.json"
 # Local BoM source choice. A missing file means the JSON sample BoM.
 # The settings-page unlock password is not stored here.
 # A SQL Server Authentication password is stored with the other connection fields.
-# config.local.json stores the BoM source and the operator ERP button.
+# config.local.json stores the BoM source, the operator ERP button, and the detect ROI.
 # bom-source.json is read only when config.local.json is absent.
 BOM_SOURCE_PATH = Path(__file__).parent / "bom-source.json"
 CONFIG_LOCAL_PATH = Path(__file__).parent / "config.local.json"
@@ -126,6 +126,39 @@ class TestModeUpdate(BaseModel):
             raise ValueError("Test mode must be true or false")
         return value
 
+class DetectRoiBox(BaseModel):
+    # Fractions of the image, origin at the top left. Not the barcode ROI.
+    x: float
+    y: float
+    w: float
+    h: float
+
+    @field_validator("x", "y", "w", "h", mode="before")
+    @classmethod
+    def reject_non_number(cls, value):
+        # JSON true must not become 1.
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("ROI values must be numbers from 0 to 1")
+        return value
+
+    @model_validator(mode="after")
+    def inside_image(self):
+        if self.w < 0.01 or self.h < 0.01:
+            raise ValueError("ROI is too small")
+        if (
+            self.x < 0
+            or self.y < 0
+            or self.w > 1
+            or self.h > 1
+            or self.x + self.w > 1.0001
+            or self.y + self.h > 1.0001
+        ):
+            raise ValueError("ROI must sit inside the image")
+        return self
+
+class DetectRoiUpdate(BaseModel):
+    roi: Optional[DetectRoiBox] = None
+
 def _blank_erp():
     return {"name": "", "url": ""}
 
@@ -143,6 +176,7 @@ def _blank_bom_source():
         "erp": _blank_erp(),
         "scanSeconds": DEFAULT_SCAN_SECONDS,
         "testMode": False,
+        "detectRoi": None,
     }
 
 def _read_json_dict(path):
@@ -216,6 +250,27 @@ def _apply_saved_test_mode(config, saved):
     mode = saved.get("testMode")
     if isinstance(mode, bool):
         config["testMode"] = mode
+    return config
+
+def _clean_detect_roi(raw):
+    if raw is None:
+        return None
+    try:
+        box = DetectRoiBox.model_validate(raw)
+    except (ValidationError, TypeError):
+        return None
+    width = min(box.w, 1 - box.x)
+    height = min(box.h, 1 - box.y)
+    return {
+        "x": round(box.x, 4),
+        "y": round(box.y, 4),
+        "w": round(width, 4),
+        "h": round(height, 4),
+    }
+
+def _apply_saved_detect_roi(config, saved):
+    if "detectRoi" in saved:
+        config["detectRoi"] = _clean_detect_roi(saved.get("detectRoi"))
     return config
 
 def _clean_erp(name, url):
@@ -301,7 +356,8 @@ def load_bom_source():
         _apply_saved_source(config, saved)
         _apply_saved_erp(config, saved)
         _apply_saved_scan(config, saved)
-        return _apply_saved_test_mode(config, saved)
+        _apply_saved_test_mode(config, saved)
+        return _apply_saved_detect_roi(config, saved)
     if BOM_SOURCE_PATH.exists():
         saved = _read_json_dict(BOM_SOURCE_PATH)
         if saved is None:
@@ -309,7 +365,8 @@ def load_bom_source():
         _apply_saved_source(config, saved)
         _apply_saved_erp(config, saved)
         _apply_saved_scan(config, saved)
-        return _apply_saved_test_mode(config, saved)
+        _apply_saved_test_mode(config, saved)
+        return _apply_saved_detect_roi(config, saved)
     return config
 
 def save_bom_source(config):
@@ -330,6 +387,7 @@ def save_bom_source(config):
         },
         "scanSeconds": _clean_scan_seconds(config.get("scanSeconds")) or DEFAULT_SCAN_SECONDS,
         "testMode": config.get("testMode") is True,
+        "detectRoi": _clean_detect_roi(config.get("detectRoi")),
     }
     CONFIG_LOCAL_PATH.write_text(
         json.dumps(stored, indent=2) + "\n",
@@ -950,8 +1008,30 @@ def _part_ic(names, class_id):
         ic = names[class_id]
     return str(ic)
 
+def _roi_slice(image, roi):
+    height, width = image.shape[:2]
+    if width < 1 or height < 1:
+        return image, 0, 0
+    x = int(round(float(roi["x"]) * width))
+    y = int(round(float(roi["y"]) * height))
+    rw = int(round(float(roi["w"]) * width))
+    rh = int(round(float(roi["h"]) * height))
+    x = max(0, min(x, width - 1))
+    y = max(0, min(y, height - 1))
+    rw = max(1, min(rw, width - x))
+    rh = max(1, min(rh, height - y))
+    return image[y:y + rh, x:x + rw], x, y
+
+def _detect_view(image):
+    # Posted images and the latest camera snapshot both come through here.
+    roi = _clean_detect_roi(load_bom_source().get("detectRoi"))
+    if roi is None:
+        return image, 0, 0
+    return _roi_slice(image, roi)
+
 def _yolo_detections(image):
-    result = yolo_model.predict(image, verbose=False)[0]
+    view, origin_x, origin_y = _detect_view(image)
+    result = yolo_model.predict(view, verbose=False)[0]
     names = result.names or {}
     boxes = result.boxes
     if boxes is None or len(boxes) == 0:
@@ -962,7 +1042,7 @@ def _yolo_detections(image):
         found.append({
             "ic": _part_ic(names, int(cls_id)),
             "confidence": round(float(conf), 4),
-            "bbox": [x1, y1, x2, y2],
+            "bbox": [x1 + origin_x, y1 + origin_y, x2 + origin_x, y2 + origin_y],
         })
     return found
 
@@ -1074,6 +1154,7 @@ def update_bom_source(body: BomSourceUpdate):
     config["erp"] = existing.get("erp") or _blank_erp()
     config["scanSeconds"] = existing.get("scanSeconds", DEFAULT_SCAN_SECONDS)
     config["testMode"] = existing.get("testMode") is True
+    config["detectRoi"] = _clean_detect_roi(existing.get("detectRoi"))
     saved = save_bom_source(config)
     if body.source == "mssql":
         message = "Saved. Inspect queries MSSQL using vision/bom_queries.sql."
@@ -1151,6 +1232,21 @@ def update_test_mode(body: TestModeUpdate):
     else:
         message = "Saved. The operator page uses the camera and barcode flow."
     return {"status": "pass", "message": message, "enabled": saved["testMode"]}
+
+@app.get("/settings/detect-roi")
+def get_detect_roi():
+    return {"roi": _clean_detect_roi(load_bom_source().get("detectRoi"))}
+
+@app.post("/settings/detect-roi")
+def update_detect_roi(body: DetectRoiUpdate):
+    config = load_bom_source()
+    config["detectRoi"] = _clean_detect_roi(None if body.roi is None else body.roi.model_dump())
+    saved = save_bom_source(config)
+    if saved["detectRoi"]:
+        message = "Saved. Detection uses this region."
+    else:
+        message = "Saved. Detection uses the full image."
+    return {"status": "pass", "message": message, "roi": saved["detectRoi"]}
 
 def lookup_bom(barcode):
     source = load_bom_source()
