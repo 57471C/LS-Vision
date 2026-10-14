@@ -32,9 +32,16 @@ type SnapshotView = {
 };
 
 type Detection = {
+	// Part IC from the YOLO class name. Kit codes come from the barcode lookup.
 	ic: string;
 	confidence: number;
 	bbox: number[];
+};
+
+type BomView = {
+	kitCode: string;
+	des?: string;
+	parts: Part[];
 };
 
 type DetectedCount = {
@@ -46,6 +53,7 @@ const DEFAULT_SCAN_SECONDS = 8;
 
 let barcode = "JOB-12345";
 let result: InspectView | null = null;
+let bom: BomView | null = null;
 let loading = false;
 let cameraIndex = 0;
 let feedOn = true;
@@ -130,16 +138,33 @@ function detectionCounts(items: Detection[]): Record<string, number> {
 	return counts;
 }
 
-function extraDetections(
+function storeBom(view: InspectView) {
+	// Only a barcode lookup loads a kit. Sample size groups and model classes do not.
+	if (view.status !== "pass" || !view.kitCode || !view.parts?.length) return;
+	if (view.info?.includes("Classical")) return;
+	bom = {
+		kitCode: view.kitCode,
+		des: view.des,
+		parts: view.parts,
+	};
+}
+
+function dropBom() {
+	bom = null;
+}
+
+function isLoadedBom(view: InspectView | null): boolean {
+	if (!bom || !view?.parts?.length || view.kitCode !== bom.kitCode)
+		return false;
+	return !view.info?.includes("Classical");
+}
+
+function partsOutsideBom(
 	items: Detection[],
-	view: InspectView | null,
-	still: SnapshotView | null,
+	parts: Part[] | null,
 ): DetectedCount[] {
 	const counts = detectionCounts(items);
-	const compareBom = Boolean(still && !still.sample && view?.parts?.length);
-	const known = new Set(
-		compareBom ? (view?.parts ?? []).map((part) => part.ic) : [],
-	);
+	const known = new Set((parts ?? []).map((part) => part.ic));
 	return Object.entries(counts)
 		.filter(([ic]) => !known.has(ic))
 		.sort((a, b) => a[0].localeCompare(b[0]))
@@ -241,6 +266,7 @@ async function showSnapshot(body: WatchBody) {
 	const kitCode = body.kitCode || body.barcode || barcode;
 	barcode = kitCode;
 	result = inspectView(body);
+	storeBom(result);
 	const generation = holdStill(body.image, kitCode);
 	await runDetect(generation, { image: body.image });
 }
@@ -423,9 +449,13 @@ async function runInspect() {
 			body: JSON.stringify({ barcode }),
 		});
 		if (!res.ok) throw new Error(await res.text());
-		result = await res.json();
+		const body = (await res.json()) as InspectView;
+		result = body;
+		if (body.status === "pass") storeBom(body);
+		else dropBom();
 	} catch (err: unknown) {
 		result = { status: "fail", message: errorMessage(err, "Request failed") };
+		dropBom();
 	} finally {
 		loading = false;
 	}
@@ -447,9 +477,7 @@ async function testSampleImage() {
 				body.kitCode || "Example3",
 				true,
 			);
-			await runDetect(generation, {
-				sample: `${body.kitCode || "Example3"}.jpg`,
-			});
+			await runDetect(generation, { sample: "Example3.jpg" });
 		}
 	} catch (err: unknown) {
 		result = {
@@ -475,6 +503,7 @@ async function decodeAndInspect() {
 		}
 		if (body.barcode) {
 			barcode = body.barcode;
+			dropBom();
 			result = {
 				status: "fail",
 				message: body.message || "Barcode not found in BoM",
@@ -620,10 +649,12 @@ async function decodeAndInspect() {
 				{#if snapshot}
 					<img
 						src={snapshot.image}
-						alt={snapshot.detected
-							? `Detected parts for ${snapshot.kitCode}`
-							: snapshot.sample
-								? `Annotated sample ${snapshot.kitCode}`
+						alt={snapshot.sample
+							? snapshot.detected
+								? "Detected parts in the sample image"
+								: `Annotated sample ${snapshot.kitCode}`
+							: snapshot.detected
+								? `Detected parts for kit ${snapshot.kitCode}`
 								: `Snapshot of kit ${snapshot.kitCode}`}
 						class="absolute inset-0 h-full w-full object-contain"
 					/>
@@ -691,7 +722,8 @@ async function decodeAndInspect() {
 					{#if result.parts?.length}
 						{@const detectFailed =
 							detectState === "done" && !!detectMessage && detections.length === 0}
-						{@const showSeen = detectState !== "idle" && !snapshot?.sample && !detectFailed}
+						{@const showSeen =
+							detectState !== "idle" && isLoadedBom(result) && !detectFailed}
 						{@const counts = detectionCounts(detections)}
 						<table class="w-full border-collapse text-left text-sm">
 							<thead>
@@ -729,14 +761,54 @@ async function decodeAndInspect() {
 							<p class="text-sm text-neutral-300">{matchSummary(result.parts, detections)}</p>
 						{/if}
 					{/if}
+					{#if bom && !isLoadedBom(result) && detectState !== "idle" && !(detectState === "done" && detectMessage && detections.length === 0)}
+						{@const counts = detectionCounts(detections)}
+						<h3 class="text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+							BoM {bom.kitCode}
+						</h3>
+						{#if bom.des}
+							<p class="text-base text-neutral-300">{bom.des}</p>
+						{/if}
+						<table class="w-full border-collapse text-left text-sm">
+							<thead>
+								<tr class="border-b border-neutral-600 text-[11px] uppercase tracking-widest text-neutral-400">
+									<th class="py-2 pr-3 font-semibold">IC</th>
+									<th class="py-2 pr-3 font-semibold">Description</th>
+									<th class="py-2 text-right font-semibold">Qty</th>
+									<th class="py-2 text-right font-semibold">Seen</th>
+								</tr>
+							</thead>
+							<tbody>
+								{#each bom.parts as part, i (i)}
+									<tr class="border-b border-neutral-800">
+										<td class="py-2 pr-3 font-mono font-medium">{part.ic}</td>
+										<td class="py-2 pr-3 text-neutral-200">{part.des}</td>
+										<td class="py-2 text-right font-semibold">{part.qty}</td>
+										<td
+											class="py-2 text-right font-semibold {detectState === 'running'
+												? 'text-neutral-500'
+												: (counts[part.ic] ?? 0) === part.qty
+													? 'text-green-400'
+													: 'text-red-400'}"
+										>
+											{detectState === "running" ? "…" : (counts[part.ic] ?? 0)}
+										</td>
+									</tr>
+								{/each}
+							</tbody>
+						</table>
+						{#if detectState === "done"}
+							<p class="text-sm text-neutral-300">{matchSummary(bom.parts, detections)}</p>
+						{/if}
+					{/if}
 					{#if detectState === "running"}
 						<p class="text-sm text-neutral-400">Detecting parts...</p>
 					{/if}
 					{#if detectState === "done"}
-						{@const extras = extraDetections(detections, result, snapshot)}
+						{@const extras = partsOutsideBom(detections, bom?.parts ?? null)}
 						{#if extras.length}
 							<h3 class="text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
-								{snapshot?.sample ? "Detected" : "Not in BoM"}
+								{bom ? "Not in BoM" : "Detected parts"}
 							</h3>
 							<table class="w-full border-collapse text-left text-sm">
 								<thead>
@@ -754,7 +826,7 @@ async function decodeAndInspect() {
 									{/each}
 								</tbody>
 							</table>
-						{:else if snapshot?.sample && !detectMessage}
+						{:else if !bom && snapshot?.sample && !detectMessage}
 							<p class="text-sm text-neutral-300">No parts detected</p>
 						{/if}
 					{/if}

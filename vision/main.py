@@ -1202,7 +1202,7 @@ def _load_yolo():
         yolo_model = loaded
         names = getattr(loaded, "names", {})
         labels = list(names.values()) if isinstance(names, dict) else list(names)
-        print(f"Loaded YOLO model {MODEL_PATH.name} with {len(labels)} classes")
+        print(f"Loaded YOLO model {MODEL_PATH.name} with {len(labels)} part classes")
     except Exception as exc:
         yolo_model = None
         print(f"YOLO model failed to load: {exc}")
@@ -1258,6 +1258,14 @@ def _color_for_ic(ic):
     total = sum(ic.encode("utf-8"))
     return palette[total % len(palette)]
 
+def _part_ic(names, class_id):
+    # Trained class names are part IC codes (2BBMNM08), never kit codes (6PBBK001).
+    if isinstance(names, dict):
+        ic = names.get(class_id, names.get(str(class_id), class_id))
+    else:
+        ic = names[class_id]
+    return str(ic)
+
 def _yolo_detections(image):
     result = yolo_model.predict(image, verbose=False)[0]
     names = result.names or {}
@@ -1266,14 +1274,9 @@ def _yolo_detections(image):
         return []
     found = []
     for box, conf, cls_id in zip(boxes.xyxy.tolist(), boxes.conf.tolist(), boxes.cls.tolist()):
-        class_id = int(cls_id)
-        if isinstance(names, dict):
-            ic = names.get(class_id, names.get(str(class_id), class_id))
-        else:
-            ic = names[class_id]
         x1, y1, x2, y2 = (int(round(value)) for value in box)
         found.append({
-            "ic": str(ic),
+            "ic": _part_ic(names, int(cls_id)),
             "confidence": round(float(conf), 4),
             "bbox": [x1, y1, x2, y2],
         })
@@ -1332,6 +1335,7 @@ def _detect_response(detections, image=None, message=None):
 
 @app.post("/detect")
 def detect(req: Optional[DetectRequest] = Body(default=None)):
+    # Returns part ICs from the model. The kit code stays with the barcode lookup.
     # An image in the body wins. Otherwise use a named sample, then the latest snapshot.
     if yolo_model is None:
         return _detect_response([], message="YOLO model is not loaded")
