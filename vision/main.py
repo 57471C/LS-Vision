@@ -57,23 +57,7 @@ DEFAULT_SQL_DRIVER = "ODBC Driver 18 for SQL Server"
 DEFAULT_SCAN_SECONDS = 8
 MIN_SCAN_SECONDS = 1
 MAX_SCAN_SECONDS = 60
-SAMPLE_DIR = Path(__file__).parent / "test-images"
-DEFAULT_SAMPLE = "Example3.jpg"
 MODEL_PATH = Path(__file__).parent / "models" / "best.pt"
-# Areas within this multiple of the group median stay in the same size band.
-SIZE_GROUP_RATIO = 2.0
-# Min-area-rect aspect is long side / short side.
-# Nuts, washers, and isolators are near square. Bolts are long and thin.
-ROUND_ASPECT_MAX = 1.6
-BOLT_ASPECT_MIN = 2.0
-BOLT_ASPECT_MAX = 8.0
-# Example3 is about 3 megapixels. This keeps small nuts and washers
-# (about 210 px) and still drops the speckle under that.
-MIN_AREA_FRACTION = 0.00007
-# A filled stack smaller than this is left to the global watershed.
-STACK_MIN_AREA = 1500
-# Isolator disks sit above this. Stacked bolts are lumpier.
-STACK_MAX_CIRCULARITY = 0.62
 
 # Fixed square on the bench. Change at runtime with POST /barcode/roi.
 CAMERA_INDEX = 0
@@ -82,7 +66,7 @@ BARCODE_ROI = {"x": 0, "y": 0, "w": 640, "h": 480}
 # One open capture shared by the stream and the decode calls.
 camera = None
 _camera_index = None
-# Last raw frame a snapshot or sample view held. POST /detect uses it when
+# Last raw frame a snapshot held. POST /detect uses it when
 # the request does not include an image.
 _latest_snapshot = None
 yolo_model = None
@@ -91,10 +75,8 @@ class InspectRequest(BaseModel):
     barcode: str
 
 class DetectRequest(BaseModel):
-    # data-url or raw base64. sample loads a file from test-images.
-    # Omit both fields to use the latest snapshot.
+    # data-url or raw base64. Omit it to use the latest snapshot.
     image: Optional[str] = None
-    sample: Optional[str] = None
 
 class BarcodeRequest(BaseModel):
     camera: Optional[int] = None
@@ -899,316 +881,6 @@ def read_barcode(req: Optional[BarcodeRequest] = Body(default=None)):
         "codes": codes,
     }
 
-def _sample_path(name):
-    if not name or Path(name).name != name or name.startswith("."):
-        return None
-    path = (SAMPLE_DIR / name).resolve()
-    try:
-        path.relative_to(SAMPLE_DIR.resolve())
-    except ValueError:
-        return None
-    return path
-
-def _size_label(index):
-    labels = ["S", "M", "L", "XL", "XXL"]
-    if index < len(labels):
-        return labels[index]
-    return f"S{index + 1}"
-
-def _fill_holes(binary):
-    # Flood from a background corner. That fills the bench, not holes inside a part.
-    if binary.size == 0 or binary[0, 0] != 0:
-        return binary
-    flood = binary.copy()
-    height, width = binary.shape[:2]
-    ff_mask = np.zeros((height + 2, width + 2), np.uint8)
-    cv2.floodFill(flood, ff_mask, (0, 0), 255)
-    return cv2.bitwise_or(binary, cv2.bitwise_not(flood))
-
-def _split_touching(mask):
-    # Open/close cuts thin bridges. Parts that still touch keep separate distance
-    # peaks, and watershed cuts between those peaks.
-    distance = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
-    peak_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-    dilated = cv2.dilate(distance, peak_kernel)
-    peaks = ((distance >= dilated - 1e-3) & (distance >= 4)).astype(np.uint8)
-    count, markers = cv2.connectedComponents(peaks)
-    if count <= 1:
-        return mask
-    marks = np.zeros(mask.shape, np.int32)
-    marks[peaks > 0] = markers[peaks > 0]
-    marks += 1
-    marks[(mask > 0) & (peaks == 0)] = 0
-    labels = cv2.watershed(cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR), marks)
-    split = np.zeros(mask.shape, np.uint8)
-    split[labels > 1] = 255
-    # A one-pixel watershed line still joins contours on the diagonal.
-    cut = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    return cv2.erode(split, cut)
-
-def _part_shape(contour):
-    (_, (rect_w, rect_h), _) = cv2.minAreaRect(contour)
-    short_side = min(rect_w, rect_h)
-    long_side = max(rect_w, rect_h)
-    if short_side < 8:
-        return None
-    aspect = long_side / float(short_side)
-    if aspect <= ROUND_ASPECT_MAX or BOLT_ASPECT_MIN <= aspect <= BOLT_ASPECT_MAX:
-        return aspect
-    return None
-
-def _circularity(contour):
-    area = cv2.contourArea(contour)
-    peri = cv2.arcLength(contour, True)
-    if peri <= 0 or area <= 0:
-        return 0.0
-    return float(4.0 * np.pi * area / (peri * peri))
-
-def _bolt_bands(row_strength):
-    # Rows where the opened mask is wide are the body of a bolt. The gaps
-    # between stacked bolts fall below this level.
-    peak = float(row_strength.max()) if row_strength.size else 0.0
-    if peak <= 0:
-        return []
-    level = peak * 0.42
-    spans = []
-    start = None
-    for index, strength in enumerate(row_strength.tolist()):
-        if strength >= level and start is None:
-            start = index
-        elif strength < level and start is not None:
-            spans.append([start, index - 1])
-            start = None
-    if start is not None:
-        spans.append([start, row_strength.size - 1])
-    merged = []
-    for span in spans:
-        if merged and span[0] - merged[-1][1] <= 3:
-            merged[-1][1] = span[1]
-        else:
-            merged.append(span)
-    return [(band_start, band_end) for band_start, band_end in merged if band_end - band_start + 1 >= 8]
-
-def _split_stacked(opened, mask):
-    # Close and hole-fill turn a bolt stack into one solid blob, so the global
-    # watershed sees a single peak. The distance transform of the opened mask
-    # still has a ridge per bolt. Cutting the valley between ridges separates
-    # the stack. A single nick can slice a round part, so the cut is kept only
-    # when it yields at least three horizontal bolts.
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    result = mask.copy()
-    dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    smooth = np.array([1, 2, 3, 2, 1], np.float32)
-    smooth /= smooth.sum()
-    for contour in contours:
-        if cv2.contourArea(contour) < STACK_MIN_AREA or _circularity(contour) >= STACK_MAX_CIRCULARITY:
-            continue
-        x, y, width, height = [int(value) for value in cv2.boundingRect(contour)]
-        if height < 36:
-            continue
-        component = np.zeros(mask.shape, np.uint8)
-        cv2.drawContours(component, [contour], -1, 255, -1)
-        local = cv2.bitwise_and(opened, cv2.dilate(component, dilate_kernel))
-        crop_open = local[y:y + height, x:x + width]
-        crop = component[y:y + height, x:x + width]
-        if cv2.countNonZero(crop_open) < 80:
-            continue
-        distance = cv2.distanceTransform(crop_open, cv2.DIST_L2, 3)
-        row_distance = distance.sum(axis=1)
-        row_strength = (crop_open > 0).sum(axis=1).astype(np.float32)
-        if row_strength.size >= 5:
-            row_strength = np.convolve(row_strength, smooth, mode="same")
-            row_distance = np.convolve(row_distance, smooth, mode="same")
-        bands = _bolt_bands(row_strength)
-        if len(bands) < 3:
-            continue
-        cut = crop.copy()
-        for (band_start, band_end), (next_start, _next_end) in zip(bands, bands[1:]):
-            if next_start <= band_end:
-                continue
-            gap = row_distance[band_end:next_start + 1]
-            cut_at = int(band_end + np.argmin(gap))
-            lo = max(0, cut_at - 1)
-            hi = min(cut.shape[0], cut_at + 2)
-            cut[lo:hi, :] = 0
-        pieces, _ = cv2.findContours(cut, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        kept = 0
-        for piece in pieces:
-            piece_area = cv2.contourArea(piece)
-            aspect = _part_shape(piece)
-            _, _, piece_w, piece_h = cv2.boundingRect(piece)
-            if (
-                piece_area >= 180
-                and aspect is not None
-                and aspect >= BOLT_ASPECT_MIN
-                and piece_w > piece_h
-            ):
-                kept += 1
-        if kept < 3:
-            continue
-        region = result[y:y + height, x:x + width]
-        region[crop > 0] = 0
-        region[cut > 0] = 255
-        result[y:y + height, x:x + width] = region
-    return result
-
-def _detected_blobs(image):
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (7, 7), 0)
-    dark = cv2.adaptiveThreshold(
-        blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 41, 6
-    )
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    # Open drops speckle. Close seals cracks inside a part. Open again so that
-    # close cannot glue touching parts back together.
-    opened = cv2.morphologyEx(dark, cv2.MORPH_OPEN, kernel)
-    mask = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel)
-    mask = _fill_holes(mask)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    mask = _split_touching(mask)
-    mask = _split_stacked(opened, mask)
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    image_area = gray.shape[0] * gray.shape[1]
-    blobs = []
-    for contour in contours:
-        area = cv2.contourArea(contour)
-        if area < image_area * MIN_AREA_FRACTION or area > image_area * 0.02:
-            continue
-        if _part_shape(contour) is None:
-            continue
-        x, y, width, height = cv2.boundingRect(contour)
-        if width < 1 or height < 1 or area / float(width * height) < 0.2:
-            continue
-        blobs.append({
-            "area": area,
-            "x": int(x),
-            "y": int(y),
-            "w": int(width),
-            "h": int(height),
-        })
-    blobs.sort(key=lambda blob: blob["area"])
-    return blobs
-
-def _group_by_size(blobs):
-    groups = []
-    for blob in blobs:
-        area = blob["area"]
-        if not groups:
-            groups.append([blob])
-            continue
-        current = groups[-1]
-        median = current[len(current) // 2]["area"]
-        if area <= median * SIZE_GROUP_RATIO and area <= current[0]["area"] * (SIZE_GROUP_RATIO ** 2):
-            current.append(blob)
-        else:
-            groups.append([blob])
-    return groups
-
-def _size_parts(groups):
-    descriptions = {
-        "S": "Small",
-        "M": "Medium",
-        "L": "Large",
-        "XL": "Extra large",
-        "XXL": "Largest",
-    }
-    parts = []
-    for index, group in enumerate(groups):
-        label = _size_label(index)
-        name = descriptions.get(label, "Size group")
-        low = int(round(group[0]["area"]))
-        high = int(round(group[-1]["area"]))
-        parts.append({
-            "ic": label,
-            "des": f"{name} blobs, about {low:,}–{high:,} px",
-            "qty": len(group),
-        })
-    return parts
-
-def _annotate_blobs(image, groups):
-    annotated = image.copy()
-    colors = {
-        "S": (0, 170, 0),
-        "M": (0, 165, 255),
-        "L": (255, 120, 0),
-        "XL": (40, 40, 220),
-    }
-    scale = max(image.shape[0], image.shape[1]) / 1200.0
-    thickness = max(2, int(round(scale * 2)))
-    font_scale = max(0.45, scale * 0.5)
-    for index, group in enumerate(groups):
-        label = _size_label(index)
-        color = colors.get(label, (255, 255, 255))
-        for blob in group:
-            x, y, width, height = blob["x"], blob["y"], blob["w"], blob["h"]
-            cv2.rectangle(annotated, (x, y), (x + width, y + height), color, thickness)
-            (text_width, text_height), baseline = cv2.getTextSize(
-                label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, max(1, thickness - 1)
-            )
-            chip_top = max(0, y - text_height - baseline - 6)
-            chip_bottom = chip_top + text_height + baseline + 6
-            cv2.rectangle(
-                annotated,
-                (x, chip_top),
-                (x + text_width + 8, chip_bottom),
-                color,
-                -1,
-            )
-            cv2.putText(
-                annotated,
-                label,
-                (x + 4, chip_bottom - baseline - 2),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                font_scale,
-                (255, 255, 255),
-                max(1, thickness - 1),
-                cv2.LINE_AA,
-            )
-    return _jpeg_data_url(annotated)
-
-@app.post("/inspect/sample")
-def inspect_sample(name: str = DEFAULT_SAMPLE):
-    path = _sample_path(name)
-    if path is None or not path.is_file():
-        return {
-            "status": "fail",
-            "message": "Sample image not found",
-            "kitCode": Path(name).name if name else DEFAULT_SAMPLE,
-            "parts": [],
-        }
-
-    image = cv2.imread(str(path))
-    if image is None:
-        return {
-            "status": "fail",
-            "message": f"Could not read {path.name}",
-            "kitCode": path.stem,
-            "parts": [],
-        }
-
-    _remember_snapshot(image)
-    blobs = _detected_blobs(image)
-    groups = _group_by_size(blobs)
-    parts = _size_parts(groups)
-    if not parts:
-        return {
-            "status": "fail",
-            "message": f"No blobs found in {path.name}",
-            "kitCode": path.stem,
-            "parts": [],
-            "info": "Info only: classical contour count, not a BoM check.",
-        }
-
-    return {
-        "status": "pass",
-        "message": f"Rough size groups from {path.name}",
-        "kitCode": path.stem,
-        "parts": parts,
-        "info": f"Info only: {len(blobs)} blobs counted. Classical contour count, not a BoM check.",
-        "image": _annotate_blobs(image, groups),
-    }
-
 def _load_yolo():
     global yolo_model
     yolo_model = None
@@ -1251,15 +923,6 @@ def _load_detect_image(req):
         image = _image_from_encoded(req.image)
         if image is None:
             return None, "Could not read the image"
-        return image, None
-    if req is not None and req.sample:
-        path = _sample_path(req.sample)
-        if path is None or not path.is_file():
-            return None, "Sample image not found"
-        image = cv2.imread(str(path))
-        if image is None:
-            return None, f"Could not read {path.name}"
-        _remember_snapshot(image)
         return image, None
     if _latest_snapshot is None:
         return None, "No image and no snapshot"
@@ -1357,7 +1020,7 @@ def _detect_response(detections, image=None, message=None):
 @app.post("/detect")
 def detect(req: Optional[DetectRequest] = Body(default=None)):
     # Returns part ICs from the model. The kit code stays with the barcode lookup.
-    # An image in the body wins. Otherwise use a named sample, then the latest snapshot.
+    # An image in the body wins. Otherwise use the latest snapshot.
     if yolo_model is None:
         return _detect_response([], message="YOLO model is not loaded")
 
