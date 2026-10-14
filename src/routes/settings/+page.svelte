@@ -22,6 +22,9 @@ let erpName = "";
 let erpUrl = "";
 let erpNotice = "";
 let savingErp = false;
+let scanSeconds = 8;
+let scanNotice = "";
+let savingScan = false;
 
 function errorMessage(err: unknown, fallback: string): string {
 	return err instanceof Error && err.message ? err.message : fallback;
@@ -42,11 +45,24 @@ async function loadSource() {
 		};
 		mssqlPassword = auth === "windows" ? "" : (data.mssql?.password ?? "");
 		await loadErp();
+		await loadScan();
 	} catch (err: unknown) {
 		notice = errorMessage(
 			err,
 			"Could not load the BoM source. Is the vision sidecar running?",
 		);
+	}
+}
+
+async function loadScan() {
+	try {
+		const res = await fetch("http://127.0.0.1:8008/settings/scan");
+		if (!res.ok) throw new Error(await res.text());
+		const data = await res.json();
+		const seconds = Number(data.seconds);
+		if (Number.isInteger(seconds)) scanSeconds = seconds;
+	} catch (err: unknown) {
+		scanNotice = errorMessage(err, "Could not load the scan interval");
 	}
 }
 
@@ -87,6 +103,35 @@ function lock() {
 	gateMessage = "";
 	mssqlPassword = "";
 	sessionStorage.removeItem(UNLOCK_KEY);
+}
+
+async function saveScan() {
+	savingScan = true;
+	scanNotice = "";
+	const seconds = Number(scanSeconds);
+	if (!Number.isInteger(seconds) || seconds < 1 || seconds > 60) {
+		scanNotice = "Enter a whole number of seconds from 1 to 60.";
+		savingScan = false;
+		return;
+	}
+	try {
+		const res = await fetch("http://127.0.0.1:8008/settings/scan", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ seconds }),
+		});
+		const data = await res.json().catch(() => ({}));
+		if (!res.ok || data.status === "fail") {
+			throw new Error(data.message || "Save failed");
+		}
+		if (Number.isInteger(Number(data.seconds)))
+			scanSeconds = Number(data.seconds);
+		scanNotice = data.message || "Saved";
+	} catch (err: unknown) {
+		scanNotice = errorMessage(err, "Could not save the scan interval");
+	} finally {
+		savingScan = false;
+	}
 }
 
 async function saveErp() {
@@ -331,6 +376,44 @@ onMount(() => {
 					</div>
 					{#if notice}
 						<p class="text-sm text-neutral-200">{notice}</p>
+					{/if}
+				</form>
+
+				<form
+					class="flex flex-col gap-4 border border-neutral-700 bg-neutral-900 p-4"
+					method="dialog"
+					novalidate
+					on:submit|preventDefault={saveScan}
+				>
+					<fieldset class="flex flex-col gap-3">
+						<legend class="text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+							Barcode scan
+						</legend>
+						<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+							Interval (seconds)
+							<input
+								type="number"
+								class="w-28 border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
+								bind:value={scanSeconds}
+								min="1"
+								max="60"
+								step="1"
+								required
+							/>
+						</label>
+						<p class="text-sm text-neutral-400">
+							How often the live feed checks for a barcode. The default is 8 seconds.
+						</p>
+					</fieldset>
+					<button
+						type="submit"
+						class="inline-flex min-h-11 w-fit items-center border border-blue-500 bg-blue-600 px-4 text-sm font-semibold text-white disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
+						disabled={savingScan}
+					>
+						{savingScan ? "Saving..." : "Save"}
+					</button>
+					{#if scanNotice}
+						<p class="text-sm text-neutral-200">{scanNotice}</p>
 					{/if}
 				</form>
 

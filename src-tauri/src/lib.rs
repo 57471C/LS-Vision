@@ -13,7 +13,6 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
-use tauri_plugin_shell::ShellExt;
 #[tauri::command]
 fn start_vision_sidecar() -> Result<String, String> {
     use std::path::PathBuf;
@@ -39,7 +38,7 @@ fn start_vision_sidecar() -> Result<String, String> {
         return Err(format!("Script not found at: {}", script.display()));
     }
 
-    let mut child = Command::new(&python)
+    let child = Command::new(&python)
         .arg(&script)
         .current_dir(&project_root)
         .spawn()

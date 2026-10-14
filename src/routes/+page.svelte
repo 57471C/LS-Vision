@@ -27,9 +27,10 @@ type SnapshotView = {
 	kitCode: string;
 	image: string;
 	takenAt: string;
+	sample?: boolean;
 };
 
-const STREAM_MS = 8000;
+const DEFAULT_SCAN_SECONDS = 8;
 
 let barcode = "JOB-12345";
 let result: InspectView | null = null;
@@ -37,7 +38,8 @@ let loading = false;
 let cameraIndex = 0;
 let feedOn = true;
 let snapshot: SnapshotView | null = null;
-let streamLeft = STREAM_MS / 1000;
+let streamMs = DEFAULT_SCAN_SECONDS * 1000;
+let streamLeft = DEFAULT_SCAN_SECONDS;
 let streamTimer: ReturnType<typeof setInterval> | null = null;
 let watchInFlight = false;
 let pageAlive = true;
@@ -62,12 +64,12 @@ function stopWatch() {
 function startWatch() {
 	if (snapshot) return;
 	stopWatch();
-	streamLeft = STREAM_MS / 1000;
+	streamLeft = streamMs / 1000;
 	void watchFeed();
 	streamTimer = setInterval(() => {
 		if (!feedOn || snapshot) return;
 		if (streamLeft <= 1) {
-			streamLeft = STREAM_MS / 1000;
+			streamLeft = streamMs / 1000;
 			void watchFeed();
 		} else {
 			streamLeft -= 1;
@@ -84,6 +86,16 @@ function toggleFeed() {
 function resumeLiveFeed() {
 	snapshot = null;
 	if (feedOn) startWatch();
+}
+
+function holdStill(image: string, kitCode: string, sample = false) {
+	snapshot = {
+		kitCode,
+		image,
+		takenAt: new Date().toLocaleTimeString(),
+		sample,
+	};
+	stopWatch();
 }
 
 function inspectView(body: WatchBody): InspectView {
@@ -103,13 +115,8 @@ function showSnapshot(body: WatchBody) {
 	if (!body.image) return;
 	const kitCode = body.kitCode || body.barcode || barcode;
 	barcode = kitCode;
-	snapshot = {
-		kitCode,
-		image: body.image,
-		takenAt: new Date().toLocaleTimeString(),
-	};
 	result = inspectView(body);
-	stopWatch();
+	holdStill(body.image, kitCode);
 }
 
 async function watchFeed() {
@@ -138,6 +145,21 @@ async function watchFeed() {
 		// A missed poll leaves the last still and the last BoM result.
 	} finally {
 		watchInFlight = false;
+	}
+}
+
+async function loadScan() {
+	try {
+		const res = await fetch("http://127.0.0.1:8008/settings/scan");
+		if (!res.ok) return;
+		const data = await res.json();
+		const seconds = Number(data.seconds);
+		if (!Number.isInteger(seconds) || seconds < 1 || seconds > 60) return;
+		streamMs = seconds * 1000;
+		if (feedOn && !snapshot) streamLeft = seconds;
+		else if (streamLeft > seconds) streamLeft = seconds;
+	} catch {
+		// A missed read keeps the current interval.
 	}
 }
 
@@ -171,7 +193,10 @@ async function checkSidecar() {
 	} catch {
 		sidecarUp = false;
 	}
-	if (pageAlive && sidecarUp && !wasUp) void loadErp();
+	if (pageAlive && sidecarUp && !wasUp) {
+		void loadErp();
+		void loadScan();
+	}
 }
 
 async function openErp() {
@@ -288,7 +313,11 @@ async function testSampleImage() {
 			method: "POST",
 		});
 		if (!res.ok) throw new Error(await res.text());
-		result = await res.json();
+		const body = (await res.json()) as InspectView;
+		result = body;
+		if (body.image) {
+			holdStill(body.image, body.kitCode || "Example3", true);
+		}
 	} catch (err: unknown) {
 		result = {
 			status: "fail",
@@ -448,7 +477,7 @@ async function decodeAndInspect() {
 		<section class="flex min-h-0 min-w-0 flex-col overflow-hidden border border-neutral-700 bg-black">
 			<div class="flex shrink-0 items-center justify-between border-b border-neutral-800 px-3 py-1.5">
 				<h2 class="text-[11px] font-semibold uppercase tracking-widest text-neutral-500">
-					{snapshot ? "Snapshot" : "Camera"}
+					{snapshot?.sample ? "Sample" : snapshot ? "Snapshot" : "Camera"}
 				</h2>
 				{#if snapshot}
 					<p class="text-xs text-amber-200">Automatic stream is stopped</p>
@@ -458,19 +487,23 @@ async function decodeAndInspect() {
 				{#if snapshot}
 					<img
 						src={snapshot.image}
-						alt="Snapshot of kit {snapshot.kitCode}"
+						alt={snapshot.sample
+							? `Annotated sample ${snapshot.kitCode}`
+							: `Snapshot of kit ${snapshot.kitCode}`}
 						class="absolute inset-0 h-full w-full object-contain"
 					/>
 					<div class="absolute left-3 top-3 bg-neutral-950/80 px-3 py-2">
 						<p class="font-mono text-3xl font-semibold leading-none text-white">{snapshot.kitCode}</p>
-						<p class="mt-1 text-sm text-neutral-300">Taken {snapshot.takenAt}</p>
+						<p class="mt-1 text-sm text-neutral-300">
+							{snapshot.sample ? "Annotated sample" : `Taken ${snapshot.takenAt}`}
+						</p>
 					</div>
 					<button
 						type="button"
 						class="absolute bottom-3 right-3 inline-flex min-h-11 items-center border border-yellow-300 bg-yellow-400 px-4 text-sm font-semibold text-neutral-950"
 						on:click={resumeLiveFeed}
 					>
-						Resume live feed
+						{feedOn ? "Resume live feed" : "Back to feed"}
 					</button>
 				{:else if feedOn}
 					<img
@@ -528,13 +561,6 @@ async function decodeAndInspect() {
 								{/each}
 							</tbody>
 						</table>
-					{/if}
-					{#if result.image}
-						<img
-							src={result.image}
-							alt="Annotated sample"
-							class="w-full border border-neutral-700 bg-black"
-						/>
 					{/if}
 					{#if result.info}
 						<p class="text-sm text-neutral-400">{result.info}</p>

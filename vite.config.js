@@ -28,7 +28,12 @@ export default defineConfig(() => ({
 			: undefined,
 		watch: {
 			// 3. tell Vite to ignore watching `src-tauri`
-			ignored: ["**/src-tauri/**"],
+			// Settings writes vision/config.local.json. A watched change reloads the page.
+			ignored: [
+				"**/src-tauri/**",
+				"**/vision/config.local.json",
+				"**/vision/bom-source.json",
+			],
 		},
 	},
 }));

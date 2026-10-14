@@ -6,7 +6,7 @@ import numpy as np
 from fastapi import Body, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 import uvicorn
 import json
 import re
@@ -47,6 +47,9 @@ CONFIG_LOCAL_PATH = Path(__file__).parent / "config.local.json"
 BOM_QUERIES_PATH = Path(__file__).parent / "bom_queries.sql"
 BOM_QUERIES_EXAMPLE_PATH = Path(__file__).parent / "bom_queries.example.sql"
 DEFAULT_SQL_DRIVER = "ODBC Driver 18 for SQL Server"
+DEFAULT_SCAN_SECONDS = 8
+MIN_SCAN_SECONDS = 1
+MAX_SCAN_SECONDS = 60
 SAMPLE_DIR = Path(__file__).parent / "test-images"
 DEFAULT_SAMPLE = "Example3.jpg"
 # Areas within this multiple of the group median stay in the same size band.
@@ -101,6 +104,17 @@ class ErpUpdate(BaseModel):
     name: Optional[str] = ""
     url: Optional[str] = ""
 
+class ScanUpdate(BaseModel):
+    seconds: int
+
+    @field_validator("seconds", mode="before")
+    @classmethod
+    def reject_bool_seconds(cls, value):
+        # JSON true must not become 1. Pydantic would coerce bool before int().
+        if isinstance(value, bool):
+            raise ValueError("Scan interval must be a whole number of seconds")
+        return value
+
 def _blank_erp():
     return {"name": "", "url": ""}
 
@@ -116,6 +130,7 @@ def _blank_bom_source():
             "password": "",
         },
         "erp": _blank_erp(),
+        "scanSeconds": DEFAULT_SCAN_SECONDS,
     }
 
 def _read_json_dict(path):
@@ -159,6 +174,30 @@ def _apply_saved_erp(config, saved):
         config["erp"]["name"] = name.strip()
     if isinstance(url, str):
         config["erp"]["url"] = url.strip()
+    return config
+
+def _clean_scan_seconds(raw):
+    # bool is an int in Python. A JSON true must not become 1 second.
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if not raw:
+            return None
+    if isinstance(raw, float) and not raw.is_integer():
+        return None
+    try:
+        seconds = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if seconds < MIN_SCAN_SECONDS or seconds > MAX_SCAN_SECONDS:
+        return None
+    return seconds
+
+def _apply_saved_scan(config, saved):
+    seconds = _clean_scan_seconds(saved.get("scanSeconds"))
+    if seconds is not None:
+        config["scanSeconds"] = seconds
     return config
 
 def _clean_erp(name, url):
@@ -242,13 +281,15 @@ def load_bom_source():
         if saved is None:
             return config
         _apply_saved_source(config, saved)
-        return _apply_saved_erp(config, saved)
+        _apply_saved_erp(config, saved)
+        return _apply_saved_scan(config, saved)
     if BOM_SOURCE_PATH.exists():
         saved = _read_json_dict(BOM_SOURCE_PATH)
         if saved is None:
             return config
         _apply_saved_source(config, saved)
-        return _apply_saved_erp(config, saved)
+        _apply_saved_erp(config, saved)
+        return _apply_saved_scan(config, saved)
     return config
 
 def save_bom_source(config):
@@ -267,6 +308,7 @@ def save_bom_source(config):
             "name": erp.get("name") or "",
             "url": erp.get("url") or "",
         },
+        "scanSeconds": _clean_scan_seconds(config.get("scanSeconds")) or DEFAULT_SCAN_SECONDS,
     }
     CONFIG_LOCAL_PATH.write_text(
         json.dumps(stored, indent=2) + "\n",
@@ -1145,6 +1187,7 @@ def update_bom_source(body: BomSourceUpdate):
     config["mssql"]["user"] = user
     config["mssql"]["password"] = password
     config["erp"] = existing.get("erp") or _blank_erp()
+    config["scanSeconds"] = existing.get("scanSeconds", DEFAULT_SCAN_SECONDS)
     saved = save_bom_source(config)
     if body.source == "mssql":
         message = "Saved. Inspect queries MSSQL using vision/bom_queries.sql."
@@ -1184,6 +1227,28 @@ def update_erp(body: ErpUpdate):
         "message": message,
         "name": saved["erp"]["name"],
         "url": saved["erp"]["url"],
+    }
+
+@app.get("/settings/scan")
+def get_scan():
+    seconds = _clean_scan_seconds(load_bom_source().get("scanSeconds"))
+    return {"seconds": seconds or DEFAULT_SCAN_SECONDS}
+
+@app.post("/settings/scan")
+def update_scan(body: ScanUpdate):
+    seconds = _clean_scan_seconds(body.seconds)
+    if seconds is None:
+        return {
+            "status": "fail",
+            "message": f"Scan interval must be a whole number of seconds from {MIN_SCAN_SECONDS} to {MAX_SCAN_SECONDS}",
+        }
+    config = load_bom_source()
+    config["scanSeconds"] = seconds
+    saved = save_bom_source(config)
+    return {
+        "status": "pass",
+        "message": f"Saved. The operator page checks for a barcode every {seconds} seconds.",
+        "seconds": saved["scanSeconds"],
     }
 
 def lookup_bom(barcode):
