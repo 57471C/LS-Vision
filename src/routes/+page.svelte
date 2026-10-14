@@ -26,18 +26,74 @@ type WatchBody = InspectView & {
 type SnapshotView = {
 	kitCode: string;
 	image: string;
+	source: string;
 	takenAt: string;
-	sample?: boolean;
+	detected?: boolean;
+};
+
+type DetectRoi = {
+	x: number;
+	y: number;
+	w: number;
+	h: number;
+};
+
+type Detection = {
+	// Part IC from the YOLO class name. Kit codes come from the barcode lookup.
+	ic: string;
+	confidence: number;
+	bbox: number[];
+};
+
+type BomView = {
+	kitCode: string;
+	des?: string;
+	parts: Part[];
+};
+
+type DetectedCount = {
+	ic: string;
+	count: number;
 };
 
 const DEFAULT_SCAN_SECONDS = 8;
+// Settings unlock is the admin flag for this tab. It is not stored in config.
+const ADMIN_FLAG = "ls-vision-settings-open";
 
 let barcode = "JOB-12345";
 let result: InspectView | null = null;
+let bom: BomView | null = null;
 let loading = false;
 let cameraIndex = 0;
 let feedOn = true;
 let snapshot: SnapshotView | null = null;
+let detections: Detection[] = [];
+let detectMessage = "";
+let detectState: "idle" | "running" | "done" = "idle";
+let detectGeneration = 0;
+let testMode = false;
+let admin = false;
+let detectRoi: DetectRoi | null = null;
+let draftRoi: DetectRoi | null = null;
+let draftMark: {
+	left: number;
+	top: number;
+	width: number;
+	height: number;
+} | null = null;
+let drawing = false;
+let savingRoi = false;
+let roiMessage = "";
+let roiDrag: { x: number; y: number } | null = null;
+let paneImage: HTMLImageElement | null = null;
+let paneFrame: HTMLElement | null = null;
+let paneWidth = 0;
+let paneHeight = 0;
+let frameWidth = 0;
+let frameHeight = 0;
+let frameObserver: ResizeObserver | null = null;
+let imagePicker: HTMLInputElement | null = null;
+let imagePick: ((file: File | null) => void) | null = null;
 let streamMs = DEFAULT_SCAN_SECONDS * 1000;
 let streamLeft = DEFAULT_SCAN_SECONDS;
 let streamTimer: ReturnType<typeof setInterval> | null = null;
@@ -84,18 +140,144 @@ function toggleFeed() {
 }
 
 function resumeLiveFeed() {
+	cancelRoiDraw();
+	detectGeneration += 1;
 	snapshot = null;
+	detections = [];
+	detectMessage = "";
+	detectState = "idle";
+	paneWidth = 0;
+	paneHeight = 0;
 	if (feedOn) startWatch();
 }
 
-function holdStill(image: string, kitCode: string, sample = false) {
+function holdStill(image: string, kitCode: string) {
+	cancelRoiDraw();
+	detectGeneration += 1;
+	paneWidth = 0;
+	paneHeight = 0;
 	snapshot = {
 		kitCode,
 		image,
+		source: image,
 		takenAt: new Date().toLocaleTimeString(),
-		sample,
+		detected: false,
 	};
 	stopWatch();
+	return detectGeneration;
+}
+
+function detectionCounts(items: Detection[]): Record<string, number> {
+	const counts: Record<string, number> = {};
+	for (const item of items) {
+		if (!item.ic) continue;
+		counts[item.ic] = (counts[item.ic] ?? 0) + 1;
+	}
+	return counts;
+}
+
+function storeBom(view: InspectView) {
+	// Only a passing barcode lookup loads a kit. Model class names do not.
+	if (view.status !== "pass" || !view.kitCode || !view.parts?.length) return;
+	bom = {
+		kitCode: view.kitCode,
+		des: view.des,
+		parts: view.parts,
+	};
+}
+
+function dropBom() {
+	bom = null;
+}
+
+function isLoadedBom(view: InspectView | null): boolean {
+	return !!bom && !!view?.parts?.length && view.kitCode === bom.kitCode;
+}
+
+function partsOutsideBom(
+	items: Detection[],
+	parts: Part[] | null,
+): DetectedCount[] {
+	const counts = detectionCounts(items);
+	const known = new Set((parts ?? []).map((part) => part.ic));
+	return Object.entries(counts)
+		.filter(([ic]) => !known.has(ic))
+		.sort((a, b) => a[0].localeCompare(b[0]))
+		.map(([ic, count]) => ({ ic, count }));
+}
+
+function matchSummary(parts: Part[], items: Detection[]): string {
+	const counts = detectionCounts(items);
+	let matched = 0;
+	for (const part of parts) {
+		if ((counts[part.ic] ?? 0) === part.qty) matched += 1;
+	}
+	const lines = parts.length === 1 ? "line" : "lines";
+	return `${matched} of ${parts.length} BoM ${lines} match`;
+}
+
+function asDetections(value: unknown): Detection[] {
+	if (!Array.isArray(value)) return [];
+	const found: Detection[] = [];
+	for (const item of value) {
+		if (!item || typeof item !== "object") continue;
+		const row = item as Detection;
+		if (typeof row.ic !== "string" || !row.ic) continue;
+		found.push({
+			ic: row.ic,
+			confidence: typeof row.confidence === "number" ? row.confidence : 0,
+			bbox: Array.isArray(row.bbox) ? row.bbox : [],
+		});
+	}
+	return found;
+}
+
+function detectedImageSrc(encoded: string): string {
+	const text = encoded.trim();
+	if (text.startsWith("data:")) return text;
+	return `data:image/jpeg;base64,${text.replace(/\s+/g, "")}`;
+}
+
+async function runDetect(generation: number, body: { image?: string }) {
+	if (generation !== detectGeneration) return;
+	detectState = "running";
+	detections = [];
+	detectMessage = "";
+	try {
+		const res = await fetch("http://127.0.0.1:8008/detect", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(body),
+		});
+		const payload = (await res.json()) as {
+			detections?: unknown;
+			annotated_image_base64?: unknown;
+			message?: unknown;
+		};
+		if (generation !== detectGeneration || !pageAlive) return;
+		if (!res.ok) {
+			throw new Error(
+				typeof payload.message === "string" && payload.message
+					? payload.message
+					: "Detect failed",
+			);
+		}
+		detections = asDetections(payload.detections);
+		detectMessage = typeof payload.message === "string" ? payload.message : "";
+		const encoded = payload.annotated_image_base64;
+		if (typeof encoded === "string" && encoded && snapshot) {
+			snapshot = {
+				...snapshot,
+				image: detectedImageSrc(encoded),
+				detected: true,
+			};
+		}
+		detectState = "done";
+	} catch (err: unknown) {
+		if (generation !== detectGeneration || !pageAlive) return;
+		detectMessage = errorMessage(err, "Detect failed");
+		detectState = "done";
+	}
 }
 
 function inspectView(body: WatchBody): InspectView {
@@ -111,12 +293,14 @@ function inspectView(body: WatchBody): InspectView {
 	};
 }
 
-function showSnapshot(body: WatchBody) {
+async function showSnapshot(body: WatchBody) {
 	if (!body.image) return;
 	const kitCode = body.kitCode || body.barcode || barcode;
 	barcode = kitCode;
 	result = inspectView(body);
-	holdStill(body.image, kitCode);
+	storeBom(result);
+	const generation = holdStill(body.image, kitCode);
+	await runDetect(generation, { image: body.image });
 }
 
 async function watchFeed() {
@@ -140,7 +324,7 @@ async function watchFeed() {
 		) {
 			return;
 		}
-		showSnapshot(body);
+		await showSnapshot(body);
 	} catch {
 		// A missed poll leaves the last still and the last BoM result.
 	} finally {
@@ -196,6 +380,328 @@ async function checkSidecar() {
 	if (pageAlive && sidecarUp && !wasUp) {
 		void loadErp();
 		void loadScan();
+		void loadTestMode();
+		void loadDetectRoi();
+	}
+}
+
+async function loadTestMode() {
+	try {
+		const res = await fetch("http://127.0.0.1:8008/settings/test-mode");
+		if (!res.ok) return;
+		const data = await res.json();
+		testMode = data.enabled === true;
+	} catch {
+		// A missed read keeps the current mode.
+	}
+}
+
+function asRoi(value: unknown): DetectRoi | null {
+	if (!value || typeof value !== "object") return null;
+	const row = value as DetectRoi;
+	if (
+		typeof row.x !== "number" ||
+		typeof row.y !== "number" ||
+		typeof row.w !== "number" ||
+		typeof row.h !== "number"
+	) {
+		return null;
+	}
+	if (![row.x, row.y, row.w, row.h].every((n) => Number.isFinite(n)))
+		return null;
+	if (row.w < 0.01 || row.h < 0.01) return null;
+	if (
+		row.x < 0 ||
+		row.y < 0 ||
+		row.x + row.w > 1.001 ||
+		row.y + row.h > 1.001
+	) {
+		return null;
+	}
+	return { x: row.x, y: row.y, w: row.w, h: row.h };
+}
+
+function readAdminFlag() {
+	admin = sessionStorage.getItem(ADMIN_FLAG) === "1";
+}
+
+function rememberPaneSize() {
+	paneWidth = paneImage?.naturalWidth ?? 0;
+	paneHeight = paneImage?.naturalHeight ?? 0;
+}
+
+function measureFrame() {
+	frameWidth = paneFrame?.clientWidth ?? 0;
+	frameHeight = paneFrame?.clientHeight ?? 0;
+}
+
+function zoomFrame(): {
+	left: number;
+	top: number;
+	width: number;
+	height: number;
+} | null {
+	// While drawing, keep the whole still so the new box can start anywhere.
+	if (drawing || !detectRoi) return null;
+	if (paneWidth < 1 || paneHeight < 1 || frameWidth < 1 || frameHeight < 1)
+		return null;
+	const roiW = detectRoi.w * paneWidth;
+	const roiH = detectRoi.h * paneHeight;
+	if (roiW < 1 || roiH < 1) return null;
+	const scale = Math.min(frameWidth / roiW, frameHeight / roiH);
+	const roiViewW = roiW * scale;
+	const roiViewH = roiH * scale;
+	return {
+		left: (frameWidth - roiViewW) / 2 - detectRoi.x * paneWidth * scale,
+		top: (frameHeight - roiViewH) / 2 - detectRoi.y * paneHeight * scale,
+		width: paneWidth * scale,
+		height: paneHeight * scale,
+	};
+}
+
+function showDraft(box: DetectRoi) {
+	const img = paneImage;
+	const frame = paneFrame;
+	if (!img || !frame || (box.w <= 0 && box.h <= 0)) {
+		draftMark = null;
+		return;
+	}
+	const nw = img.naturalWidth;
+	const nh = img.naturalHeight;
+	if (nw < 1 || nh < 1) {
+		draftMark = null;
+		return;
+	}
+	const rect = img.getBoundingClientRect();
+	const frameRect = frame.getBoundingClientRect();
+	if (rect.width < 1 || rect.height < 1) {
+		draftMark = null;
+		return;
+	}
+	const scale = Math.min(rect.width / nw, rect.height / nh);
+	const drawnW = nw * scale;
+	const drawnH = nh * scale;
+	const originX = rect.left + (rect.width - drawnW) / 2 - frameRect.left;
+	const originY = rect.top + (rect.height - drawnH) / 2 - frameRect.top;
+	draftMark = {
+		left: originX + box.x * drawnW,
+		top: originY + box.y * drawnH,
+		width: Math.max(2, box.w * drawnW),
+		height: Math.max(2, box.h * drawnH),
+	};
+}
+
+function cancelRoiDraw() {
+	drawing = false;
+	draftRoi = null;
+	draftMark = null;
+	roiDrag = null;
+}
+
+function beginSetRoi() {
+	if (!admin) return;
+	if (drawing) {
+		cancelRoiDraw();
+		roiMessage = "";
+		return;
+	}
+	if (!snapshot) {
+		roiMessage = "Hold a snapshot, then draw the region.";
+		return;
+	}
+	roiMessage = "";
+	drawing = true;
+	draftRoi = null;
+	draftMark = null;
+	roiDrag = null;
+}
+
+function pointInImage(event: PointerEvent): { x: number; y: number } | null {
+	const img = paneImage;
+	if (!img) return null;
+	const rect = img.getBoundingClientRect();
+	const nw = img.naturalWidth;
+	const nh = img.naturalHeight;
+	if (!nw || !nh || rect.width < 1 || rect.height < 1) return null;
+	const scale = Math.min(rect.width / nw, rect.height / nh);
+	const drawnW = nw * scale;
+	const drawnH = nh * scale;
+	const originX = rect.left + (rect.width - drawnW) / 2;
+	const originY = rect.top + (rect.height - drawnH) / 2;
+	return {
+		x: Math.min(1, Math.max(0, (event.clientX - originX) / drawnW)),
+		y: Math.min(1, Math.max(0, (event.clientY - originY) / drawnH)),
+	};
+}
+
+function rectFromPoints(
+	start: { x: number; y: number },
+	end: { x: number; y: number },
+): DetectRoi {
+	return {
+		x: Math.min(start.x, end.x),
+		y: Math.min(start.y, end.y),
+		w: Math.abs(end.x - start.x),
+		h: Math.abs(end.y - start.y),
+	};
+}
+
+function onRoiPointerDown(event: PointerEvent) {
+	if (!drawing) return;
+	const point = pointInImage(event);
+	if (!point) return;
+	(event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+	roiDrag = point;
+	draftRoi = { x: point.x, y: point.y, w: 0, h: 0 };
+	draftMark = null;
+}
+
+function onRoiPointerMove(event: PointerEvent) {
+	if (!roiDrag) return;
+	const point = pointInImage(event);
+	if (!point) return;
+	const box = rectFromPoints(roiDrag, point);
+	draftRoi = box;
+	showDraft(box);
+}
+
+function onRoiPointerUp(event: PointerEvent) {
+	if (!roiDrag) return;
+	const start = roiDrag;
+	const point = pointInImage(event) ?? start;
+	roiDrag = null;
+	const roi = rectFromPoints(start, point);
+	if (roi.w < 0.01 || roi.h < 0.01) {
+		draftRoi = null;
+		draftMark = null;
+		roiMessage = "Drag a larger rectangle.";
+		return;
+	}
+	draftRoi = roi;
+	showDraft(roi);
+	void saveDetectRoi(roi);
+}
+
+async function loadDetectRoi() {
+	try {
+		const res = await fetch("http://127.0.0.1:8008/settings/detect-roi");
+		if (!res.ok) return;
+		const data = await res.json();
+		detectRoi = asRoi(data.roi);
+	} catch {
+		// A missed read keeps the current region.
+	}
+}
+
+function roundRoi(roi: DetectRoi): DetectRoi {
+	const round = (value: number) => Math.round(value * 10000) / 10000;
+	return { x: round(roi.x), y: round(roi.y), w: round(roi.w), h: round(roi.h) };
+}
+
+async function saveDetectRoi(roi: DetectRoi | null) {
+	if (!admin) return;
+	savingRoi = true;
+	roiMessage = "";
+	try {
+		const res = await fetch("http://127.0.0.1:8008/settings/detect-roi", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ roi: roi ? roundRoi(roi) : null }),
+		});
+		const data = (await res.json().catch(() => ({}))) as {
+			status?: string;
+			message?: string;
+			roi?: unknown;
+		};
+		if (!res.ok || data.status === "fail") {
+			throw new Error(data.message || "Could not save the ROI");
+		}
+		detectRoi = asRoi(data.roi);
+		draftRoi = null;
+		draftMark = null;
+		drawing = false;
+		roiDrag = null;
+		roiMessage = data.message || "Saved.";
+		rerunDetect();
+	} catch (err: unknown) {
+		roiMessage = errorMessage(err, "Could not save the ROI");
+	} finally {
+		savingRoi = false;
+	}
+}
+
+function clearDetectRoi() {
+	if (!admin || savingRoi) return;
+	cancelRoiDraw();
+	void saveDetectRoi(null);
+}
+
+function rerunDetect() {
+	if (!snapshot?.source || !pageAlive) return;
+	detectGeneration += 1;
+	const generation = detectGeneration;
+	void runDetect(generation, { image: snapshot.source });
+}
+
+function chooseImageFile(): Promise<File | null> {
+	const input = imagePicker;
+	if (!input) return Promise.resolve(null);
+	if (imagePick) imagePick(null);
+	input.value = "";
+	return new Promise((resolve) => {
+		imagePick = resolve;
+		try {
+			input.click();
+		} catch {
+			imagePick = null;
+			resolve(null);
+		}
+	});
+}
+
+function finishImagePick(file: File | null) {
+	const resolve = imagePick;
+	imagePick = null;
+	resolve?.(file);
+}
+
+function onImagePicked(event: Event) {
+	const input = event.currentTarget as HTMLInputElement;
+	finishImagePick(input.files?.[0] ?? null);
+}
+
+function onImageCancel() {
+	finishImagePick(null);
+}
+
+function readImageFile(file: File): Promise<string> {
+	return new Promise((resolve, reject) => {
+		const reader = new FileReader();
+		reader.onload = () => {
+			if (typeof reader.result === "string" && reader.result)
+				resolve(reader.result);
+			else reject(new Error("Could not read the image"));
+		};
+		reader.onerror = () =>
+			reject(reader.error ?? new Error("Could not read the image"));
+		reader.readAsDataURL(file);
+	});
+}
+
+async function chooseAndDetect() {
+	if (!bom || !testMode) return;
+	const kitCode = bom.kitCode;
+	const file = await chooseImageFile();
+	if (!file || !pageAlive || !bom || bom.kitCode !== kitCode) return;
+	try {
+		const dataUrl = await readImageFile(file);
+		if (!pageAlive || !bom || bom.kitCode !== kitCode) return;
+		const generation = holdStill(dataUrl, kitCode);
+		await runDetect(generation, { image: dataUrl });
+	} catch (err: unknown) {
+		if (!pageAlive) return;
+		detectMessage = errorMessage(err, "Could not read the image");
+		detectState = "done";
 	}
 }
 
@@ -237,6 +743,7 @@ function closeErp() {
 
 function onErpKey(event: KeyboardEvent) {
 	if (event.key === "Escape" && erpOpen) closeErp();
+	else if (event.key === "Escape" && drawing) cancelRoiDraw();
 }
 
 function onIframeError() {
@@ -253,6 +760,13 @@ async function openErpInBrowser() {
 }
 
 onMount(() => {
+	readAdminFlag();
+	window.addEventListener("focus", readAdminFlag);
+	measureFrame();
+	if (paneFrame) {
+		frameObserver = new ResizeObserver(() => measureFrame());
+		frameObserver.observe(paneFrame);
+	}
 	void checkSidecar();
 	healthTimer = setInterval(() => {
 		void checkSidecar();
@@ -262,6 +776,9 @@ onMount(() => {
 
 onDestroy(() => {
 	pageAlive = false;
+	window.removeEventListener("focus", readAdminFlag);
+	frameObserver?.disconnect();
+	frameObserver = null;
 	stopWatch();
 	if (healthTimer !== null) {
 		clearInterval(healthTimer);
@@ -297,32 +814,15 @@ async function runInspect() {
 			body: JSON.stringify({ barcode }),
 		});
 		if (!res.ok) throw new Error(await res.text());
-		result = await res.json();
-	} catch (err: unknown) {
-		result = { status: "fail", message: errorMessage(err, "Request failed") };
-	} finally {
-		loading = false;
-	}
-}
-
-async function testSampleImage() {
-	loading = true;
-	result = null;
-	try {
-		const res = await fetch("http://127.0.0.1:8008/inspect/sample", {
-			method: "POST",
-		});
-		if (!res.ok) throw new Error(await res.text());
 		const body = (await res.json()) as InspectView;
 		result = body;
-		if (body.image) {
-			holdStill(body.image, body.kitCode || "Example3", true);
-		}
+		if (body.status === "pass") {
+			storeBom(body);
+			if (testMode) void chooseAndDetect();
+		} else dropBom();
 	} catch (err: unknown) {
-		result = {
-			status: "fail",
-			message: errorMessage(err, "Sample test failed"),
-		};
+		result = { status: "fail", message: errorMessage(err, "Request failed") };
+		dropBom();
 	} finally {
 		loading = false;
 	}
@@ -337,11 +837,12 @@ async function decodeAndInspect() {
 		const body = (await res.json()) as WatchBody;
 		if (!res.ok) throw new Error(body.message || "Decode failed");
 		if (body.snapshot && body.image) {
-			showSnapshot(body);
+			await showSnapshot(body);
 			return;
 		}
 		if (body.barcode) {
 			barcode = body.barcode;
+			dropBom();
 			result = {
 				status: "fail",
 				message: body.message || "Barcode not found in BoM",
@@ -363,6 +864,15 @@ async function decodeAndInspect() {
 <svelte:window on:keydown={onErpKey} />
 
 <div class="relative flex h-dvh max-h-dvh flex-col overflow-hidden overscroll-none bg-neutral-950 text-neutral-100">
+	<input
+		bind:this={imagePicker}
+		type="file"
+		accept="image/*"
+		class="absolute h-px w-px opacity-0"
+		tabindex="-1"
+		on:change={onImagePicked}
+		on:cancel={onImageCancel}
+	/>
 	<header class="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-neutral-800 bg-neutral-900 px-4 py-2">
 		<div class="flex items-baseline gap-3">
 			<h1 class="text-lg font-semibold tracking-tight">LS-Vision</h1>
@@ -449,19 +959,29 @@ async function decodeAndInspect() {
 		</button>
 		<button
 			type="button"
-			class="inline-flex min-h-11 items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100 disabled:text-neutral-500"
-			on:click={testSampleImage}
-			disabled={loading}
-		>
-			Test sample image
-		</button>
-		<button
-			type="button"
 			class="inline-flex min-h-11 items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100"
 			on:click={toggleFeed}
 		>
 			{feedOn ? "Stop feed" : "Start feed"}
 		</button>
+		{#if admin}
+			<button
+				type="button"
+				class="inline-flex min-h-11 items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100 disabled:text-neutral-500"
+				on:click={beginSetRoi}
+				disabled={savingRoi}
+			>
+				{drawing ? "Cancel" : "Set ROI"}
+			</button>
+			<button
+				type="button"
+				class="inline-flex min-h-11 items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100 disabled:text-neutral-500"
+				on:click={clearDetectRoi}
+				disabled={savingRoi || !detectRoi}
+			>
+				Clear ROI
+			</button>
+		{/if}
 		{#if erpUrl}
 			<button
 				type="button"
@@ -477,44 +997,139 @@ async function decodeAndInspect() {
 		<section class="flex min-h-0 min-w-0 flex-col overflow-hidden border border-neutral-700 bg-black">
 			<div class="flex shrink-0 items-center justify-between border-b border-neutral-800 px-3 py-1.5">
 				<h2 class="text-[11px] font-semibold uppercase tracking-widest text-neutral-500">
-					{snapshot?.sample ? "Sample" : snapshot ? "Snapshot" : "Camera"}
+					{snapshot ? "Snapshot" : "Camera"}
 				</h2>
-				{#if snapshot}
+				{#if roiMessage}
+					<p class="text-xs text-amber-200">{roiMessage}</p>
+				{:else if snapshot}
 					<p class="text-xs text-amber-200">Automatic stream is stopped</p>
 				{/if}
 			</div>
-			<div class="relative min-h-0 flex-1 overflow-hidden">
-				{#if snapshot}
-					<img
-						src={snapshot.image}
-						alt={snapshot.sample
-							? `Annotated sample ${snapshot.kitCode}`
-							: `Snapshot of kit ${snapshot.kitCode}`}
-						class="absolute inset-0 h-full w-full object-contain"
-					/>
-					<div class="absolute left-3 top-3 bg-neutral-950/80 px-3 py-2">
-						<p class="font-mono text-3xl font-semibold leading-none text-white">{snapshot.kitCode}</p>
-						<p class="mt-1 text-sm text-neutral-300">
-							{snapshot.sample ? "Annotated sample" : `Taken ${snapshot.takenAt}`}
-						</p>
-					</div>
-					<button
-						type="button"
-						class="absolute bottom-3 right-3 inline-flex min-h-11 items-center border border-yellow-300 bg-yellow-400 px-4 text-sm font-semibold text-neutral-950"
-						on:click={resumeLiveFeed}
+			<div bind:this={paneFrame} class="relative min-h-0 flex-1 overflow-hidden">
+				{#if snapshot || feedOn}
+					{@const zoom = zoomFrame()}
+					<div
+						class="absolute {zoom ? '' : 'inset-0'}"
+						style={zoom
+							? `left:${zoom.left}px;top:${zoom.top}px;width:${zoom.width}px;height:${zoom.height}px;`
+							: ""}
 					>
-						{feedOn ? "Resume live feed" : "Back to feed"}
-					</button>
-				{:else if feedOn}
-					<img
-						src="http://127.0.0.1:8008/camera/stream?index={cameraIndex}"
-						alt="Camera feed"
-						class="absolute inset-0 h-full w-full object-contain"
-					/>
+						{#if snapshot}
+							<img
+								bind:this={paneImage}
+								src={snapshot.image}
+								alt={snapshot.detected
+									? `Detected parts for kit ${snapshot.kitCode}`
+									: `Snapshot of kit ${snapshot.kitCode}`}
+								class="h-full w-full {zoom ? 'object-fill' : 'object-contain'}"
+								on:load={rememberPaneSize}
+							/>
+						{:else}
+							<img
+								bind:this={paneImage}
+								src="http://127.0.0.1:8008/camera/stream?index={cameraIndex}"
+								alt="Camera feed"
+								class="h-full w-full {zoom ? 'object-fill' : 'object-contain'}"
+								on:load={rememberPaneSize}
+							/>
+						{/if}
+						{#if paneWidth > 0 && paneHeight > 0 && !drawing && detectRoi}
+							{@const x = detectRoi.x * paneWidth}
+							{@const y = detectRoi.y * paneHeight}
+							{@const w = detectRoi.w * paneWidth}
+							{@const h = detectRoi.h * paneHeight}
+							<svg
+								class="pointer-events-none absolute inset-0 z-10 h-full w-full"
+								viewBox="0 0 {paneWidth} {paneHeight}"
+								preserveAspectRatio={zoom ? "none" : "xMidYMid meet"}
+							>
+								<rect x="0" y="0" width={paneWidth} height={y} fill="black" fill-opacity="0.45" />
+								<rect
+									x="0"
+									y={y + h}
+									width={paneWidth}
+									height={paneHeight - (y + h)}
+									fill="black"
+									fill-opacity="0.45"
+								/>
+								<rect x="0" y={y} width={x} height={h} fill="black" fill-opacity="0.45" />
+								<rect
+									x={x + w}
+									y={y}
+									width={paneWidth - (x + w)}
+									height={h}
+									fill="black"
+									fill-opacity="0.45"
+								/>
+								<rect
+									x={x}
+									y={y}
+									width={w}
+									height={h}
+									fill="none"
+									stroke="#fde68a"
+									stroke-opacity="0.75"
+									stroke-width="2"
+									vector-effect="non-scaling-stroke"
+								/>
+							</svg>
+						{/if}
+					</div>
 				{:else}
 					<div class="absolute inset-0 flex items-center justify-center text-lg text-neutral-500">
 						Feed stopped
 					</div>
+				{/if}
+				{#if snapshot}
+					<div
+						class="pointer-events-none absolute left-3 top-3 z-20 bg-neutral-950/80 {detectRoi &&
+						!drawing
+							? 'px-2 py-1'
+							: 'px-3 py-2'}"
+					>
+						<p
+							class="font-mono font-semibold leading-none text-white {detectRoi && !drawing
+								? 'text-sm'
+								: 'text-3xl'}"
+						>
+							{snapshot.kitCode}
+						</p>
+						<p
+							class="mt-1 text-neutral-300 {detectRoi && !drawing ? 'text-[11px]' : 'text-sm'}"
+						>
+							Taken {snapshot.takenAt}
+						</p>
+					</div>
+					{#if detectState === "running"}
+						<p class="pointer-events-none absolute bottom-3 left-3 z-40 bg-neutral-950/80 px-3 py-2 text-sm font-semibold text-amber-200">
+							Detecting parts...
+						</p>
+					{/if}
+					<button
+						type="button"
+						class="absolute bottom-3 right-3 z-40 inline-flex min-h-11 items-center border border-yellow-300 bg-yellow-400 px-4 text-sm font-semibold text-neutral-950"
+						on:click={resumeLiveFeed}
+					>
+						{feedOn ? "Resume live feed" : "Back to feed"}
+					</button>
+				{/if}
+				{#if drawing && snapshot}
+					<div
+						class="absolute inset-0 z-30 cursor-crosshair"
+						on:pointerdown={onRoiPointerDown}
+						on:pointermove={onRoiPointerMove}
+						on:pointerup={onRoiPointerUp}
+						on:pointercancel={onRoiPointerUp}
+					></div>
+					<p class="pointer-events-none absolute left-3 top-3 z-40 bg-neutral-950/80 px-3 py-2 text-sm text-amber-200">
+						Drag a rectangle on the snapshot.
+					</p>
+					{#if draftMark}
+						<div
+							class="pointer-events-none absolute z-50"
+							style="left:{draftMark.left}px;top:{draftMark.top}px;width:{draftMark.width}px;height:{draftMark.height}px;box-sizing:border-box;border:3px dotted #fde68a;background:rgba(253,230,138,0.2);box-shadow:0 0 0 1px #0a0a0a;"
+						></div>
+					{/if}
 				{/if}
 			</div>
 		</section>
@@ -536,6 +1151,18 @@ async function decodeAndInspect() {
 					{#if result.kitCode}
 						<p class="font-mono text-2xl font-semibold tracking-tight">{result.kitCode}</p>
 					{/if}
+					{#if testMode && isLoadedBom(result)}
+						<button
+							type="button"
+							class="inline-flex min-h-11 w-fit items-center border border-blue-500 bg-blue-600 px-4 text-sm font-semibold text-white"
+							on:click={chooseAndDetect}
+						>
+							Choose image
+						</button>
+						<p class="text-sm text-neutral-400">
+							Test mode is on. Choose an image file to detect parts for this kit.
+						</p>
+					{/if}
 					{#if result.des}
 						<p class="text-base text-neutral-300">{result.des}</p>
 					{/if}
@@ -543,12 +1170,20 @@ async function decodeAndInspect() {
 						<p class="text-base text-neutral-200">{result.message}</p>
 					{/if}
 					{#if result.parts?.length}
+						{@const detectFailed =
+							detectState === "done" && !!detectMessage && detections.length === 0}
+						{@const showSeen =
+							detectState !== "idle" && isLoadedBom(result) && !detectFailed}
+						{@const counts = detectionCounts(detections)}
 						<table class="w-full border-collapse text-left text-sm">
 							<thead>
 								<tr class="border-b border-neutral-600 text-[11px] uppercase tracking-widest text-neutral-400">
 									<th class="py-2 pr-3 font-semibold">IC</th>
 									<th class="py-2 pr-3 font-semibold">Description</th>
 									<th class="py-2 text-right font-semibold">Qty</th>
+									{#if showSeen}
+										<th class="py-2 text-right font-semibold">Seen</th>
+									{/if}
 								</tr>
 							</thead>
 							<tbody>
@@ -557,10 +1192,54 @@ async function decodeAndInspect() {
 										<td class="py-2 pr-3 font-mono font-medium">{part.ic}</td>
 										<td class="py-2 pr-3 text-neutral-200">{part.des}</td>
 										<td class="py-2 text-right font-semibold">{part.qty}</td>
+										{#if showSeen}
+											<td
+												class="py-2 text-right font-semibold {detectState === 'running'
+													? 'text-neutral-500'
+													: (counts[part.ic] ?? 0) === part.qty
+														? 'text-green-400'
+														: 'text-red-400'}"
+											>
+												{detectState === "running" ? "…" : (counts[part.ic] ?? 0)}
+											</td>
+										{/if}
 									</tr>
 								{/each}
 							</tbody>
 						</table>
+						{#if showSeen && detectState === "done"}
+							<p class="text-sm text-neutral-300">{matchSummary(result.parts, detections)}</p>
+						{/if}
+					{/if}
+					{#if detectState === "running"}
+						<p class="text-sm text-neutral-400">Detecting parts...</p>
+					{/if}
+					{#if detectState === "done"}
+						{@const extras = partsOutsideBom(detections, bom?.parts ?? null)}
+						{#if extras.length}
+							<h3 class="text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+								{bom ? "Not in BoM" : "Detected parts"}
+							</h3>
+							<table class="w-full border-collapse text-left text-sm">
+								<thead>
+									<tr class="border-b border-neutral-600 text-[11px] uppercase tracking-widest text-neutral-400">
+										<th class="py-2 pr-3 font-semibold">IC</th>
+										<th class="py-2 text-right font-semibold">Count</th>
+									</tr>
+								</thead>
+								<tbody>
+									{#each extras as row (row.ic)}
+										<tr class="border-b border-neutral-800">
+											<td class="py-2 pr-3 font-mono font-medium">{row.ic}</td>
+											<td class="py-2 text-right font-semibold">{row.count}</td>
+										</tr>
+									{/each}
+								</tbody>
+							</table>
+						{/if}
+					{/if}
+					{#if detectMessage}
+						<p class="text-sm text-red-300">{detectMessage}</p>
 					{/if}
 					{#if result.info}
 						<p class="text-sm text-neutral-400">{result.info}</p>
