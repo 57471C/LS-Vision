@@ -133,6 +133,17 @@ class ScanUpdate(BaseModel):
             raise ValueError("Scan interval must be a whole number of seconds")
         return value
 
+class TestModeUpdate(BaseModel):
+    enabled: bool
+
+    @field_validator("enabled", mode="before")
+    @classmethod
+    def reject_non_bool(cls, value):
+        # JSON 1 or "true" must not turn Test mode on.
+        if not isinstance(value, bool):
+            raise ValueError("Test mode must be true or false")
+        return value
+
 def _blank_erp():
     return {"name": "", "url": ""}
 
@@ -149,6 +160,7 @@ def _blank_bom_source():
         },
         "erp": _blank_erp(),
         "scanSeconds": DEFAULT_SCAN_SECONDS,
+        "testMode": False,
     }
 
 def _read_json_dict(path):
@@ -216,6 +228,12 @@ def _apply_saved_scan(config, saved):
     seconds = _clean_scan_seconds(saved.get("scanSeconds"))
     if seconds is not None:
         config["scanSeconds"] = seconds
+    return config
+
+def _apply_saved_test_mode(config, saved):
+    mode = saved.get("testMode")
+    if isinstance(mode, bool):
+        config["testMode"] = mode
     return config
 
 def _clean_erp(name, url):
@@ -300,14 +318,16 @@ def load_bom_source():
             return config
         _apply_saved_source(config, saved)
         _apply_saved_erp(config, saved)
-        return _apply_saved_scan(config, saved)
+        _apply_saved_scan(config, saved)
+        return _apply_saved_test_mode(config, saved)
     if BOM_SOURCE_PATH.exists():
         saved = _read_json_dict(BOM_SOURCE_PATH)
         if saved is None:
             return config
         _apply_saved_source(config, saved)
         _apply_saved_erp(config, saved)
-        return _apply_saved_scan(config, saved)
+        _apply_saved_scan(config, saved)
+        return _apply_saved_test_mode(config, saved)
     return config
 
 def save_bom_source(config):
@@ -327,6 +347,7 @@ def save_bom_source(config):
             "url": erp.get("url") or "",
         },
         "scanSeconds": _clean_scan_seconds(config.get("scanSeconds")) or DEFAULT_SCAN_SECONDS,
+        "testMode": config.get("testMode") is True,
     }
     CONFIG_LOCAL_PATH.write_text(
         json.dumps(stored, indent=2) + "\n",
@@ -1389,6 +1410,7 @@ def update_bom_source(body: BomSourceUpdate):
     config["mssql"]["password"] = password
     config["erp"] = existing.get("erp") or _blank_erp()
     config["scanSeconds"] = existing.get("scanSeconds", DEFAULT_SCAN_SECONDS)
+    config["testMode"] = existing.get("testMode") is True
     saved = save_bom_source(config)
     if body.source == "mssql":
         message = "Saved. Inspect queries MSSQL using vision/bom_queries.sql."
@@ -1451,6 +1473,21 @@ def update_scan(body: ScanUpdate):
         "message": f"Saved. The operator page checks for a barcode every {seconds} seconds.",
         "seconds": saved["scanSeconds"],
     }
+
+@app.get("/settings/test-mode")
+def get_test_mode():
+    return {"enabled": load_bom_source().get("testMode") is True}
+
+@app.post("/settings/test-mode")
+def update_test_mode(body: TestModeUpdate):
+    config = load_bom_source()
+    config["testMode"] = body.enabled
+    saved = save_bom_source(config)
+    if saved["testMode"]:
+        message = "Saved. Enter a kit IC to choose an image for detection."
+    else:
+        message = "Saved. The operator page uses the camera and barcode flow."
+    return {"status": "pass", "message": message, "enabled": saved["testMode"]}
 
 def lookup_bom(barcode):
     source = load_bom_source()

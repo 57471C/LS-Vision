@@ -12,5 +12,6 @@
     "name": "",
     "url": ""
   },
-  "scanSeconds": 8
+  "scanSeconds": 8,
+  "testMode": false
 }

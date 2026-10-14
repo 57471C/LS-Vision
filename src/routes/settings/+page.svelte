@@ -25,6 +25,9 @@ let savingErp = false;
 let scanSeconds = 8;
 let scanNotice = "";
 let savingScan = false;
+let testMode = false;
+let testNotice = "";
+let savingTest = false;
 
 function errorMessage(err: unknown, fallback: string): string {
 	return err instanceof Error && err.message ? err.message : fallback;
@@ -46,6 +49,7 @@ async function loadSource() {
 		mssqlPassword = auth === "windows" ? "" : (data.mssql?.password ?? "");
 		await loadErp();
 		await loadScan();
+		await loadTestMode();
 	} catch (err: unknown) {
 		notice = errorMessage(
 			err,
@@ -63,6 +67,41 @@ async function loadScan() {
 		if (Number.isInteger(seconds)) scanSeconds = seconds;
 	} catch (err: unknown) {
 		scanNotice = errorMessage(err, "Could not load the scan interval");
+	}
+}
+
+async function loadTestMode() {
+	try {
+		const res = await fetch("http://127.0.0.1:8008/settings/test-mode");
+		if (!res.ok) throw new Error(await res.text());
+		const data = await res.json();
+		testMode = data.enabled === true;
+	} catch (err: unknown) {
+		testNotice = errorMessage(err, "Could not load Test mode");
+	}
+}
+
+async function saveTestMode() {
+	savingTest = true;
+	testNotice = "";
+	const enabled = testMode;
+	try {
+		const res = await fetch("http://127.0.0.1:8008/settings/test-mode", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ enabled }),
+		});
+		const data = await res.json().catch(() => ({}));
+		if (!res.ok || data.status === "fail") {
+			throw new Error(data.message || "Save failed");
+		}
+		testMode = data.enabled === true;
+		testNotice = data.message || "Saved";
+	} catch (err: unknown) {
+		testMode = !enabled;
+		testNotice = errorMessage(err, "Could not save Test mode");
+	} finally {
+		savingTest = false;
 	}
 }
 
@@ -376,6 +415,39 @@ onMount(() => {
 					</div>
 					{#if notice}
 						<p class="text-sm text-neutral-200">{notice}</p>
+					{/if}
+				</form>
+
+				<form
+					class="flex flex-col gap-4 border border-neutral-700 bg-neutral-900 p-4"
+					on:submit|preventDefault={saveTestMode}
+				>
+					<fieldset class="flex flex-col gap-3">
+						<legend class="text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+							Test mode
+						</legend>
+						<label class="flex items-center gap-3 text-sm font-medium text-neutral-100">
+							<input
+								type="checkbox"
+								class="h-5 w-5 accent-blue-500"
+								bind:checked={testMode}
+								disabled={savingTest}
+							/>
+							Use an image file after a kit IC loads
+						</label>
+						<p class="text-sm text-neutral-400">
+							When this is on, entering a kit IC and loading its BoM asks for an image file. Detection runs on that file. When it is off, the operator page keeps the camera and barcode flow.
+						</p>
+					</fieldset>
+					<button
+						type="submit"
+						class="inline-flex min-h-11 w-fit items-center border border-blue-500 bg-blue-600 px-4 text-sm font-semibold text-white disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
+						disabled={savingTest}
+					>
+						{savingTest ? "Saving..." : "Save"}
+					</button>
+					{#if testNotice}
+						<p class="text-sm text-neutral-200">{testNotice}</p>
 					{/if}
 				</form>
 

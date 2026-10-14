@@ -62,6 +62,9 @@ let detections: Detection[] = [];
 let detectMessage = "";
 let detectState: "idle" | "running" | "done" = "idle";
 let detectGeneration = 0;
+let testMode = false;
+let imagePicker: HTMLInputElement | null = null;
+let imagePick: ((file: File | null) => void) | null = null;
 let streamMs = DEFAULT_SCAN_SECONDS * 1000;
 let streamLeft = DEFAULT_SCAN_SECONDS;
 let streamTimer: ReturnType<typeof setInterval> | null = null;
@@ -348,6 +351,80 @@ async function checkSidecar() {
 	if (pageAlive && sidecarUp && !wasUp) {
 		void loadErp();
 		void loadScan();
+		void loadTestMode();
+	}
+}
+
+async function loadTestMode() {
+	try {
+		const res = await fetch("http://127.0.0.1:8008/settings/test-mode");
+		if (!res.ok) return;
+		const data = await res.json();
+		testMode = data.enabled === true;
+	} catch {
+		// A missed read keeps the current mode.
+	}
+}
+
+function chooseImageFile(): Promise<File | null> {
+	const input = imagePicker;
+	if (!input) return Promise.resolve(null);
+	if (imagePick) imagePick(null);
+	input.value = "";
+	return new Promise((resolve) => {
+		imagePick = resolve;
+		try {
+			input.click();
+		} catch {
+			imagePick = null;
+			resolve(null);
+		}
+	});
+}
+
+function finishImagePick(file: File | null) {
+	const resolve = imagePick;
+	imagePick = null;
+	resolve?.(file);
+}
+
+function onImagePicked(event: Event) {
+	const input = event.currentTarget as HTMLInputElement;
+	finishImagePick(input.files?.[0] ?? null);
+}
+
+function onImageCancel() {
+	finishImagePick(null);
+}
+
+function readImageFile(file: File): Promise<string> {
+	return new Promise((resolve, reject) => {
+		const reader = new FileReader();
+		reader.onload = () => {
+			if (typeof reader.result === "string" && reader.result)
+				resolve(reader.result);
+			else reject(new Error("Could not read the image"));
+		};
+		reader.onerror = () =>
+			reject(reader.error ?? new Error("Could not read the image"));
+		reader.readAsDataURL(file);
+	});
+}
+
+async function chooseAndDetect() {
+	if (!bom || !testMode) return;
+	const kitCode = bom.kitCode;
+	const file = await chooseImageFile();
+	if (!file || !pageAlive || !bom || bom.kitCode !== kitCode) return;
+	try {
+		const dataUrl = await readImageFile(file);
+		if (!pageAlive || !bom || bom.kitCode !== kitCode) return;
+		const generation = holdStill(dataUrl, kitCode);
+		await runDetect(generation, { image: dataUrl });
+	} catch (err: unknown) {
+		if (!pageAlive) return;
+		detectMessage = errorMessage(err, "Could not read the image");
+		detectState = "done";
 	}
 }
 
@@ -451,8 +528,10 @@ async function runInspect() {
 		if (!res.ok) throw new Error(await res.text());
 		const body = (await res.json()) as InspectView;
 		result = body;
-		if (body.status === "pass") storeBom(body);
-		else dropBom();
+		if (body.status === "pass") {
+			storeBom(body);
+			if (testMode) void chooseAndDetect();
+		} else dropBom();
 	} catch (err: unknown) {
 		result = { status: "fail", message: errorMessage(err, "Request failed") };
 		dropBom();
@@ -525,6 +604,15 @@ async function decodeAndInspect() {
 <svelte:window on:keydown={onErpKey} />
 
 <div class="relative flex h-dvh max-h-dvh flex-col overflow-hidden overscroll-none bg-neutral-950 text-neutral-100">
+	<input
+		bind:this={imagePicker}
+		type="file"
+		accept="image/*"
+		class="absolute h-px w-px opacity-0"
+		tabindex="-1"
+		on:change={onImagePicked}
+		on:cancel={onImageCancel}
+	/>
 	<header class="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-neutral-800 bg-neutral-900 px-4 py-2">
 		<div class="flex items-baseline gap-3">
 			<h1 class="text-lg font-semibold tracking-tight">LS-Vision</h1>
@@ -712,6 +800,18 @@ async function decodeAndInspect() {
 				<div class="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4">
 					{#if result.kitCode}
 						<p class="font-mono text-2xl font-semibold tracking-tight">{result.kitCode}</p>
+					{/if}
+					{#if testMode && isLoadedBom(result)}
+						<button
+							type="button"
+							class="inline-flex min-h-11 w-fit items-center border border-blue-500 bg-blue-600 px-4 text-sm font-semibold text-white"
+							on:click={chooseAndDetect}
+						>
+							Choose image
+						</button>
+						<p class="text-sm text-neutral-400">
+							Test mode is on. Choose an image file to detect parts for this kit.
+						</p>
 					{/if}
 					{#if result.des}
 						<p class="text-base text-neutral-300">{result.des}</p>
