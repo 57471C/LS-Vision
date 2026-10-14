@@ -1,4 +1,5 @@
 import base64
+from contextlib import asynccontextmanager
 from typing import Optional
 
 import cv2
@@ -26,7 +27,13 @@ except OSError as exc:
 else:
     _PYZBAR_ERROR = None
 
-app = FastAPI(title="LS-Vision Sidecar")
+@asynccontextmanager
+async def _lifespan(_app):
+    # Barcode and BoM stay up even when the weights fail to load.
+    _load_yolo()
+    yield
+
+app = FastAPI(title="LS-Vision Sidecar", lifespan=_lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -52,6 +59,7 @@ MIN_SCAN_SECONDS = 1
 MAX_SCAN_SECONDS = 60
 SAMPLE_DIR = Path(__file__).parent / "test-images"
 DEFAULT_SAMPLE = "Example3.jpg"
+MODEL_PATH = Path(__file__).parent / "models" / "best.pt"
 # Areas within this multiple of the group median stay in the same size band.
 SIZE_GROUP_RATIO = 2.0
 # Min-area-rect aspect is long side / short side.
@@ -74,9 +82,19 @@ BARCODE_ROI = {"x": 0, "y": 0, "w": 640, "h": 480}
 # One open capture shared by the stream and the decode calls.
 camera = None
 _camera_index = None
+# Last raw frame a snapshot or sample view held. POST /detect uses it when
+# the request does not include an image.
+_latest_snapshot = None
+yolo_model = None
 
 class InspectRequest(BaseModel):
     barcode: str
+
+class DetectRequest(BaseModel):
+    # data-url or raw base64. sample loads a file from test-images.
+    # Omit both fields to use the latest snapshot.
+    image: Optional[str] = None
+    sample: Optional[str] = None
 
 class BarcodeRequest(BaseModel):
     camera: Optional[int] = None
@@ -637,12 +655,23 @@ def _pyzbar_load_error():
         + (_PYZBAR_ERROR or "")
     )
 
-def _jpeg_data_url(image):
+def _jpeg_base64(image):
     ok, buffer = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
     if not ok:
         return None
-    encoded = base64.b64encode(buffer.tobytes()).decode("ascii")
+    return base64.b64encode(buffer.tobytes()).decode("ascii")
+
+def _jpeg_data_url(image):
+    encoded = _jpeg_base64(image)
+    if not encoded:
+        return None
     return f"data:image/jpeg;base64,{encoded}"
+
+def _remember_snapshot(image):
+    global _latest_snapshot
+    if image is None:
+        return
+    _latest_snapshot = image.copy()
 
 def _grab_frame(index):
     cap = get_camera(index)
@@ -752,6 +781,7 @@ def camera_snapshot(index: int = 0):
             "message": "Could not encode the frame",
         }
 
+    _remember_snapshot(frame)
     return {
         **looked,
         "snapshot": True,
@@ -1136,6 +1166,7 @@ def inspect_sample(name: str = DEFAULT_SAMPLE):
             "parts": [],
         }
 
+    _remember_snapshot(image)
     blobs = _detected_blobs(image)
     groups = _group_by_size(blobs)
     parts = _size_parts(groups)
@@ -1155,6 +1186,172 @@ def inspect_sample(name: str = DEFAULT_SAMPLE):
         "parts": parts,
         "info": f"Info only: {len(blobs)} blobs counted. Classical contour count, not a BoM check.",
         "image": _annotate_blobs(image, groups),
+    }
+
+def _load_yolo():
+    global yolo_model
+    yolo_model = None
+    if not MODEL_PATH.is_file():
+        print(f"YOLO model not found at {MODEL_PATH}")
+        return
+    try:
+        from ultralytics import YOLO
+        loaded = YOLO(str(MODEL_PATH))
+        # First predict pays the device setup cost. Do it before the operator clicks.
+        loaded.predict(np.zeros((64, 64, 3), dtype=np.uint8), verbose=False)
+        yolo_model = loaded
+        names = getattr(loaded, "names", {})
+        labels = list(names.values()) if isinstance(names, dict) else list(names)
+        print(f"Loaded YOLO model {MODEL_PATH.name} with {len(labels)} classes")
+    except Exception as exc:
+        yolo_model = None
+        print(f"YOLO model failed to load: {exc}")
+
+def _image_from_encoded(value):
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.startswith("data:"):
+        comma = text.find(",")
+        if comma < 0:
+            return None
+        text = text[comma + 1 :]
+    try:
+        raw = base64.b64decode(text, validate=False)
+    except Exception:
+        return None
+    if not raw:
+        return None
+    array = np.frombuffer(raw, dtype=np.uint8)
+    return cv2.imdecode(array, cv2.IMREAD_COLOR)
+
+def _load_detect_image(req):
+    if req is not None and req.image:
+        image = _image_from_encoded(req.image)
+        if image is None:
+            return None, "Could not read the image"
+        return image, None
+    if req is not None and req.sample:
+        path = _sample_path(req.sample)
+        if path is None or not path.is_file():
+            return None, "Sample image not found"
+        image = cv2.imread(str(path))
+        if image is None:
+            return None, f"Could not read {path.name}"
+        _remember_snapshot(image)
+        return image, None
+    if _latest_snapshot is None:
+        return None, "No image and no snapshot"
+    return _latest_snapshot.copy(), None
+
+def _color_for_ic(ic):
+    palette = (
+        (0, 180, 60),
+        (0, 165, 255),
+        (255, 140, 0),
+        (60, 60, 230),
+        (200, 60, 200),
+        (0, 200, 200),
+        (180, 180, 0),
+        (0, 100, 255),
+    )
+    total = sum(ic.encode("utf-8"))
+    return palette[total % len(palette)]
+
+def _yolo_detections(image):
+    result = yolo_model.predict(image, verbose=False)[0]
+    names = result.names or {}
+    boxes = result.boxes
+    if boxes is None or len(boxes) == 0:
+        return []
+    found = []
+    for box, conf, cls_id in zip(boxes.xyxy.tolist(), boxes.conf.tolist(), boxes.cls.tolist()):
+        class_id = int(cls_id)
+        if isinstance(names, dict):
+            ic = names.get(class_id, names.get(str(class_id), class_id))
+        else:
+            ic = names[class_id]
+        x1, y1, x2, y2 = (int(round(value)) for value in box)
+        found.append({
+            "ic": str(ic),
+            "confidence": round(float(conf), 4),
+            "bbox": [x1, y1, x2, y2],
+        })
+    return found
+
+def _annotate_detections(image, detections):
+    annotated = image.copy()
+    height, width = annotated.shape[:2]
+    scale = max(height, width) / 1600.0
+    thickness = max(2, int(round(scale * 2)))
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = max(0.4, min(0.75, scale * 0.45))
+    text_thickness = max(1, thickness - 1)
+    ordered = sorted(detections, key=lambda item: item["confidence"])
+    for item in ordered:
+        x1, y1, x2, y2 = item["bbox"]
+        x1 = max(0, min(width - 1, int(x1)))
+        y1 = max(0, min(height - 1, int(y1)))
+        x2 = max(0, min(width - 1, int(x2)))
+        y2 = max(0, min(height - 1, int(y2)))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        color = _color_for_ic(item["ic"])
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, thickness)
+        label = item["ic"]
+        (text_width, text_height), baseline = cv2.getTextSize(
+            label, font, font_scale, text_thickness
+        )
+        chip_top = y1 - text_height - baseline - 6
+        if chip_top < 0:
+            chip_top = min(y1, height - text_height - baseline - 6)
+        chip_top = max(0, chip_top)
+        chip_bottom = min(height - 1, chip_top + text_height + baseline + 6)
+        chip_right = min(width - 1, x1 + text_width + 8)
+        cv2.rectangle(annotated, (x1, chip_top), (chip_right, chip_bottom), color, -1)
+        cv2.putText(
+            annotated,
+            label,
+            (x1 + 4, max(text_height, chip_bottom - baseline - 2)),
+            font,
+            font_scale,
+            (255, 255, 255),
+            text_thickness,
+            cv2.LINE_AA,
+        )
+    return annotated
+
+def _detect_response(detections, image=None, message=None):
+    payload = {
+        "detections": detections,
+        "annotated_image_base64": _jpeg_base64(image) if image is not None else None,
+    }
+    if message:
+        payload["message"] = message
+    return payload
+
+@app.post("/detect")
+def detect(req: Optional[DetectRequest] = Body(default=None)):
+    # An image in the body wins. Otherwise use a named sample, then the latest snapshot.
+    if yolo_model is None:
+        return _detect_response([], message="YOLO model is not loaded")
+
+    image, error = _load_detect_image(req)
+    if image is None:
+        return _detect_response([], message=error or "No image and no snapshot")
+
+    try:
+        detections = _yolo_detections(image)
+        annotated = _annotate_detections(image, detections)
+    except Exception as exc:
+        return _detect_response([], message=f"Detect failed: {exc}")
+
+    encoded = _jpeg_base64(annotated)
+    if not encoded:
+        return _detect_response(detections, message="Could not encode the image")
+    return {
+        "detections": detections,
+        "annotated_image_base64": encoded,
     }
 
 @app.get("/settings/bom-source")

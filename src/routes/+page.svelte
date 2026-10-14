@@ -28,6 +28,18 @@ type SnapshotView = {
 	image: string;
 	takenAt: string;
 	sample?: boolean;
+	detected?: boolean;
+};
+
+type Detection = {
+	ic: string;
+	confidence: number;
+	bbox: number[];
+};
+
+type DetectedCount = {
+	ic: string;
+	count: number;
 };
 
 const DEFAULT_SCAN_SECONDS = 8;
@@ -38,6 +50,10 @@ let loading = false;
 let cameraIndex = 0;
 let feedOn = true;
 let snapshot: SnapshotView | null = null;
+let detections: Detection[] = [];
+let detectMessage = "";
+let detectState: "idle" | "running" | "done" = "idle";
+let detectGeneration = 0;
 let streamMs = DEFAULT_SCAN_SECONDS * 1000;
 let streamLeft = DEFAULT_SCAN_SECONDS;
 let streamTimer: ReturnType<typeof setInterval> | null = null;
@@ -84,18 +100,127 @@ function toggleFeed() {
 }
 
 function resumeLiveFeed() {
+	detectGeneration += 1;
 	snapshot = null;
+	detections = [];
+	detectMessage = "";
+	detectState = "idle";
 	if (feedOn) startWatch();
 }
 
 function holdStill(image: string, kitCode: string, sample = false) {
+	detectGeneration += 1;
 	snapshot = {
 		kitCode,
 		image,
 		takenAt: new Date().toLocaleTimeString(),
 		sample,
+		detected: false,
 	};
 	stopWatch();
+	return detectGeneration;
+}
+
+function detectionCounts(items: Detection[]): Record<string, number> {
+	const counts: Record<string, number> = {};
+	for (const item of items) {
+		if (!item.ic) continue;
+		counts[item.ic] = (counts[item.ic] ?? 0) + 1;
+	}
+	return counts;
+}
+
+function extraDetections(
+	items: Detection[],
+	view: InspectView | null,
+	still: SnapshotView | null,
+): DetectedCount[] {
+	const counts = detectionCounts(items);
+	const compareBom = Boolean(still && !still.sample && view?.parts?.length);
+	const known = new Set(
+		compareBom ? (view?.parts ?? []).map((part) => part.ic) : [],
+	);
+	return Object.entries(counts)
+		.filter(([ic]) => !known.has(ic))
+		.sort((a, b) => a[0].localeCompare(b[0]))
+		.map(([ic, count]) => ({ ic, count }));
+}
+
+function matchSummary(parts: Part[], items: Detection[]): string {
+	const counts = detectionCounts(items);
+	let matched = 0;
+	for (const part of parts) {
+		if ((counts[part.ic] ?? 0) === part.qty) matched += 1;
+	}
+	const lines = parts.length === 1 ? "line" : "lines";
+	return `${matched} of ${parts.length} BoM ${lines} match`;
+}
+
+function asDetections(value: unknown): Detection[] {
+	if (!Array.isArray(value)) return [];
+	const found: Detection[] = [];
+	for (const item of value) {
+		if (!item || typeof item !== "object") continue;
+		const row = item as Detection;
+		if (typeof row.ic !== "string" || !row.ic) continue;
+		found.push({
+			ic: row.ic,
+			confidence: typeof row.confidence === "number" ? row.confidence : 0,
+			bbox: Array.isArray(row.bbox) ? row.bbox : [],
+		});
+	}
+	return found;
+}
+
+function detectedImageSrc(encoded: string): string {
+	const text = encoded.trim();
+	if (text.startsWith("data:")) return text;
+	return `data:image/jpeg;base64,${text.replace(/\s+/g, "")}`;
+}
+
+async function runDetect(
+	generation: number,
+	body: { image?: string; sample?: string },
+) {
+	if (generation !== detectGeneration) return;
+	detectState = "running";
+	detections = [];
+	detectMessage = "";
+	try {
+		const res = await fetch("http://127.0.0.1:8008/detect", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(body),
+		});
+		const payload = (await res.json()) as {
+			detections?: unknown;
+			annotated_image_base64?: unknown;
+			message?: unknown;
+		};
+		if (generation !== detectGeneration || !pageAlive) return;
+		if (!res.ok) {
+			throw new Error(
+				typeof payload.message === "string" && payload.message
+					? payload.message
+					: "Detect failed",
+			);
+		}
+		detections = asDetections(payload.detections);
+		detectMessage = typeof payload.message === "string" ? payload.message : "";
+		const encoded = payload.annotated_image_base64;
+		if (typeof encoded === "string" && encoded && snapshot) {
+			snapshot = {
+				...snapshot,
+				image: detectedImageSrc(encoded),
+				detected: true,
+			};
+		}
+		detectState = "done";
+	} catch (err: unknown) {
+		if (generation !== detectGeneration || !pageAlive) return;
+		detectMessage = errorMessage(err, "Detect failed");
+		detectState = "done";
+	}
 }
 
 function inspectView(body: WatchBody): InspectView {
@@ -111,12 +236,13 @@ function inspectView(body: WatchBody): InspectView {
 	};
 }
 
-function showSnapshot(body: WatchBody) {
+async function showSnapshot(body: WatchBody) {
 	if (!body.image) return;
 	const kitCode = body.kitCode || body.barcode || barcode;
 	barcode = kitCode;
 	result = inspectView(body);
-	holdStill(body.image, kitCode);
+	const generation = holdStill(body.image, kitCode);
+	await runDetect(generation, { image: body.image });
 }
 
 async function watchFeed() {
@@ -140,7 +266,7 @@ async function watchFeed() {
 		) {
 			return;
 		}
-		showSnapshot(body);
+		await showSnapshot(body);
 	} catch {
 		// A missed poll leaves the last still and the last BoM result.
 	} finally {
@@ -316,7 +442,14 @@ async function testSampleImage() {
 		const body = (await res.json()) as InspectView;
 		result = body;
 		if (body.image) {
-			holdStill(body.image, body.kitCode || "Example3", true);
+			const generation = holdStill(
+				body.image,
+				body.kitCode || "Example3",
+				true,
+			);
+			await runDetect(generation, {
+				sample: `${body.kitCode || "Example3"}.jpg`,
+			});
 		}
 	} catch (err: unknown) {
 		result = {
@@ -337,7 +470,7 @@ async function decodeAndInspect() {
 		const body = (await res.json()) as WatchBody;
 		if (!res.ok) throw new Error(body.message || "Decode failed");
 		if (body.snapshot && body.image) {
-			showSnapshot(body);
+			await showSnapshot(body);
 			return;
 		}
 		if (body.barcode) {
@@ -487,17 +620,30 @@ async function decodeAndInspect() {
 				{#if snapshot}
 					<img
 						src={snapshot.image}
-						alt={snapshot.sample
-							? `Annotated sample ${snapshot.kitCode}`
-							: `Snapshot of kit ${snapshot.kitCode}`}
+						alt={snapshot.detected
+							? `Detected parts for ${snapshot.kitCode}`
+							: snapshot.sample
+								? `Annotated sample ${snapshot.kitCode}`
+								: `Snapshot of kit ${snapshot.kitCode}`}
 						class="absolute inset-0 h-full w-full object-contain"
 					/>
 					<div class="absolute left-3 top-3 bg-neutral-950/80 px-3 py-2">
 						<p class="font-mono text-3xl font-semibold leading-none text-white">{snapshot.kitCode}</p>
 						<p class="mt-1 text-sm text-neutral-300">
-							{snapshot.sample ? "Annotated sample" : `Taken ${snapshot.takenAt}`}
+							{snapshot.detected
+								? snapshot.sample
+									? "Detected parts"
+									: `Taken ${snapshot.takenAt}`
+								: snapshot.sample
+									? "Annotated sample"
+									: `Taken ${snapshot.takenAt}`}
 						</p>
 					</div>
+					{#if detectState === "running"}
+						<p class="absolute bottom-3 left-3 bg-neutral-950/80 px-3 py-2 text-sm font-semibold text-amber-200">
+							Detecting parts...
+						</p>
+					{/if}
 					<button
 						type="button"
 						class="absolute bottom-3 right-3 inline-flex min-h-11 items-center border border-yellow-300 bg-yellow-400 px-4 text-sm font-semibold text-neutral-950"
@@ -543,12 +689,19 @@ async function decodeAndInspect() {
 						<p class="text-base text-neutral-200">{result.message}</p>
 					{/if}
 					{#if result.parts?.length}
+						{@const detectFailed =
+							detectState === "done" && !!detectMessage && detections.length === 0}
+						{@const showSeen = detectState !== "idle" && !snapshot?.sample && !detectFailed}
+						{@const counts = detectionCounts(detections)}
 						<table class="w-full border-collapse text-left text-sm">
 							<thead>
 								<tr class="border-b border-neutral-600 text-[11px] uppercase tracking-widest text-neutral-400">
 									<th class="py-2 pr-3 font-semibold">IC</th>
 									<th class="py-2 pr-3 font-semibold">Description</th>
 									<th class="py-2 text-right font-semibold">Qty</th>
+									{#if showSeen}
+										<th class="py-2 text-right font-semibold">Seen</th>
+									{/if}
 								</tr>
 							</thead>
 							<tbody>
@@ -557,10 +710,56 @@ async function decodeAndInspect() {
 										<td class="py-2 pr-3 font-mono font-medium">{part.ic}</td>
 										<td class="py-2 pr-3 text-neutral-200">{part.des}</td>
 										<td class="py-2 text-right font-semibold">{part.qty}</td>
+										{#if showSeen}
+											<td
+												class="py-2 text-right font-semibold {detectState === 'running'
+													? 'text-neutral-500'
+													: (counts[part.ic] ?? 0) === part.qty
+														? 'text-green-400'
+														: 'text-red-400'}"
+											>
+												{detectState === "running" ? "…" : (counts[part.ic] ?? 0)}
+											</td>
+										{/if}
 									</tr>
 								{/each}
 							</tbody>
 						</table>
+						{#if showSeen && detectState === "done"}
+							<p class="text-sm text-neutral-300">{matchSummary(result.parts, detections)}</p>
+						{/if}
+					{/if}
+					{#if detectState === "running"}
+						<p class="text-sm text-neutral-400">Detecting parts...</p>
+					{/if}
+					{#if detectState === "done"}
+						{@const extras = extraDetections(detections, result, snapshot)}
+						{#if extras.length}
+							<h3 class="text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+								{snapshot?.sample ? "Detected" : "Not in BoM"}
+							</h3>
+							<table class="w-full border-collapse text-left text-sm">
+								<thead>
+									<tr class="border-b border-neutral-600 text-[11px] uppercase tracking-widest text-neutral-400">
+										<th class="py-2 pr-3 font-semibold">IC</th>
+										<th class="py-2 text-right font-semibold">Count</th>
+									</tr>
+								</thead>
+								<tbody>
+									{#each extras as row (row.ic)}
+										<tr class="border-b border-neutral-800">
+											<td class="py-2 pr-3 font-mono font-medium">{row.ic}</td>
+											<td class="py-2 text-right font-semibold">{row.count}</td>
+										</tr>
+									{/each}
+								</tbody>
+							</table>
+						{:else if snapshot?.sample && !detectMessage}
+							<p class="text-sm text-neutral-300">No parts detected</p>
+						{/if}
+					{/if}
+					{#if detectMessage}
+						<p class="text-sm text-red-300">{detectMessage}</p>
 					{/if}
 					{#if result.info}
 						<p class="text-sm text-neutral-400">{result.info}</p>
