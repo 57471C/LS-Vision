@@ -42,7 +42,7 @@ cd vision
 
 (First-time setup: `python -m venv .venv` then `pip install -r requirements.txt`.)
 
-Place your best.pt in vision/models/.
+Model files (`*.pt` / `*.onnx`) are not stored in git. Take them from the matching Forgejo release and place them in `vision/models/`.
 
 See [vision/README.md](vision/README.md) for full sidecar details.
 
