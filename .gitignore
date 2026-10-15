@@ -18,3 +18,5 @@ vision/config.local.json
 # Trained weights stay on the machine. Place best.pt in vision/models/.
 vision/models/*.pt
 vision/models/*.onnx
+# Sidecar startup and camera errors, including launches from the packaged exe.
+vision/sidecar.log

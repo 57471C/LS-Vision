@@ -129,9 +129,16 @@ let imagePick: ((file: File | null) => void) | null = null;
 let streamMs = DEFAULT_SCAN_SECONDS * 1000;
 let streamLeft = DEFAULT_SCAN_SECONDS;
 let streamTimer: ReturnType<typeof setInterval> | null = null;
+let streamEpoch = 0;
+let streamRetries = 0;
+let streamRetry: ReturnType<typeof setTimeout> | null = null;
+let ignoreStreamErrorUntil = 0;
 let watchInFlight = false;
 let pageAlive = true;
 let sidecarUp = false;
+let sidecarStarting = false;
+let sidecarSeconds = 0;
+let sidecarTick: ReturnType<typeof setInterval> | null = null;
 let healthTimer: ReturnType<typeof setInterval> | null = null;
 let erpName = "";
 let erpUrl = "";
@@ -165,10 +172,46 @@ function startWatch() {
 	}, 1000);
 }
 
+function clearStreamRetry() {
+	if (streamRetry !== null) {
+		clearTimeout(streamRetry);
+		streamRetry = null;
+	}
+}
+
+function showLiveFeed() {
+	clearStreamRetry();
+	streamRetries = 0;
+	// Changing the img src aborts the previous request and fires its error.
+	ignoreStreamErrorUntil = Date.now() + 1000;
+	streamEpoch += 1;
+	startWatch();
+}
+
+function retryStream() {
+	// A request that started before the sidecar was listening stays broken.
+	// Stop/Start feed fixes that by loading a new stream URL. Do the same once
+	// the sidecar is up, and again if that attempt fails.
+	if (Date.now() < ignoreStreamErrorUntil) return;
+	if (!pageAlive || !feedOn || snapshot || !sidecarUp || streamRetry !== null)
+		return;
+	if (streamRetries >= 3) return;
+	streamRetry = setTimeout(() => {
+		streamRetry = null;
+		if (!pageAlive || !feedOn || snapshot || !sidecarUp) return;
+		streamRetries += 1;
+		ignoreStreamErrorUntil = Date.now() + 1000;
+		streamEpoch += 1;
+	}, 2000);
+}
+
 function toggleFeed() {
 	feedOn = !feedOn;
-	if (feedOn) startWatch();
-	else stopWatch();
+	if (feedOn) showLiveFeed();
+	else {
+		clearStreamRetry();
+		stopWatch();
+	}
 }
 
 function resumeLiveFeed() {
@@ -505,12 +548,14 @@ async function checkSidecar() {
 	} catch {
 		sidecarUp = false;
 	}
+	if (sidecarUp) stopSidecarWait();
 	if (pageAlive && sidecarUp && !wasUp) {
 		void loadErp();
 		void loadScan();
 		void loadTestMode();
 		void loadDetectRoi();
 		void loadBomSource();
+		if (feedOn && !snapshot) showLiveFeed();
 	}
 }
 
@@ -932,6 +977,8 @@ onDestroy(() => {
 	frameObserver?.disconnect();
 	frameObserver = null;
 	stopWatch();
+	clearStreamRetry();
+	stopSidecarWait();
 	if (healthTimer !== null) {
 		clearInterval(healthTimer);
 		healthTimer = null;
@@ -942,12 +989,33 @@ function errorMessage(err: unknown, fallback: string): string {
 	return err instanceof Error && err.message ? err.message : fallback;
 }
 
+function stopSidecarWait() {
+	sidecarStarting = false;
+	if (sidecarTick !== null) {
+		clearInterval(sidecarTick);
+		sidecarTick = null;
+	}
+}
+
+function beginSidecarWait() {
+	sidecarStarting = true;
+	sidecarSeconds = 0;
+	if (sidecarTick !== null) clearInterval(sidecarTick);
+	sidecarTick = setInterval(() => {
+		sidecarSeconds += 1;
+	}, 1000);
+}
+
 async function startSidecar() {
+	if (sidecarStarting) return;
+	if (!sidecarUp) beginSidecarWait();
 	try {
 		const res = await invoke("start_vision_sidecar");
 		console.log(res);
 	} catch (err) {
 		console.error(err);
+		stopSidecarWait();
+		return;
 	}
 	void checkSidecar();
 	setTimeout(() => {
@@ -984,7 +1052,10 @@ function apiQty(value: unknown): number {
 	return 0;
 }
 
-function viewFromKit(kitCode: string, row: Record<string, unknown>): InspectView {
+function viewFromKit(
+	kitCode: string,
+	row: Record<string, unknown>,
+): InspectView {
 	const rawParts = apiField(row, ["parts"]);
 	if (!Array.isArray(rawParts)) {
 		return { status: "fail", message: "BoM API response has no parts." };
@@ -1228,12 +1299,34 @@ async function decodeAndInspect() {
 			</a>
 			<button
 				type="button"
-				class="inline-flex min-h-11 items-center border px-3 text-sm font-semibold text-white {sidecarUp
-					? 'border-green-700 bg-green-600'
-					: 'border-red-800 bg-red-600'}"
+				class="inline-flex min-h-11 min-w-44 items-center justify-center gap-2 border px-3 text-sm font-semibold {sidecarStarting
+					? 'cursor-wait border-amber-300 bg-amber-400 text-neutral-950'
+					: sidecarUp
+						? 'border-green-700 bg-green-600 text-white'
+						: 'border-red-800 bg-red-600 text-white'}"
+				disabled={sidecarStarting}
+				aria-busy={sidecarStarting}
+				aria-label={sidecarStarting ? "Starting vision sidecar" : "Start Vision Sidecar"}
 				on:click={startSidecar}
 			>
-				Start Vision Sidecar
+				{#if sidecarStarting}
+					<span class="inline-flex items-end gap-1" aria-hidden="true">
+						<span
+							class="inline-block h-1.5 w-1.5 rounded-full bg-neutral-950 animate-bounce motion-reduce:animate-none"
+						></span>
+						<span
+							class="inline-block h-1.5 w-1.5 rounded-full bg-neutral-950 animate-bounce motion-reduce:animate-none"
+							style="animation-delay: 150ms"
+						></span>
+						<span
+							class="inline-block h-1.5 w-1.5 rounded-full bg-neutral-950 animate-bounce motion-reduce:animate-none"
+							style="animation-delay: 300ms"
+						></span>
+					</span>
+					<span class="font-mono tabular-nums">{sidecarSeconds}s</span>
+				{:else}
+					Start Vision Sidecar
+				{/if}
 			</button>
 		</div>
 	</header>
@@ -1317,6 +1410,26 @@ async function decodeAndInspect() {
 				{/if}
 			</div>
 			<div bind:this={paneFrame} class="relative min-h-0 flex-1 overflow-hidden">
+				{#if sidecarStarting && !snapshot}
+					<div
+						class="pointer-events-none absolute inset-0 z-20 flex flex-col items-center justify-center gap-3 text-neutral-100"
+					>
+						<span class="inline-flex items-end gap-1.5" aria-hidden="true">
+							<span
+								class="inline-block h-2 w-2 rounded-full bg-white animate-bounce motion-reduce:animate-none"
+							></span>
+							<span
+								class="inline-block h-2 w-2 rounded-full bg-white animate-bounce motion-reduce:animate-none"
+								style="animation-delay: 150ms"
+							></span>
+							<span
+								class="inline-block h-2 w-2 rounded-full bg-white animate-bounce motion-reduce:animate-none"
+								style="animation-delay: 300ms"
+							></span>
+						</span>
+						<p class="font-mono text-sm tabular-nums">Starting sidecar · {sidecarSeconds}s</p>
+					</div>
+				{/if}
 				{#if snapshot || feedOn}
 					{@const zoom = zoomFrame()}
 					<div
@@ -1338,10 +1451,11 @@ async function decodeAndInspect() {
 						{:else}
 							<img
 								bind:this={paneImage}
-								src="http://127.0.0.1:8008/camera/stream?index={cameraIndex}"
+								src="http://127.0.0.1:8008/camera/stream?index={cameraIndex}&feed={streamEpoch}"
 								alt="Camera feed"
 								class="h-full w-full {zoom ? 'object-fill' : 'object-contain'}"
 								on:load={rememberPaneSize}
+								on:error={retryStream}
 							/>
 						{/if}
 						{#if paneWidth > 0 && paneHeight > 0 && !drawing && detectRoi}
