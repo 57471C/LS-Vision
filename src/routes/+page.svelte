@@ -60,7 +60,7 @@ const DEFAULT_SCAN_SECONDS = 8;
 // Settings unlock is the admin flag for this tab. It is not stored in config.
 const ADMIN_FLAG = "ls-vision-settings-open";
 
-let barcode = "JOB-12345";
+let barcode = "";
 let result: InspectView | null = null;
 let bom: BomView | null = null;
 let loading = false;
