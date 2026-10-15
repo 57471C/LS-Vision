@@ -47,6 +47,12 @@ let roiW: number | null = null;
 let roiH: number | null = null;
 let roiNotice = "";
 let savingRoi = false;
+let modelFiles: string[] = [];
+let modelName = "";
+let modelActive = "best.pt";
+let modelLoaded = false;
+let modelNotice = "";
+let savingModel = false;
 
 function storedUnlocked(): boolean {
 	if (typeof sessionStorage === "undefined") return false;
@@ -65,6 +71,7 @@ function storedSection(): SettingsSection {
 function selectSection(next: SettingsSection) {
 	section = next;
 	sessionStorage.setItem(SECTION_KEY, next);
+	if (next === "training") void loadModel();
 }
 
 function focusOnMount(node: HTMLInputElement) {
@@ -164,11 +171,70 @@ async function loadSource() {
 		await loadScan();
 		await loadTestMode();
 		await loadRoi();
+		await loadModel();
 	} catch (err: unknown) {
 		notice = errorMessage(
 			err,
 			"Could not load the BoM source. Is the vision sidecar running?",
 		);
+	}
+}
+
+function readModelFiles(value: unknown): string[] {
+	if (!Array.isArray(value)) return [];
+	return value.filter(
+		(item): item is string => typeof item === "string" && item.length > 0,
+	);
+}
+
+function applyModel(data: {
+	model?: unknown;
+	active?: unknown;
+	files?: unknown;
+	loaded?: unknown;
+}) {
+	modelFiles = readModelFiles(data.files);
+	const active = typeof data.active === "string" ? data.active.trim() : "";
+	modelActive = active || "best.pt";
+	modelLoaded = data.loaded === true;
+	const selected = typeof data.model === "string" ? data.model : "";
+	if (modelFiles.includes(selected)) modelName = selected;
+	else if (modelFiles.includes(modelActive)) modelName = modelActive;
+	else modelName = modelFiles[0] ?? "";
+}
+
+async function loadModel() {
+	try {
+		const res = await fetch("http://127.0.0.1:8008/settings/model");
+		if (!res.ok) throw new Error(await res.text());
+		const data = await res.json();
+		applyModel(data);
+		modelNotice = typeof data.message === "string" ? data.message : "";
+	} catch (err: unknown) {
+		modelNotice = errorMessage(err, "Could not load the model list");
+	}
+}
+
+async function saveModel() {
+	savingModel = true;
+	modelNotice = "";
+	try {
+		const res = await fetch("http://127.0.0.1:8008/settings/model", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ filename: modelName }),
+		});
+		const data = await res.json().catch(() => ({}));
+		if (!res.ok || data.status === "fail") {
+			throw new Error(data.message || "Save failed");
+		}
+		applyModel(data);
+		modelNotice =
+			typeof data.message === "string" && data.message ? data.message : "Saved";
+	} catch (err: unknown) {
+		modelNotice = errorMessage(err, "Could not save the model");
+	} finally {
+		savingModel = false;
 	}
 }
 
@@ -739,12 +805,57 @@ onMount(() => {
 							{/if}
 						</form>
 					{:else if section === "training"}
-						<section class="flex flex-col gap-2 border border-neutral-700 bg-neutral-900 p-4">
-							<h2 id="settings-section-heading" class="text-lg font-semibold tracking-tight">
-								Training
-							</h2>
-							<p class="text-sm text-neutral-400">Coming soon.</p>
-						</section>
+						<h2 id="settings-section-heading" class="text-lg font-semibold tracking-tight">
+							Training
+						</h2>
+						<form
+							class="flex flex-col gap-4 border border-neutral-700 bg-neutral-900 p-4"
+							on:submit|preventDefault={saveModel}
+						>
+							<fieldset class="flex flex-col gap-3">
+								<legend class="text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+									Model
+								</legend>
+								<p class="text-sm text-neutral-200">
+									Current model
+									<span class="font-mono text-neutral-100">{modelActive}</span>
+									{#if modelLoaded}
+										<span class="text-neutral-400">loaded</span>
+									{:else}
+										<span class="text-amber-200">not loaded</span>
+									{/if}
+								</p>
+								<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+									File
+									<select
+										class="border border-neutral-600 bg-neutral-950 px-3 py-2 font-mono text-base font-medium normal-case tracking-normal text-neutral-100 disabled:text-neutral-500"
+										bind:value={modelName}
+										disabled={savingModel || modelFiles.length === 0}
+									>
+										{#each modelFiles as file (file)}
+											<option value={file}>{file}</option>
+										{/each}
+									</select>
+								</label>
+								<p class="text-sm text-neutral-400">
+									{#if modelFiles.length === 0}
+										No .pt or .onnx files in vision/models. Detection uses best.pt when that file is present.
+									{:else}
+										Choose a .pt or .onnx file in vision/models. A missing file, or no selection, uses best.pt.
+									{/if}
+								</p>
+							</fieldset>
+							<button
+								type="submit"
+								class="inline-flex min-h-11 w-fit items-center border border-blue-500 bg-blue-600 px-4 text-sm font-semibold text-white disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
+								disabled={savingModel || modelFiles.length === 0 || !modelName}
+							>
+								{savingModel ? "Saving..." : "Save"}
+							</button>
+							{#if modelNotice}
+								<p class="text-sm text-neutral-200">{modelNotice}</p>
+							{/if}
+						</form>
 					{:else}
 						<h2 id="settings-section-heading" class="text-lg font-semibold tracking-tight">
 							Database

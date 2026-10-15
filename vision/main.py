@@ -51,6 +51,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ValidationError, field_validator, model_validator
 import uvicorn
+import json
+import re
+import threading
+import urllib.error
+import urllib.request
+from decimal import Decimal
+from pathlib import Path
+from urllib.parse import urlparse
 
 def _prefer_bundled_dlls():
     # cv2 prepends its own bin directory while it imports. Put the bundled
@@ -133,7 +141,7 @@ _log_runtime()
 @asynccontextmanager
 async def _lifespan(_app):
     # Barcode and BoM stay up even when the weights fail to load.
-    _load_yolo()
+    _ensure_yolo()
     try:
         yield
     finally:
@@ -153,7 +161,7 @@ BOM_PATH = Path(__file__).parent / "sample-bom.json"
 # Local BoM source choice. A missing file means the JSON sample BoM.
 # The settings-page unlock password is not stored here.
 # A SQL Server Authentication password is stored with the other connection fields.
-# config.local.json stores the BoM source, the operator ERP button, and the detect ROI.
+# config.local.json stores the BoM source, the operator ERP button, the detect ROI, and the model file name.
 # An API key is stored with the other API fields. POST /bom/api posts the job card number.
 # bom-source.json is read only when config.local.json is absent.
 BOM_SOURCE_PATH = Path(__file__).parent / "bom-source.json"
@@ -164,7 +172,9 @@ DEFAULT_SQL_DRIVER = "ODBC Driver 18 for SQL Server"
 DEFAULT_SCAN_SECONDS = 8
 MIN_SCAN_SECONDS = 1
 MAX_SCAN_SECONDS = 60
-MODEL_PATH = Path(__file__).parent / "models" / "best.pt"
+MODEL_DIR = Path(__file__).parent / "models"
+DEFAULT_MODEL_NAME = "best.pt"
+_MODEL_SUFFIXES = {".pt", ".onnx"}
 
 # Fixed square on the bench. Change at runtime with POST /barcode/roi.
 CAMERA_INDEX = 0
@@ -191,6 +201,12 @@ _FRAME_WAIT_SECONDS = 5.0
 # the request does not include an image.
 _latest_snapshot = None
 yolo_model = None
+_yolo_lock = threading.RLock()
+# (path, mtime_ns) of the weights object in yolo_model. None when nothing is loaded.
+_yolo_loaded_key = None
+# (stored name, resolved name, mtime_ns) of the last load attempt, including failures.
+_yolo_attempt_key = None
+_yolo_message = ""
 
 class InspectRequest(BaseModel):
     barcode: str
@@ -298,6 +314,19 @@ class DetectRoiBox(BaseModel):
 class DetectRoiUpdate(BaseModel):
     roi: Optional[DetectRoiBox] = None
 
+class ModelUpdate(BaseModel):
+    # File name only, for example best.pt. An empty string selects the default.
+    filename: str = ""
+
+    @field_validator("filename", mode="before")
+    @classmethod
+    def reject_non_str(cls, value):
+        if value is None:
+            return ""
+        if not isinstance(value, str):
+            raise ValueError("Model must be a file name")
+        return value
+
 def _blank_erp():
     return {"name": "", "url": ""}
 
@@ -320,6 +349,8 @@ def _blank_bom_source():
         "scanSeconds": DEFAULT_SCAN_SECONDS,
         "testMode": False,
         "detectRoi": None,
+        # Empty means best.pt. A saved name is a file in vision/models.
+        "model": "",
     }
 
 def _read_json_dict(path):
@@ -442,6 +473,26 @@ def _apply_saved_detect_roi(config, saved):
         config["detectRoi"] = _clean_detect_roi(saved.get("detectRoi"))
     return config
 
+def _clean_model_name(raw):
+    # A config value is a file name, never a path. Reject separators and other suffixes.
+    if not isinstance(raw, str):
+        return ""
+    name = raw.strip()
+    if not name or len(name) > 180:
+        return ""
+    if name != Path(name).name:
+        return ""
+    if "/" in name or "\\" in name or ".." in name or "\x00" in name:
+        return ""
+    if Path(name).suffix.lower() not in _MODEL_SUFFIXES:
+        return ""
+    return name
+
+def _apply_saved_model(config, saved):
+    if "model" in saved:
+        config["model"] = _clean_model_name(saved.get("model"))
+    return config
+
 def _clean_erp(name, url):
     name = " ".join((name or "").split())
     url = (url or "").strip()
@@ -527,7 +578,8 @@ def load_bom_source():
         _apply_saved_erp(config, saved)
         _apply_saved_scan(config, saved)
         _apply_saved_test_mode(config, saved)
-        return _apply_saved_detect_roi(config, saved)
+        _apply_saved_detect_roi(config, saved)
+        return _apply_saved_model(config, saved)
     if BOM_SOURCE_PATH.exists():
         saved = _read_json_dict(BOM_SOURCE_PATH)
         if saved is None:
@@ -537,7 +589,8 @@ def load_bom_source():
         _apply_saved_erp(config, saved)
         _apply_saved_scan(config, saved)
         _apply_saved_test_mode(config, saved)
-        return _apply_saved_detect_roi(config, saved)
+        _apply_saved_detect_roi(config, saved)
+        return _apply_saved_model(config, saved)
     return config
 
 def save_bom_source(config):
@@ -564,6 +617,7 @@ def save_bom_source(config):
         "scanSeconds": _clean_scan_seconds(config.get("scanSeconds")) or DEFAULT_SCAN_SECONDS,
         "testMode": config.get("testMode") is True,
         "detectRoi": _clean_detect_roi(config.get("detectRoi")),
+        "model": _clean_model_name(config.get("model")),
     }
     CONFIG_LOCAL_PATH.write_text(
         json.dumps(stored, indent=2) + "\n",
@@ -1617,24 +1671,163 @@ def read_barcode(req: Optional[BarcodeRequest] = Body(default=None)):
         "codes": codes,
     }
 
-def _load_yolo():
-    global yolo_model
-    yolo_model = None
-    if not MODEL_PATH.is_file():
-        print(f"YOLO model not found at {MODEL_PATH}")
-        return
+def _list_model_files():
+    if not MODEL_DIR.is_dir():
+        return []
+    root = MODEL_DIR.resolve()
+    names = []
+    for path in MODEL_DIR.iterdir():
+        if not path.is_file() or not _clean_model_name(path.name):
+            continue
+        try:
+            path.resolve().relative_to(root)
+        except (OSError, ValueError):
+            continue
+        names.append(path.name)
+    names.sort(key=str.lower)
+    return names
+
+def _match_model_file(name, files):
+    cleaned = _clean_model_name(name)
+    if not cleaned:
+        return ""
+    for item in files:
+        if item.lower() == cleaned.lower():
+            return item
+    return ""
+
+def _model_file(name):
+    cleaned = _clean_model_name(name)
+    if not cleaned:
+        return None
+    root = MODEL_DIR.resolve()
     try:
-        from ultralytics import YOLO
-        loaded = YOLO(str(MODEL_PATH))
-        # First predict pays the device setup cost. Do it before the operator clicks.
-        loaded.predict(np.zeros((64, 64, 3), dtype=np.uint8), verbose=False)
-        yolo_model = loaded
-        names = getattr(loaded, "names", {})
-        labels = list(names.values()) if isinstance(names, dict) else list(names)
-        print(f"Loaded YOLO model {MODEL_PATH.name} with {len(labels)} part classes")
+        resolved = (root / cleaned).resolve()
+        resolved.relative_to(root)
+    except (OSError, ValueError):
+        return None
+    if resolved.is_file():
+        return resolved
+    if not root.is_dir():
+        return None
+    for path in root.iterdir():
+        if not path.is_file() or path.name.lower() != cleaned.lower():
+            continue
+        try:
+            found = path.resolve()
+            found.relative_to(root)
+        except (OSError, ValueError):
+            return None
+        return found
+    return None
+
+def _model_choice():
+    # Returns (stored name, file to load, note). A missing or empty choice uses best.pt.
+    files = _list_model_files()
+    stored = _clean_model_name(load_bom_source().get("model"))
+    match = _match_model_file(stored, files)
+    default_name = _match_model_file(DEFAULT_MODEL_NAME, files)
+    if match:
+        return stored, match, ""
+    if default_name:
+        if stored:
+            return stored, default_name, f"{stored} was not found. Using {default_name}."
+        return "", default_name, ""
+    if stored:
+        return stored, DEFAULT_MODEL_NAME, f"{stored} was not found. {DEFAULT_MODEL_NAME} was not found."
+    return "", DEFAULT_MODEL_NAME, f"YOLO model {DEFAULT_MODEL_NAME} was not found."
+
+def _short_error(exc):
+    text = " ".join(str(exc).split())
+    if len(text) > 240:
+        return text[:237] + "..."
+    return text or "unknown error"
+
+def _load_weights(path):
+    from ultralytics import YOLO
+    loaded = YOLO(str(path))
+    # First predict pays the device setup cost. Do it before the operator clicks.
+    loaded.predict(np.zeros((64, 64, 3), dtype=np.uint8), verbose=False)
+    return loaded
+
+def _finish_load(path, note):
+    loaded = _load_weights(path)
+    try:
+        mtime = path.stat().st_mtime_ns
+    except OSError:
+        mtime = None
+    names = getattr(loaded, "names", {})
+    labels = list(names.values()) if isinstance(names, dict) else list(names)
+    print(f"Loaded YOLO model {path.name} with {len(labels)} part classes")
+    return loaded, path, mtime, note
+
+def _load_choice(path, note):
+    # path is an existing weights file, or None when the choice is missing.
+    if path is None:
+        return None, None, None, note or f"YOLO model {DEFAULT_MODEL_NAME} was not found."
+    try:
+        return _finish_load(path, note)
     except Exception as exc:
-        yolo_model = None
-        print(f"YOLO model failed to load: {exc}")
+        print(f"YOLO model {path.name} failed to load: {_short_error(exc)}")
+        default_path = _model_file(DEFAULT_MODEL_NAME)
+        if default_path is not None and default_path.resolve() != path.resolve():
+            fallback = f"{path.name} failed to load. Using {default_path.name}."
+            try:
+                return _finish_load(default_path, fallback)
+            except Exception as fallback_exc:
+                print(f"YOLO model {default_path.name} failed to load: {_short_error(fallback_exc)}")
+                message = f"{path.name} failed to load. {default_path.name} failed to load: {_short_error(fallback_exc)}"
+                return None, None, None, message
+        return None, None, None, f"{path.name} failed to load: {_short_error(exc)}"
+
+def _ensure_yolo():
+    # Reload when the saved file name or the file's mtime changes. A failed file is not retried
+    # until one of those changes, so the next detection stays fast.
+    global yolo_model, _yolo_loaded_key, _yolo_attempt_key, _yolo_message
+    stored, choice, note = _model_choice()
+    path = _model_file(choice)
+    mtime = None
+    if path is not None:
+        try:
+            mtime = path.stat().st_mtime_ns
+        except OSError:
+            path = None
+    attempt = (stored, choice, mtime)
+    with _yolo_lock:
+        if _yolo_attempt_key == attempt:
+            return yolo_model, _yolo_message
+        if path is not None and yolo_model is not None and _yolo_loaded_key == (str(path), mtime):
+            _yolo_attempt_key = attempt
+            _yolo_message = note
+            return yolo_model, _yolo_message
+        loaded, used_path, used_mtime, message = _load_choice(path, note)
+        yolo_model = loaded
+        if loaded is not None and used_path is not None:
+            _yolo_loaded_key = (str(used_path), used_mtime)
+        else:
+            _yolo_loaded_key = None
+        _yolo_attempt_key = attempt
+        _yolo_message = message
+        if message:
+            print(message)
+        return yolo_model, _yolo_message
+
+def _model_payload():
+    model, load_message = _ensure_yolo()
+    files = _list_model_files()
+    stored, choice, note = _model_choice()
+    selected = _match_model_file(stored, files) or _match_model_file(choice, files)
+    active = choice
+    with _yolo_lock:
+        if model is not None and _yolo_loaded_key:
+            active = Path(_yolo_loaded_key[0]).name
+    return {
+        "model": selected or active,
+        "active": active,
+        "files": files,
+        "loaded": model is not None,
+        "message": load_message or note or "",
+    }
 
 def _image_from_encoded(value):
     if not isinstance(value, str) or not value.strip():
@@ -1693,9 +1886,9 @@ def _detect_view(image):
         return image, 0, 0
     return _roi_slice(image, roi)
 
-def _yolo_detections(image):
+def _yolo_detections(image, model):
     view, origin_x, origin_y = _detect_view(image)
-    result = yolo_model.predict(view, verbose=False)[0]
+    result = model.predict(view, verbose=False)[0]
     names = result.names or {}
     boxes = result.boxes
     if boxes is None or len(boxes) == 0:
@@ -1724,15 +1917,17 @@ def _detect_response(detections, image_base64=None, message=None):
 def detect(req: Optional[DetectRequest] = Body(default=None)):
     # Returns part ICs from the model. The kit code stays with the barcode lookup.
     # An image in the body wins. Otherwise use the latest snapshot.
-    if yolo_model is None:
-        return _detect_response([], message="YOLO model is not loaded")
+    # A config change is picked up here when Settings has not already reloaded the file.
+    model, model_message = _ensure_yolo()
+    if model is None:
+        return _detect_response([], message=model_message or "YOLO model is not loaded")
 
     image, error = _load_detect_image(req)
     if image is None:
         return _detect_response([], message=error or "No image and no snapshot")
 
     try:
-        detections = _yolo_detections(image)
+        detections = _yolo_detections(image, model)
     except Exception as exc:
         return _detect_response([], message=f"Detect failed: {exc}")
 
@@ -1786,6 +1981,7 @@ def update_bom_source(body: BomSourceUpdate):
     config["scanSeconds"] = existing.get("scanSeconds", DEFAULT_SCAN_SECONDS)
     config["testMode"] = existing.get("testMode") is True
     config["detectRoi"] = _clean_detect_roi(existing.get("detectRoi"))
+    config["model"] = _clean_model_name(existing.get("model"))
     saved = save_bom_source(config)
     if body.source == "mssql":
         message = "Saved. Inspect queries MSSQL using vision/bom_queries.sql."
@@ -1880,6 +2076,35 @@ def update_detect_roi(body: DetectRoiUpdate):
     else:
         message = "Saved. Detection uses the full image."
     return {"status": "pass", "message": message, "roi": saved["detectRoi"]}
+
+@app.get("/settings/model")
+def get_model():
+    return _model_payload()
+
+@app.post("/settings/model")
+def update_model(body: ModelUpdate):
+    files = _list_model_files()
+    raw = body.filename.strip()
+    cleaned = _clean_model_name(body.filename)
+    if raw and not cleaned:
+        return {"status": "fail", "message": "Choose a .pt or .onnx file in vision/models."}
+    match = _match_model_file(cleaned, files) if cleaned else ""
+    if cleaned and not match:
+        return {"status": "fail", "message": f"{cleaned} was not found in vision/models."}
+    config = load_bom_source()
+    config["model"] = match
+    save_bom_source(config)
+    payload = _model_payload()
+    if payload["loaded"]:
+        if payload["message"]:
+            text = f"Saved. {payload['message']}"
+        else:
+            text = f"Saved. Detection uses {payload['active']}."
+    else:
+        text = f"Saved. {payload['message'] or 'The model is not loaded.'}"
+    payload["message"] = text
+    payload["status"] = "pass"
+    return payload
 
 def lookup_bom(barcode):
     source = load_bom_source()

@@ -19,5 +19,6 @@
 	},
 	"scanSeconds": 8,
 	"testMode": false,
-	"detectRoi": null
+	"detectRoi": null,
+	"model": "best.pt"
 }

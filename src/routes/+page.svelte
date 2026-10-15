@@ -148,6 +148,7 @@ let erpChecking = false;
 let erpAttempt = 0;
 let erpLoadedUrl = "";
 let erpCloseButton: HTMLButtonElement | null = null;
+let modelName = "best.pt";
 
 function stopWatch() {
 	if (streamTimer !== null) {
@@ -555,7 +556,8 @@ async function checkSidecar() {
 		void loadTestMode();
 		void loadDetectRoi();
 		void loadBomSource();
-		if (feedOn && !snapshot) showLiveFeed();
+if (feedOn && !snapshot) showLiveFeed();
+void loadModel();
 	}
 }
 
@@ -620,6 +622,19 @@ function asRoi(value: unknown): DetectRoi | null {
 function readAdminFlag() {
 	admin = sessionStorage.getItem(ADMIN_FLAG) === "1";
 	void loadBomSource();
+	if (sidecarUp) void loadModel();
+}
+
+async function loadModel() {
+	try {
+		const res = await fetch("http://127.0.0.1:8008/settings/model");
+		if (!res.ok) return;
+		const data = await res.json();
+		const active = typeof data.active === "string" ? data.active.trim() : "";
+		if (active) modelName = active;
+	} catch {
+		// A missed read keeps the last model name.
+	}
 }
 
 function rememberPaneSize() {
@@ -1732,6 +1747,15 @@ async function decodeAndInspect() {
 			{/if}
 		</section>
 	</div>
+
+	<footer class="flex shrink-0 items-center border-t border-neutral-800 bg-neutral-900 px-4 py-1.5">
+		<p class="text-[11px] font-semibold uppercase tracking-widest text-neutral-500">
+			Model
+			<span class="ml-2 font-mono text-xs font-medium normal-case tracking-normal text-neutral-300">
+				{modelName}
+			</span>
+		</p>
+	</footer>
 
 	<button
 		type="button"
