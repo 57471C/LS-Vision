@@ -42,6 +42,8 @@ cd vision
 
 (First-time setup: `python -m venv .venv` then `pip install -r requirements.txt`.)
 
+Place your best.pt in vision/models/.
+
 See [vision/README.md](vision/README.md) for full sidecar details.
 
 ## Project status

@@ -13,6 +13,8 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
+Place your best.pt in vision/models/. Weight files (`*.pt`, `*.onnx`) stay local and are not committed.
+
 ## Activate the environment (every new terminal)
 
 ```powershell
