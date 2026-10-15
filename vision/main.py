@@ -48,6 +48,7 @@ BOM_PATH = Path(__file__).parent / "sample-bom.json"
 # The settings-page unlock password is not stored here.
 # A SQL Server Authentication password is stored with the other connection fields.
 # config.local.json stores the BoM source, the operator ERP button, and the detect ROI.
+# An API key is stored with the other API fields. Inspect does not call that API.
 # bom-source.json is read only when config.local.json is absent.
 BOM_SOURCE_PATH = Path(__file__).parent / "bom-source.json"
 CONFIG_LOCAL_PATH = Path(__file__).parent / "config.local.json"
@@ -92,6 +93,11 @@ class RoiUpdate(BaseModel):
     w: int
     h: int
 
+class ApiSourceUpdate(BaseModel):
+    baseUrl: Optional[str] = ""
+    path: Optional[str] = ""
+    key: Optional[str] = ""
+
 class BomSourceUpdate(BaseModel):
     source: str
     server: Optional[str] = ""
@@ -99,6 +105,8 @@ class BomSourceUpdate(BaseModel):
     auth: Optional[str] = "windows"
     user: Optional[str] = ""
     password: Optional[str] = ""
+    # None keeps the API fields already stored. The settings page sends the object.
+    api: Optional[ApiSourceUpdate] = None
 
 class ErpUpdate(BaseModel):
     name: Optional[str] = ""
@@ -162,6 +170,9 @@ class DetectRoiUpdate(BaseModel):
 def _blank_erp():
     return {"name": "", "url": ""}
 
+def _blank_api():
+    return {"baseUrl": "", "path": "", "key": ""}
+
 def _blank_bom_source():
     return {
         "source": "json",
@@ -173,6 +184,7 @@ def _blank_bom_source():
             "user": "",
             "password": "",
         },
+        "api": _blank_api(),
         "erp": _blank_erp(),
         "scanSeconds": DEFAULT_SCAN_SECONDS,
         "testMode": False,
@@ -191,7 +203,7 @@ def _read_json_dict(path):
 
 def _apply_saved_source(config, saved):
     source = saved.get("source")
-    if source in ("json", "mssql"):
+    if source in ("json", "mssql", "api"):
         config["source"] = source
     mssql = saved.get("mssql")
     if isinstance(mssql, dict):
@@ -209,6 +221,32 @@ def _apply_saved_source(config, saved):
         config["mssql"]["user"] = ""
         config["mssql"]["password"] = ""
     return config
+
+def _apply_saved_api(config, saved):
+    api = saved.get("api")
+    if not isinstance(api, dict):
+        return config
+    for field in ("baseUrl", "path", "key"):
+        value = api.get(field)
+        if isinstance(value, str):
+            config["api"][field] = value.strip()
+    return config
+
+def _clean_api(base_url, path, key, check_url):
+    base_url = (base_url or "").strip()
+    path = (path or "").strip()
+    key = (key or "").strip()
+    if len(base_url) > 2000:
+        return None, "Base URL is too long"
+    if len(path) > 2000:
+        return None, "Endpoint path is too long"
+    if len(key) > 2000:
+        return None, "API key is too long"
+    if check_url and base_url:
+        parsed = urlparse(base_url)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            return None, "Base URL must start with http:// or https://"
+    return {"baseUrl": base_url, "path": path, "key": key}, None
 
 def _apply_saved_erp(config, saved):
     erp = saved.get("erp")
@@ -354,6 +392,7 @@ def load_bom_source():
         if saved is None:
             return config
         _apply_saved_source(config, saved)
+        _apply_saved_api(config, saved)
         _apply_saved_erp(config, saved)
         _apply_saved_scan(config, saved)
         _apply_saved_test_mode(config, saved)
@@ -363,6 +402,7 @@ def load_bom_source():
         if saved is None:
             return config
         _apply_saved_source(config, saved)
+        _apply_saved_api(config, saved)
         _apply_saved_erp(config, saved)
         _apply_saved_scan(config, saved)
         _apply_saved_test_mode(config, saved)
@@ -380,6 +420,11 @@ def save_bom_source(config):
             "auth": config["mssql"]["auth"],
             "user": config["mssql"]["user"],
             "password": config["mssql"]["password"],
+        },
+        "api": {
+            "baseUrl": (config.get("api") or {}).get("baseUrl") or "",
+            "path": (config.get("api") or {}).get("path") or "",
+            "key": (config.get("api") or {}).get("key") or "",
         },
         "erp": {
             "name": erp.get("name") or "",
@@ -1128,8 +1173,8 @@ def get_bom_source():
 
 @app.post("/settings/bom-source")
 def update_bom_source(body: BomSourceUpdate):
-    if body.source not in ("json", "mssql"):
-        return {"status": "fail", "message": "BoM source must be json or mssql"}
+    if body.source not in ("json", "mssql", "api"):
+        return {"status": "fail", "message": "BoM source must be json, mssql, or api"}
     if body.auth not in ("windows", "sql"):
         return {"status": "fail", "message": "Authentication must be windows or sql"}
     user = (body.user or "").strip()
@@ -1143,6 +1188,17 @@ def update_bom_source(body: BomSourceUpdate):
             "message": "Username and password are required for SQL Server Authentication",
         }
     existing = load_bom_source()
+    if body.api is None:
+        api = existing.get("api") or _blank_api()
+    else:
+        api, error = _clean_api(
+            body.api.baseUrl,
+            body.api.path,
+            body.api.key,
+            body.source == "api",
+        )
+        if error:
+            return {"status": "fail", "message": error}
     config = _blank_bom_source()
     config["source"] = body.source
     config["mssql"]["driver"] = existing["mssql"].get("driver") or DEFAULT_SQL_DRIVER
@@ -1151,6 +1207,7 @@ def update_bom_source(body: BomSourceUpdate):
     config["mssql"]["auth"] = body.auth
     config["mssql"]["user"] = user
     config["mssql"]["password"] = password
+    config["api"] = api
     config["erp"] = existing.get("erp") or _blank_erp()
     config["scanSeconds"] = existing.get("scanSeconds", DEFAULT_SCAN_SECONDS)
     config["testMode"] = existing.get("testMode") is True
@@ -1158,6 +1215,8 @@ def update_bom_source(body: BomSourceUpdate):
     saved = save_bom_source(config)
     if body.source == "mssql":
         message = "Saved. Inspect queries MSSQL using vision/bom_queries.sql."
+    elif body.source == "api":
+        message = "Saved. The API address is stored. Inspect does not call it yet."
     else:
         message = "Saved. Inspect uses vision/sample-bom.json."
     return {"status": "pass", "message": message, **saved}
@@ -1255,6 +1314,9 @@ def lookup_bom(barcode):
             return _inspect_mssql(barcode, source)
         except Exception as exc:
             return _inspect_fail(barcode, _mssql_error_message(exc, source))
+    # The API address is stored for later. Do not call it from inspect.
+    if source["source"] == "api":
+        return _inspect_fail(barcode, "API BoM lookup is not available yet")
 
     bom = load_bom()
     job = bom.get(barcode)

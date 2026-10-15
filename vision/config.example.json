@@ -8,6 +8,11 @@
 		"user": "",
 		"password": ""
 	},
+	"api": {
+		"baseUrl": "",
+		"path": "",
+		"key": ""
+	},
 	"erp": {
 		"name": "",
 		"url": ""

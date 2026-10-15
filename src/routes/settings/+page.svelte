@@ -6,7 +6,7 @@ const DEV_PASSWORD = "admin";
 const UNLOCK_KEY = "ls-vision-settings-open";
 const SECTION_KEY = "ls-vision-settings-section";
 
-type BomSource = "json" | "mssql";
+type BomSource = "json" | "mssql" | "api";
 type AuthMode = "windows" | "sql";
 type MssqlFields = { server: string; database: string; user: string };
 type SettingsSection = "camera" | "training" | "database";
@@ -25,6 +25,9 @@ let source: BomSource = "json";
 let auth: AuthMode = "windows";
 let mssql: MssqlFields = { server: "", database: "", user: "" };
 let mssqlPassword = "";
+let apiBaseUrl = "";
+let apiPath = "";
+let apiKey = "";
 let notice = "";
 let saving = false;
 let erpName = "";
@@ -75,6 +78,34 @@ function errorMessage(err: unknown, fallback: string): string {
 	return err instanceof Error && err.message ? err.message : fallback;
 }
 
+function readSource(value: unknown): BomSource {
+	if (value === "mssql" || value === "api" || value === "json") return value;
+	return "json";
+}
+
+function readApi(value: unknown) {
+	if (!value || typeof value !== "object") return;
+	const api = value as { baseUrl?: unknown; path?: unknown; key?: unknown };
+	if (typeof api.baseUrl === "string") apiBaseUrl = api.baseUrl;
+	if (typeof api.path === "string") apiPath = api.path;
+	if (typeof api.key === "string") apiKey = api.key;
+}
+
+function apiBaseUrlError(value: string): string {
+	const url = value.trim();
+	if (!url) return "";
+	try {
+		const parsed = new URL(url);
+		if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+			return "Base URL must start with http:// or https://";
+		}
+		if (!parsed.host) return "Base URL must start with http:// or https://";
+	} catch {
+		return "Base URL must start with http:// or https://";
+	}
+	return "";
+}
+
 function asRoi(value: unknown): DetectRoi | null {
 	if (!value || typeof value !== "object") return null;
 	const row = value as Record<string, unknown>;
@@ -120,7 +151,7 @@ async function loadSource() {
 		const res = await fetch("http://127.0.0.1:8008/settings/bom-source");
 		if (!res.ok) throw new Error(await res.text());
 		const data = await res.json();
-		source = data.source === "mssql" ? "mssql" : "json";
+		source = readSource(data.source);
 		auth = data.mssql?.auth === "sql" ? "sql" : "windows";
 		mssql = {
 			server: data.mssql?.server ?? "",
@@ -128,6 +159,7 @@ async function loadSource() {
 			user: auth === "windows" ? "" : (data.mssql?.user ?? ""),
 		};
 		mssqlPassword = auth === "windows" ? "" : (data.mssql?.password ?? "");
+		readApi(data.api);
 		await loadErp();
 		await loadScan();
 		await loadTestMode();
@@ -352,6 +384,13 @@ async function saveSource() {
 			"Username and password are required for SQL Server Authentication.";
 		return;
 	}
+	if (source === "api") {
+		const problem = apiBaseUrlError(apiBaseUrl);
+		if (problem) {
+			notice = problem;
+			return;
+		}
+	}
 	saving = true;
 	notice = "";
 	try {
@@ -365,12 +404,18 @@ async function saveSource() {
 				auth,
 				user: auth === "windows" ? "" : mssql.user,
 				password: auth === "windows" ? "" : mssqlPassword,
+				api: {
+					baseUrl: apiBaseUrl,
+					path: apiPath,
+					key: apiKey,
+				},
 			}),
 		});
 		if (!res.ok) throw new Error(await res.text());
 		const data = await res.json();
 		if (data.status !== "pass") throw new Error(data.message || "Save failed");
-		source = data.source === "mssql" ? "mssql" : source;
+		source = readSource(data.source);
+		readApi(data.api);
 		auth = data.mssql?.auth === "sql" ? "sql" : "windows";
 		mssql.user = data.mssql?.user ?? "";
 		mssqlPassword = data.mssql?.password ?? "";
@@ -717,10 +762,21 @@ onMount(() => {
 										class="h-4 w-4 accent-blue-500"
 										type="radio"
 										name="bom-source"
+										value="mssql"
+										bind:group={source}
+									/>
+									SQL
+									<span class="text-sm font-normal text-neutral-400">vision/bom_queries.sql</span>
+								</label>
+								<label class="flex items-center gap-3 text-base font-medium">
+									<input
+										class="h-4 w-4 accent-blue-500"
+										type="radio"
+										name="bom-source"
 										value="json"
 										bind:group={source}
 									/>
-									JSON file
+									JSON
 									<span class="text-sm font-normal text-neutral-400">vision/sample-bom.json</span>
 								</label>
 								<label class="flex items-center gap-3 text-base font-medium">
@@ -728,11 +784,10 @@ onMount(() => {
 										class="h-4 w-4 accent-blue-500"
 										type="radio"
 										name="bom-source"
-										value="mssql"
+										value="api"
 										bind:group={source}
 									/>
-									MSSQL
-									<span class="text-sm font-normal text-neutral-400">vision/bom_queries.sql</span>
+									API
 								</label>
 							</fieldset>
 
@@ -814,6 +869,40 @@ onMount(() => {
 									</label>
 									<p class="text-sm text-neutral-400">
 										Inspect runs the queries in vision/bom_queries.sql.
+									</p>
+								</div>
+							{:else if source === "api"}
+								<div class="flex flex-col gap-3 border-t border-neutral-800 pt-4">
+									<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+										Base URL
+										<input
+											type="url"
+											class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
+											bind:value={apiBaseUrl}
+											autocomplete="off"
+											placeholder="https://"
+										/>
+									</label>
+									<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+										Endpoint path
+										<input
+											class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
+											bind:value={apiPath}
+											autocomplete="off"
+											placeholder="/bom"
+										/>
+									</label>
+									<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+										API key
+										<input
+											type="password"
+											class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
+											bind:value={apiKey}
+											autocomplete="new-password"
+										/>
+									</label>
+									<p class="text-sm text-neutral-400">
+										Stored in vision/config.local.json. Inspect does not call this API yet.
 									</p>
 								</div>
 							{/if}
