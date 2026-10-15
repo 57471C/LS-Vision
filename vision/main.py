@@ -1,6 +1,48 @@
 import base64
+import ctypes
+import json
+import logging
+import os
+import re
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
 from contextlib import asynccontextmanager
+from decimal import Decimal
+from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
+
+def _windows_dll_dirs():
+    # pyzbar loads libiconv.dll and libzbar-64.dll by name. Classic LoadLibrary
+    # search uses PATH, not os.add_dll_directory, and a packaged exe inherits
+    # Explorer's PATH rather than the dev shell's PATH.
+    if os.name != "nt":
+        return []
+    exe_dir = Path(sys.executable).resolve().parent
+    site = exe_dir.parent / "Lib" / "site-packages"
+    found = []
+    for path in (site / "pyzbar", site / "cv2", exe_dir, Path(__file__).resolve().parent):
+        if path.is_dir() and path not in found:
+            found.append(path)
+    return found
+
+def _prepare_windows_dlls():
+    errors = []
+    dirs = _windows_dll_dirs()
+    if dirs:
+        prefix = os.pathsep.join(str(path) for path in dirs)
+        os.environ["PATH"] = prefix + os.pathsep + os.environ.get("PATH", "")
+    for path in dirs:
+        try:
+            os.add_dll_directory(str(path))
+        except (AttributeError, OSError) as exc:
+            errors.append(f"add_dll_directory failed for {path}: {exc}")
+    return dirs, errors
+
+_DLL_DIRS, _DLL_SETUP_ERRORS = _prepare_windows_dlls()
 
 import cv2
 import numpy as np
@@ -9,13 +51,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ValidationError, field_validator, model_validator
 import uvicorn
-import json
-import re
-import urllib.error
-import urllib.request
-from decimal import Decimal
-from pathlib import Path
-from urllib.parse import urlparse
+
+def _prefer_bundled_dlls():
+    # cv2 prepends its own bin directory while it imports. Put the bundled
+    # barcode DLLs back at the front before pyzbar's LoadLibrary("libiconv.dll").
+    if os.name != "nt" or not _DLL_DIRS:
+        return
+    prefix = os.pathsep.join(str(path) for path in _DLL_DIRS)
+    os.environ["PATH"] = prefix + os.pathsep + os.environ.get("PATH", "")
+
+_prefer_bundled_dlls()
 
 # pyzbar's bundled libzbar needs MSVCR120.dll (VC++ 2013 x64). If that runtime
 # is missing, keep /health and /inspect up and report the error from decode routes.
@@ -27,11 +72,72 @@ except OSError as exc:
 else:
     _PYZBAR_ERROR = None
 
+def _configure_logging():
+    logger = logging.getLogger("ls-vision")
+    logger.setLevel(logging.INFO)
+    if logger.handlers:
+        return logger
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    logger.addHandler(logging.StreamHandler())
+    try:
+        file_handler = logging.FileHandler(
+            Path(__file__).resolve().parent / "sidecar.log",
+            encoding="utf-8",
+        )
+        logger.addHandler(file_handler)
+    except OSError as exc:
+        logger.warning("could not open sidecar.log: %s", exc)
+    for handler in logger.handlers:
+        handler.setFormatter(formatter)
+    logger.propagate = False
+    return logger
+
+log = _configure_logging()
+
+def _camera_thread_excepthook(args):
+    name = args.thread.name if args.thread is not None else ""
+    if name.startswith("ls-vision-camera"):
+        log.error(
+            "camera thread crashed",
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+        return
+    sys.__excepthook__(args.exc_type, args.exc_value, args.exc_traceback)
+
+threading.excepthook = _camera_thread_excepthook
+
+def _log_runtime():
+    for message in _DLL_SETUP_ERRORS:
+        log.warning("%s", message)
+    log.info(
+        "sidecar start cwd=%s python=%s script=%s",
+        os.getcwd(),
+        sys.executable,
+        Path(__file__).resolve(),
+    )
+    system = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "MSVCR120.dll"
+    log.info("MSVCR120.dll %s", "found" if system.exists() else "missing")
+    watched = ("libzbar-64.dll", "libiconv.dll", "opencv_videoio_ffmpeg500_64.dll")
+    for directory in _DLL_DIRS:
+        present = [name for name in watched if (directory / name).exists()]
+        log.info(
+            "dll dir %s has %s",
+            directory,
+            ", ".join(present) if present else "none of the camera or barcode dlls",
+        )
+    if _PYZBAR_ERROR:
+        log.error("pyzbar failed to load: %s", _PYZBAR_ERROR)
+
+_log_runtime()
+
 @asynccontextmanager
 async def _lifespan(_app):
     # Barcode and BoM stay up even when the weights fail to load.
     _load_yolo()
-    yield
+    try:
+        yield
+    finally:
+        _shutdown_capture()
 
 app = FastAPI(title="LS-Vision Sidecar", lifespan=_lifespan)
 
@@ -64,9 +170,23 @@ MODEL_PATH = Path(__file__).parent / "models" / "best.pt"
 CAMERA_INDEX = 0
 BARCODE_ROI = {"x": 0, "y": 0, "w": 640, "h": 480}
 
-# One open capture shared by the stream and the decode calls.
+# The reader thread is the only owner of the device. The MJPEG stream and the
+# barcode routes copy the latest frame, so a decode cannot stall or close the stream.
 camera = None
 _camera_index = None
+_frame_lock = threading.Lock()
+_capture_lock = threading.Lock()
+_capture_thread = None
+_capture_stop = None
+_capture_generation = 0
+_capture_target = None
+_capture_error = None
+_latest_frame = None
+_latest_frame_id = 0
+_frames_published = 0
+_OPEN_RETRY_SECONDS = 0.3
+_SWITCH_SETTLE_SECONDS = 0.2
+_FRAME_WAIT_SECONDS = 5.0
 # Last raw frame a snapshot held. POST /detect uses it when
 # the request does not include an image.
 _latest_snapshot = None
@@ -890,36 +1010,254 @@ def load_bom():
     with open(BOM_PATH, encoding="utf-8") as f:
         return json.load(f)
 
-def get_camera(index=0):
-    global camera, _camera_index
-    if camera is None or not camera.isOpened() or _camera_index != index:
-        if camera is not None:
-            camera.release()
-        camera = cv2.VideoCapture(index, cv2.CAP_DSHOW)  # DSHOW is more reliable on Windows
-        _camera_index = index
-    return camera
+def _release_cap(cap):
+    if cap is None:
+        return
+    try:
+        cap.release()
+    except Exception:
+        log.exception("camera release failed")
+
+def _init_capture_com():
+    if os.name != "nt":
+        return
+    # DirectShow capture from a packaged GUI exe stays black or stalls unless
+    # the thread that opens the device is an STA. Dev still uses CAP_DSHOW.
+    try:
+        hr = ctypes.windll.ole32.CoInitializeEx(None, 0x2)
+    except Exception:
+        log.exception("CoInitializeEx failed")
+        return
+    log.info("CoInitializeEx STA hr=0x%08x", hr & 0xFFFFFFFF)
+
+def _open_capture(index):
+    # Same open as dev: CAP_DSHOW. A second attempt covers a device that is
+    # still releasing. There is no MSMF fallback; that backend is black for one
+    # of the bench cameras in the packaged exe.
+    last_error = f"Camera {index} did not open (CAP_DSHOW)"
+    for attempt in (1, 2):
+        cap = None
+        try:
+            cap = cv2.VideoCapture(int(index), cv2.CAP_DSHOW)
+            if cap is not None and cap.isOpened():
+                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+                log.info(
+                    "camera %s opened via CAP_DSHOW on attempt %s (%sx%s)",
+                    index,
+                    attempt,
+                    width,
+                    height,
+                )
+                return cap, None
+            last_error = f"Camera {index} did not open (CAP_DSHOW)"
+            log.warning("%s on attempt %s", last_error, attempt)
+        except Exception as exc:
+            last_error = f"Camera {index} failed to open: {exc}"
+            log.exception("camera %s open failed on attempt %s", index, attempt)
+        _release_cap(cap)
+        cap = None
+        if attempt == 1:
+            time.sleep(_OPEN_RETRY_SECONDS)
+    return None, last_error
 
 def _open_camera(index):
     cap = cv2.VideoCapture()
     if hasattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC"):
         cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 2000)
     if not cap.open(index, cv2.CAP_DSHOW):
+        log.warning("camera %s probe CAP_DSHOW did not open; trying the default backend", index)
         cap.open(index)
+    if not cap.isOpened():
+        log.warning("camera %s probe did not open", index)
     return cap
 
+def _stop_reader_locked():
+    global _capture_thread, _capture_target, camera, _camera_index, _latest_frame, _frames_published
+    stop = _capture_stop
+    thread = _capture_thread
+    was_running = thread is not None and thread.is_alive()
+    if stop is not None:
+        stop.set()
+    if was_running and thread is not threading.current_thread():
+        thread.join(timeout=2.5)
+        if thread.is_alive():
+            log.warning("camera reader is still stopping; releasing the open device")
+            with _frame_lock:
+                stuck = camera
+                camera = None
+                _camera_index = None
+                _latest_frame = None
+                _frames_published = 0
+            _release_cap(stuck)
+            thread.join(timeout=1.0)
+            if thread.is_alive():
+                log.error("camera reader did not stop")
+    _capture_thread = None
+    _capture_target = None
+    return was_running
+
+def _read_capture(cap, index, stop, generation):
+    global camera, _camera_index, _latest_frame, _latest_frame_id, _frames_published, _capture_error
+    with _frame_lock:
+        if generation != _capture_generation or stop.is_set():
+            return
+        camera = cap
+        _camera_index = index
+        _capture_error = None
+    empty_logged = False
+    read_error_at = 0.0
+    while not stop.is_set() and generation == _capture_generation:
+        try:
+            ok, frame = cap.read()
+        except Exception:
+            now = time.monotonic()
+            if now - read_error_at > 2:
+                log.exception("camera %s read failed", index)
+                read_error_at = now
+            time.sleep(0.05)
+            continue
+        if not ok or frame is None:
+            if not empty_logged:
+                log.warning("camera %s returned an empty frame", index)
+                empty_logged = True
+            time.sleep(0.02)
+            continue
+        empty_logged = False
+        published = frame.copy()
+        with _frame_lock:
+            if generation != _capture_generation:
+                return
+            first = _frames_published == 0
+            _latest_frame = published
+            _latest_frame_id += 1
+            _frames_published += 1
+        if first and not published.any():
+            log.warning("camera %s first frame is black", index)
+
+def _capture_loop(index, stop, generation):
+    global camera, _camera_index, _latest_frame, _frames_published, _capture_error
+    _init_capture_com()
+    logged_failure = False
+    try:
+        while not stop.is_set() and generation == _capture_generation:
+            cap, error = _open_capture(index)
+            if stop.is_set() or generation != _capture_generation:
+                _release_cap(cap)
+                log.info("camera %s open cancelled", index)
+                return
+            if cap is None:
+                with _frame_lock:
+                    if generation == _capture_generation:
+                        _capture_error = error
+                if not logged_failure:
+                    log.error("camera %s unavailable: %s", index, error)
+                    logged_failure = True
+                else:
+                    log.info("camera %s still unavailable: %s", index, error)
+                if stop.wait(1.0):
+                    return
+                continue
+            logged_failure = False
+            with _frame_lock:
+                if generation == _capture_generation:
+                    _capture_error = None
+            try:
+                _read_capture(cap, index, stop, generation)
+            except Exception:
+                log.exception("camera %s read loop failed", index)
+                with _frame_lock:
+                    if generation == _capture_generation:
+                        _capture_error = f"Camera {index} read failed"
+            finally:
+                _release_cap(cap)
+                with _frame_lock:
+                    if _capture_generation == generation and camera is cap:
+                        camera = None
+                        _camera_index = None
+                        _latest_frame = None
+                        _frames_published = 0
+                log.info("camera %s released", index)
+            if stop.is_set() or generation != _capture_generation:
+                return
+            if stop.wait(0.5):
+                return
+    except Exception:
+        log.exception("camera %s reader crashed", index)
+        with _frame_lock:
+            if generation == _capture_generation:
+                _capture_error = f"Camera {index} failed"
+
+def ensure_capture(index):
+    global _capture_generation, _capture_stop, _capture_target, _capture_error, _capture_thread
+    global _latest_frame, _frames_published
+    index = int(index)
+    with _capture_lock:
+        if (
+            _capture_thread is not None
+            and _capture_thread.is_alive()
+            and _capture_target == index
+        ):
+            return
+        released = _stop_reader_locked()
+        if released:
+            # DirectShow keeps the previous device black if the next open overlaps it.
+            time.sleep(_SWITCH_SETTLE_SECONDS)
+        _capture_generation += 1
+        generation = _capture_generation
+        stop = threading.Event()
+        _capture_stop = stop
+        _capture_target = index
+        _capture_error = None
+        with _frame_lock:
+            _latest_frame = None
+            _frames_published = 0
+        thread = threading.Thread(
+            target=_capture_loop,
+            args=(index, stop, generation),
+            name=f"ls-vision-camera-{index}",
+            daemon=True,
+        )
+        _capture_thread = thread
+        thread.start()
+        log.info("camera %s reader started", index)
+
+def _shutdown_capture():
+    with _capture_lock:
+        _stop_reader_locked()
+
+def _frame_or_error(index, min_frames=1):
+    index = int(index)
+    try:
+        ensure_capture(index)
+    except Exception:
+        log.exception("camera %s setup failed", index)
+        return None, f"Camera {index} failed to open"
+    deadline = time.monotonic() + _FRAME_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        with _frame_lock:
+            if (
+                _capture_target == index
+                and _latest_frame is not None
+                and _frames_published >= min_frames
+            ):
+                return _latest_frame.copy(), None
+            error = _capture_error
+            published = _frames_published
+        # The reader keeps retrying, so a failed open must not sit here for the
+        # whole wait. The live stream stays connected and reads the next frame.
+        if error and published == 0:
+            return None, error
+        time.sleep(0.02)
+    with _frame_lock:
+        error = _capture_error
+    message = error or "Failed to capture a frame"
+    log.warning("camera %s had no frame: %s", index, message)
+    return None, message
+
 def _capture_frame(index):
-    cap = get_camera(index)
-    if not cap.isOpened():
-        return None, "Camera not available"
-    frame = None
-    # First frames from many webcams are blank. Keep the last good one.
-    for _ in range(5):
-        ok, grabbed = cap.read()
-        if ok and grabbed is not None:
-            frame = grabbed
-    if frame is None:
-        return None, "Failed to capture a frame"
-    return frame, None
+    # First frames from many webcams are blank. Wait until the reader has a few.
+    return _frame_or_error(index, min_frames=5)
 
 def _resolve_roi(req):
     roi = dict(BARCODE_ROI)
@@ -990,12 +1328,64 @@ def _remember_snapshot(image):
         return
     _latest_snapshot = image.copy()
 
-def _grab_frame(index):
-    cap = get_camera(index)
-    ret, frame = cap.read()
-    if not ret or frame is None:
+def _take_stream_frame(index, last_id):
+    with _frame_lock:
+        if _capture_target != int(index) or _latest_frame is None or _latest_frame_id == last_id:
+            return None
+        frame = _latest_frame
+        frame_id = _latest_frame_id
+    try:
+        ok, jpeg = cv2.imencode(".jpg", frame)
+    except Exception:
+        log.exception("camera %s stream encode failed", index)
+        time.sleep(0.2)
         return None
-    return frame
+    if not ok:
+        log.warning("camera %s stream encode returned no jpeg", index)
+        time.sleep(0.2)
+        return None
+    payload = (
+        b"--frame\r\n"
+        b"Content-Type: image/jpeg\r\n\r\n" + jpeg.tobytes() + b"\r\n"
+    )
+    return payload, frame_id
+
+def _reopen_if_mine(index):
+    # A stream that the operator has already left must not grab the device back.
+    index = int(index)
+    with _capture_lock:
+        mine = _capture_target == index
+        alive = _capture_thread is not None and _capture_thread.is_alive()
+    if mine and not alive:
+        ensure_capture(index)
+
+def iter_camera_stream(index):
+    # Decode never touches this generator. A miss, a bad frame, or a pyzbar
+    # error must not end the multipart response. The device is claimed once
+    # per connection so a stale response cannot reopen the previous camera.
+    log.info("camera %s stream connected", index)
+    last_id = -1
+    try:
+        try:
+            ensure_capture(index)
+        except Exception:
+            log.exception("camera %s stream could not open", index)
+        while True:
+            try:
+                _reopen_if_mine(index)
+                item = _take_stream_frame(index, last_id)
+            except Exception:
+                log.exception("camera %s stream failed", index)
+                time.sleep(0.2)
+                continue
+            if item is None:
+                time.sleep(0.02)
+                continue
+            payload, frame_id = item
+            last_id = frame_id
+            yield payload
+    finally:
+        log.info("camera %s stream closed", index)
 
 def _codes_from_frame(frame):
     decoded = pyzbar.decode(frame)
@@ -1023,22 +1413,23 @@ def health():
 
 @app.get("/camera/stream")
 def camera_stream(index: int = 0):
-    def generate():
-        cap = get_camera(index)
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            _, jpeg = cv2.imencode(".jpg", frame)
-            yield (b"--frame\r\n"
-                   b"Content-Type: image/jpeg\r\n\r\n" + jpeg.tobytes() + b"\r\n")
-    return StreamingResponse(generate(), media_type="multipart/x-mixed-replace; boundary=frame")
+    return StreamingResponse(
+        iter_camera_stream(index),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
 
 @app.get("/camera/decode")
 def camera_decode(index: int = 0):
-    frame = _grab_frame(index)
+    try:
+        return _camera_decode(index)
+    except Exception:
+        log.exception("camera decode failed")
+        return {"status": "fail", "message": "Barcode decode failed", "codes": []}
+
+def _camera_decode(index):
+    frame, error = _frame_or_error(index)
     if frame is None:
-        return {"status": "fail", "message": "No frame"}
+        return {"status": "fail", "message": error or "No frame"}
 
     if pyzbar is None:
         return {
@@ -1056,6 +1447,13 @@ def camera_decode(index: int = 0):
 
 @app.get("/camera/snapshot")
 def camera_snapshot(index: int = 0):
+    try:
+        return _camera_snapshot(index)
+    except Exception:
+        log.exception("camera snapshot failed")
+        return {"status": "fail", "snapshot": False, "message": "Snapshot failed"}
+
+def _camera_snapshot(index):
     # An API BoM is the typed job card number. Do not decode a barcode for it.
     if load_bom_source().get("source") == "api":
         return {
@@ -1065,9 +1463,10 @@ def camera_snapshot(index: int = 0):
         }
 
     # Freeze this frame only when its barcode is in the current BoM (JSON or MSSQL).
-    frame = _grab_frame(index)
+    # The copy comes from the reader thread. This route does not call cap.read().
+    frame, error = _frame_or_error(index)
     if frame is None:
-        return {"status": "fail", "snapshot": False, "message": "No frame"}
+        return {"status": "fail", "snapshot": False, "message": error or "No frame"}
 
     if pyzbar is None:
         return {
@@ -1117,13 +1516,17 @@ def camera_snapshot(index: int = 0):
 def cameras(count: int = 4):
     count = max(1, min(count, 8))
     available = []
+    with _frame_lock:
+        active_index = _camera_index if camera is not None and camera.isOpened() else None
     for index in range(count):
-        if camera is not None and camera.isOpened() and _camera_index == index:
+        if index == active_index:
             available.append(index)
             continue
         cap = _open_camera(index)
-        opened = cap.isOpened()
-        cap.release()
+        try:
+            opened = cap.isOpened()
+        finally:
+            _release_cap(cap)
         if opened:
             available.append(index)
     return {"cameras": available, "active": CAMERA_INDEX}
@@ -1174,11 +1577,22 @@ def read_barcode(req: Optional[BarcodeRequest] = Body(default=None)):
             "codes": [],
         }
 
-    crop, used_roi = _crop_roi(frame, roi)
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    codes = _decode(gray)
-    if not codes:
-        codes = _decode(crop)
+    try:
+        crop, used_roi = _crop_roi(frame, roi)
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        codes = _decode(gray)
+        if not codes:
+            codes = _decode(crop)
+    except Exception:
+        log.exception("barcode read failed")
+        return {
+            "status": "fail",
+            "barcode": None,
+            "message": "Barcode decode failed",
+            "camera": camera,
+            "roi": roi,
+            "codes": [],
+        }
 
     frame_size = {"width": int(frame.shape[1]), "height": int(frame.shape[0])}
     if not codes:
