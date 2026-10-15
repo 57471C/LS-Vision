@@ -45,6 +45,36 @@ type Detection = {
 	bbox: number[];
 };
 
+type DetectionMark = {
+	key: string;
+	ic: string;
+	color: string;
+	x: number;
+	y: number;
+	w: number;
+	h: number;
+	labelX: number;
+	labelY: number;
+	labelW: number;
+	labelH: number;
+};
+
+// Same order the sidecar used when it painted boxes. OpenCV stored these as BGR.
+const PART_COLORS = [
+	"rgb(60, 180, 0)",
+	"rgb(255, 165, 0)",
+	"rgb(0, 140, 255)",
+	"rgb(230, 60, 60)",
+	"rgb(200, 60, 200)",
+	"rgb(200, 200, 0)",
+	"rgb(0, 180, 180)",
+	"rgb(255, 100, 0)",
+];
+const BOX_STROKE = 2;
+const LABEL_FONT = 12;
+const LABEL_PAD_X = 4;
+const LABEL_PAD_Y = 3;
+
 type BomView = {
 	kitCode: string;
 	des?: string;
@@ -61,6 +91,8 @@ const DEFAULT_SCAN_SECONDS = 8;
 const ADMIN_FLAG = "ls-vision-settings-open";
 
 let barcode = "";
+let bomSource: "json" | "mssql" | "api" = "json";
+let bomSourceReady: Promise<void> | null = null;
 let result: InspectView | null = null;
 let bom: BomView | null = null;
 let loading = false;
@@ -238,6 +270,87 @@ function detectedImageSrc(encoded: string): string {
 	return `data:image/jpeg;base64,${text.replace(/\s+/g, "")}`;
 }
 
+function colorForIc(ic: string): string {
+	const bytes = new TextEncoder().encode(ic);
+	let total = 0;
+	for (const byte of bytes) total += byte;
+	return PART_COLORS[total % PART_COLORS.length];
+}
+
+function detectionMarks(
+	zoom: {
+		width: number;
+		height: number;
+	} | null,
+): DetectionMark[] {
+	// Positions are CSS pixels of the still. The viewBox matches that size,
+	// so the stroke and the label font do not grow when the still is scaled.
+	if (!snapshot || paneWidth < 1 || paneHeight < 1 || detections.length === 0)
+		return [];
+	let scale = 1;
+	let originX = 0;
+	let originY = 0;
+	if (zoom) {
+		scale = zoom.width / paneWidth;
+	} else if (frameWidth > 0 && frameHeight > 0) {
+		scale = Math.min(frameWidth / paneWidth, frameHeight / paneHeight);
+		originX = (frameWidth - paneWidth * scale) / 2;
+		originY = (frameHeight - paneHeight * scale) / 2;
+	} else {
+		return [];
+	}
+	if (!Number.isFinite(scale) || scale <= 0) return [];
+	const imageRight = originX + paneWidth * scale;
+	const imageBottom = originY + paneHeight * scale;
+	const marks: DetectionMark[] = [];
+	const ordered = [...detections].sort((a, b) => a.confidence - b.confidence);
+	for (const [index, item] of ordered.entries()) {
+		const box = item.bbox;
+		if (box.length < 4) continue;
+		const [rawX1, rawY1, rawX2, rawY2] = box;
+		if (
+			![rawX1, rawY1, rawX2, rawY2].every(
+				(value) => typeof value === "number" && Number.isFinite(value),
+			)
+		) {
+			continue;
+		}
+		const x1 = Math.max(0, Math.min(paneWidth, rawX1));
+		const y1 = Math.max(0, Math.min(paneHeight, rawY1));
+		const x2 = Math.max(0, Math.min(paneWidth, rawX2));
+		const y2 = Math.max(0, Math.min(paneHeight, rawY2));
+		if (x2 <= x1 || y2 <= y1) continue;
+		const x = originX + x1 * scale;
+		const y = originY + y1 * scale;
+		const w = (x2 - x1) * scale;
+		const h = (y2 - y1) * scale;
+		const labelW =
+			Math.ceil(item.ic.length * LABEL_FONT * 0.62) + LABEL_PAD_X * 2;
+		const labelH = LABEL_FONT + LABEL_PAD_Y * 2;
+		let labelX = x;
+		let labelY = y - labelH;
+		if (labelY < originY) labelY = y;
+		if (labelX + labelW > imageRight)
+			labelX = Math.max(originX, imageRight - labelW);
+		if (labelY + labelH > imageBottom)
+			labelY = Math.max(originY, imageBottom - labelH);
+		marks.push({
+			key: `${index}:${item.ic}:${x1}:${y1}`,
+			ic: item.ic,
+			color: colorForIc(item.ic),
+			x,
+			y,
+			w,
+			h,
+			labelX,
+			labelY,
+			labelW,
+			labelH,
+		});
+	}
+	return marks;
+}
+
 async function runDetect(generation: number, body: { image?: string }) {
 	if (generation !== detectGeneration) return;
 	detectState = "running";
@@ -251,7 +364,7 @@ async function runDetect(generation: number, body: { image?: string }) {
 		});
 		const payload = (await res.json()) as {
 			detections?: unknown;
-			annotated_image_base64?: unknown;
+			image_base64?: unknown;
 			message?: unknown;
 		};
 		if (generation !== detectGeneration || !pageAlive) return;
@@ -264,12 +377,15 @@ async function runDetect(generation: number, body: { image?: string }) {
 		}
 		detections = asDetections(payload.detections);
 		detectMessage = typeof payload.message === "string" ? payload.message : "";
-		const encoded = payload.annotated_image_base64;
-		if (typeof encoded === "string" && encoded && snapshot) {
+		const encoded = payload.image_base64;
+		if (snapshot) {
 			snapshot = {
 				...snapshot,
-				image: detectedImageSrc(encoded),
-				detected: true,
+				image:
+					typeof encoded === "string" && encoded
+						? detectedImageSrc(encoded)
+						: snapshot.image,
+				detected: detections.length > 0,
 			};
 		}
 		detectState = "done";
@@ -308,6 +424,18 @@ async function watchFeed() {
 	watchInFlight = true;
 	const index = cameraIndex;
 	try {
+		// Wait until the saved source is known. API lookup does not decode.
+		await ensureBomSource();
+		if (
+			!pageAlive ||
+			bomSource === "api" ||
+			!feedOn ||
+			snapshot ||
+			loading ||
+			index !== cameraIndex
+		) {
+			return;
+		}
 		const res = await fetch(
 			`http://127.0.0.1:8008/camera/snapshot?index=${index}`,
 		);
@@ -382,6 +510,29 @@ async function checkSidecar() {
 		void loadScan();
 		void loadTestMode();
 		void loadDetectRoi();
+		void loadBomSource();
+	}
+}
+
+function ensureBomSource(): Promise<void> {
+	if (!bomSourceReady) bomSourceReady = loadBomSource();
+	return bomSourceReady;
+}
+
+async function loadBomSource() {
+	try {
+		const res = await fetch("http://127.0.0.1:8008/settings/bom-source");
+		if (!res.ok) return;
+		const data = await res.json();
+		if (
+			data.source === "api" ||
+			data.source === "mssql" ||
+			data.source === "json"
+		) {
+			bomSource = data.source;
+		}
+	} catch {
+		// A missed read keeps the current label.
 	}
 }
 
@@ -423,6 +574,7 @@ function asRoi(value: unknown): DetectRoi | null {
 
 function readAdminFlag() {
 	admin = sessionStorage.getItem(ADMIN_FLAG) === "1";
+	void loadBomSource();
 }
 
 function rememberPaneSize() {
@@ -803,7 +955,161 @@ async function startSidecar() {
 	}, 1500);
 }
 
+function apiField(row: Record<string, unknown>, names: string[]): unknown {
+	const lookup = new Map(
+		Object.entries(row).map(([key, value]) => [key.toLowerCase(), value]),
+	);
+	for (const name of names) {
+		const key = name.toLowerCase();
+		if (lookup.has(key)) return lookup.get(key);
+	}
+	return undefined;
+}
+
+function apiText(row: Record<string, unknown>, names: string[]): string {
+	const value = apiField(row, names);
+	if (value === undefined || value === null) return "";
+	return String(value).trim();
+}
+
+function apiQty(value: unknown): number {
+	if (typeof value === "number" && Number.isFinite(value)) return value;
+	if (
+		typeof value === "string" &&
+		value.trim() &&
+		Number.isFinite(Number(value))
+	) {
+		return Number(value);
+	}
+	return 0;
+}
+
+function viewFromKit(kitCode: string, row: Record<string, unknown>): InspectView {
+	const rawParts = apiField(row, ["parts"]);
+	if (!Array.isArray(rawParts)) {
+		return { status: "fail", message: "BoM API response has no parts." };
+	}
+	const parts: Part[] = [];
+	for (const item of rawParts) {
+		if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+		const part = item as Record<string, unknown>;
+		const ic = apiText(part, ["ic", "cc"]);
+		if (!ic) continue;
+		parts.push({
+			ic,
+			des: apiText(part, ["des", "description"]),
+			qty: apiQty(apiField(part, ["qty", "quantity"])),
+		});
+	}
+	const expected = apiField(row, ["expectedKitCount", "labelCount"]);
+	return {
+		status: "pass",
+		message: "BoM loaded – 2 kit(s) on bench",
+		kitCode,
+		des: apiText(row, ["des", "description", "kitName"]),
+		parts,
+		kitsFound: 2,
+		expectedKitCount:
+			expected === undefined || expected === null
+				? undefined
+				: apiQty(expected),
+	};
+}
+
+function kitsKeyedByIc(
+	data: Record<string, unknown>,
+): { kitCode: string; job: Record<string, unknown> }[] {
+	// The BoM API uses the same shape as the sample file: { kitIC: { des, parts } }.
+	const kits = [];
+	for (const [key, value] of Object.entries(data)) {
+		if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+		const job = value as Record<string, unknown>;
+		if (!Array.isArray(apiField(job, ["parts"]))) continue;
+		const kitCode = key.trim();
+		if (kitCode) kits.push({ kitCode, job });
+	}
+	return kits;
+}
+
+function viewFromApiData(data: unknown): InspectView {
+	if (!data || typeof data !== "object" || Array.isArray(data)) {
+		return { status: "fail", message: "BoM API response has no data object." };
+	}
+	const row = data as Record<string, unknown>;
+	const directCode = apiText(row, ["kitIC", "kitIc", "kitCode", "kit", "ic"]);
+	if (directCode && Array.isArray(apiField(row, ["parts"]))) {
+		return viewFromKit(directCode, row);
+	}
+	const kits = kitsKeyedByIc(row);
+	if (kits.length > 1) {
+		return { status: "fail", message: "BoM API returned more than one kit." };
+	}
+	if (kits.length === 1) return viewFromKit(kits[0].kitCode, kits[0].job);
+	if (directCode) {
+		return { status: "fail", message: "BoM API response has no parts." };
+	}
+	return { status: "fail", message: "BoM API response has no kit IC." };
+}
+
+function apiFailureMessage(
+	body: unknown,
+	text: string,
+	status: number,
+): string {
+	if (body && typeof body === "object" && !Array.isArray(body)) {
+		const row = body as Record<string, unknown>;
+		if (typeof row.message === "string" && row.message.trim()) {
+			return row.message.trim();
+		}
+	}
+	if (text.trim()) return text.trim();
+	return `BoM API lookup failed (${status}).`;
+}
+
+async function runApiLookup() {
+	if (loading) return;
+	loading = true;
+	result = null;
+	try {
+		const res = await fetch("http://127.0.0.1:8008/bom/api", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ jobCardNumber: barcode.trim() }),
+		});
+		const text = await res.text();
+		let body: unknown = null;
+		try {
+			body = text ? JSON.parse(text) : null;
+		} catch {
+			body = null;
+		}
+		if (!res.ok || !body) {
+			result = {
+				status: "fail",
+				message: apiFailureMessage(body, text, res.status),
+			};
+			dropBom();
+			return;
+		}
+		const view = viewFromApiData(body);
+		result = view;
+		if (view.status === "pass") {
+			storeBom(view);
+			if (testMode) void chooseAndDetect();
+		} else dropBom();
+	} catch (err: unknown) {
+		result = { status: "fail", message: errorMessage(err, "Request failed") };
+		dropBom();
+	} finally {
+		loading = false;
+	}
+}
+
 async function runInspect() {
+	if (bomSource === "api") {
+		await runApiLookup();
+		return;
+	}
 	if (loading) return;
 	loading = true;
 	result = null;
@@ -829,6 +1135,10 @@ async function runInspect() {
 }
 
 async function decodeAndInspect() {
+	if (bomSource === "api") {
+		await runApiLookup();
+		return;
+	}
 	loading = true;
 	try {
 		const res = await fetch(
@@ -933,9 +1243,10 @@ async function decodeAndInspect() {
 		on:submit|preventDefault={runInspect}
 	>
 		<label class="flex min-w-56 flex-1 flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
-			Barcode
+			{bomSource === "api" ? "Job card number" : "Barcode"}
 			<input
 				class="w-full border border-neutral-600 bg-neutral-950 px-3 py-2 font-mono text-lg font-medium normal-case tracking-normal text-neutral-100"
+				inputmode={bomSource === "api" ? "numeric" : undefined}
 				bind:value={barcode}
 			/>
 		</label>
@@ -955,7 +1266,7 @@ async function decodeAndInspect() {
 			on:click={decodeAndInspect}
 			disabled={loading}
 		>
-			Decode QR / Barcode
+			{bomSource === "api" ? "Look up" : "Decode QR / Barcode"}
 		</button>
 		<button
 			type="button"
@@ -1074,6 +1385,51 @@ async function decodeAndInspect() {
 								/>
 							</svg>
 						{/if}
+						{#if snapshot && paneWidth > 0 && paneHeight > 0 && detections.length > 0}
+							{@const marks = detectionMarks(zoom)}
+							{@const viewW = zoom ? zoom.width : frameWidth}
+							{@const viewH = zoom ? zoom.height : frameHeight}
+							{#if marks.length > 0 && viewW > 0 && viewH > 0}
+								<svg
+									class="pointer-events-none absolute left-0 top-0 z-10"
+									width={viewW}
+									height={viewH}
+									viewBox="0 0 {viewW} {viewH}"
+									preserveAspectRatio="none"
+									aria-hidden="true"
+								>
+									{#each marks as mark (mark.key)}
+										<rect
+											x={mark.x}
+											y={mark.y}
+											width={mark.w}
+											height={mark.h}
+											fill="none"
+											stroke={mark.color}
+											stroke-width={BOX_STROKE}
+										/>
+										<rect
+											x={mark.labelX}
+											y={mark.labelY}
+											width={mark.labelW}
+											height={mark.labelH}
+											fill={mark.color}
+										/>
+										<text
+											x={mark.labelX + LABEL_PAD_X}
+											y={mark.labelY + mark.labelH / 2}
+											fill="#ffffff"
+											font-size={LABEL_FONT}
+											font-family="ui-monospace, monospace"
+											font-weight="600"
+											dominant-baseline="central"
+										>
+											{mark.ic}
+										</text>
+									{/each}
+								</svg>
+							{/if}
+						{/if}
 					</div>
 				{:else}
 					<div class="absolute inset-0 flex items-center justify-center text-lg text-neutral-500">
@@ -1147,7 +1503,7 @@ async function decodeAndInspect() {
 				>
 					{result.status}
 				</p>
-				<div class="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4">
+				<div class="result-scroll flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4">
 					{#if result.kitCode}
 						<p class="font-mono text-2xl font-semibold tracking-tight">{result.kitCode}</p>
 					{/if}
@@ -1253,7 +1609,11 @@ async function decodeAndInspect() {
 			{:else}
 				<div class="px-4 py-8">
 					<p class="text-lg font-medium text-neutral-300">No result yet</p>
-					<p class="mt-1 text-sm text-neutral-500">Decode a barcode or press Enter.</p>
+					<p class="mt-1 text-sm text-neutral-500">
+						{bomSource === "api"
+							? "Enter a job card number and press Enter."
+							: "Decode a barcode or press Enter."}
+					</p>
 				</div>
 			{/if}
 		</section>
@@ -1318,3 +1678,33 @@ async function decodeAndInspect() {
 		{/if}
 	</div>
 </div>
+
+<style>
+	.result-scroll {
+		color-scheme: dark;
+		scrollbar-color: #a3a3a3 #171717;
+		scrollbar-width: auto;
+	}
+
+	.result-scroll::-webkit-scrollbar {
+		width: 12px;
+		height: 12px;
+	}
+
+	.result-scroll::-webkit-scrollbar-track {
+		background: #171717;
+	}
+
+	.result-scroll::-webkit-scrollbar-thumb {
+		background: #a3a3a3;
+		border: 2px solid #171717;
+	}
+
+	.result-scroll::-webkit-scrollbar-thumb:hover {
+		background: #d4d4d4;
+	}
+
+	.result-scroll::-webkit-scrollbar-corner {
+		background: #171717;
+	}
+</style>
