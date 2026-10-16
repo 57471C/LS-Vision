@@ -146,14 +146,6 @@ fn listening_pids_on(text: &str, port: u16) -> Vec<u32> {
     pids
 }
 
-fn is_vision_sidecar(command_line: &str) -> bool {
-    let line = command_line.to_ascii_lowercase();
-    // `python main.py` from the vision folder has no vision path in the command line.
-    // That process is still the sidecar when it owns port 8008. The absolute
-    // launch path always contains both words, including the parent launcher.
-    line.contains("main.py") && line.contains("vision")
-}
-
 fn is_sidecar_command(command_line: &str, listening: bool) -> bool {
     let line = command_line.to_ascii_lowercase();
     if !line.contains("main.py") {
@@ -389,7 +381,7 @@ fn stop_process(_pid: u32) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_vision_sidecar, listening_pids_on, output_text};
+    use super::{is_sidecar_command, listening_pids_on, output_text};
 
     #[test]
     fn netstat_keeps_only_the_sidecar_port() {
@@ -405,12 +397,6 @@ mod tests {
 
     #[test]
     fn command_line_must_be_the_vision_script() {
-        use super::is_sidecar_command;
-        assert!(is_vision_sidecar(
-            r"C:\Scripts\LS-Vision\vision\.venv\Scripts\python.exe C:\Scripts\LS-Vision\vision\main.py"
-        ));
-        assert!(!is_vision_sidecar(r"C:\Other\main.py"));
-        assert!(!is_vision_sidecar("python.exe"));
         assert!(is_sidecar_command(r"C:\Python\python.exe main.py", true));
         assert!(!is_sidecar_command(r"C:\Python\python.exe main.py", false));
         assert!(is_sidecar_command(
@@ -425,7 +411,7 @@ mod tests {
             .encode_utf16()
             .flat_map(|unit| unit.to_le_bytes())
             .collect();
-        assert!(is_vision_sidecar(&output_text(&bytes)));
+        assert_eq!(output_text(&bytes), "vision\\main.py");
     }
 }
 
