@@ -52,6 +52,8 @@ _CAMERA_PROBE_MISS_LIMIT = 3
 # Last raw frame a snapshot held. POST /detect uses it when
 # the request does not include an image.
 _latest_snapshot = None
+_controls_lock = threading.Lock()
+_pending_controls = None
 
 def _release_cap(cap):
     if cap is None:
@@ -103,6 +105,132 @@ def _open_capture(index):
         if attempt == 1:
             time.sleep(_OPEN_RETRY_SECONDS)
     return None, last_error
+
+_SPAN_GUESSES = (255, 1023, 2047, 4095, 8191)
+_control_spans = {}
+_unsupported_logged = set()
+
+def _discover_span(cap, prop):
+    # The UI is 0 to 100. DirectShow cameras use their own maximum, so find
+    # the highest value this device keeps, then put the lens back.
+    current = cap.get(prop)
+    found = None
+    try:
+        for guess in _SPAN_GUESSES:
+            if not cap.set(prop, float(guess)):
+                if found is None:
+                    continue
+                break
+            read = float(cap.get(prop))
+            if abs(read - guess) <= 1.5:
+                found = guess
+                continue
+            if abs(read - float(current)) > 1.5:
+                found = max(int(round(read)), 1)
+            break
+    finally:
+        try:
+            cap.set(prop, current)
+        except Exception:
+            log.exception("camera control restore failed")
+    return found
+
+def _span_for(cap, index, prop):
+    key = (int(index), int(prop))
+    if key in _control_spans:
+        return _control_spans[key]
+    span = _discover_span(cap, prop)
+    _control_spans[key] = span
+    return span
+
+def _set_level(cap, prop, level, label, index):
+    if isinstance(level, bool) or not isinstance(level, int):
+        return
+    span = _span_for(cap, index, prop)
+    if not span:
+        key = (int(index), int(prop))
+        if key not in _unsupported_logged:
+            _unsupported_logged.add(key)
+            log.info("camera %s is not supported", label)
+        return
+    applied = int(level * span / 100 + 0.5)
+    if not cap.set(prop, float(applied)):
+        log.info("camera %s %s was not accepted", label, level)
+        return
+    log.info(
+        "camera %s ui=%s applied=%s of %s read=%s",
+        label,
+        level,
+        applied,
+        span,
+        cap.get(prop),
+    )
+
+def _apply_controls(cap, controls, index):
+    if cap is None or not isinstance(controls, dict):
+        return
+    try:
+        resolution = controls.get("resolution") or ""
+        if isinstance(resolution, str) and "x" in resolution:
+            width_text, height_text = resolution.lower().split("x", 1)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(width_text))
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(height_text))
+            log.info(
+                "camera size set %s read %sx%s",
+                resolution,
+                int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0),
+                int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0),
+            )
+        _set_level(cap, cv2.CAP_PROP_BRIGHTNESS, controls.get("brightness"), "brightness", index)
+        _set_level(cap, cv2.CAP_PROP_CONTRAST, controls.get("contrast"), "contrast", index)
+        focus = controls.get("focus")
+        if isinstance(focus, int) and not isinstance(focus, bool):
+            if hasattr(cv2, "CAP_PROP_AUTOFOCUS"):
+                cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+            _set_level(cap, cv2.CAP_PROP_FOCUS, focus, "focus", index)
+    except Exception:
+        log.exception("camera controls were not applied")
+
+def _saved_controls():
+    camera_settings = load_bom_source().get("camera") or {}
+    if not isinstance(camera_settings, dict):
+        return {}
+    return {
+        "resolution": camera_settings.get("resolution") or "",
+        "focus": camera_settings.get("focus"),
+        "brightness": camera_settings.get("brightness"),
+        "contrast": camera_settings.get("contrast"),
+    }
+
+def publish_camera_controls(camera_settings):
+    # The reader thread applies these on its next frame. This does not open
+    # a second capture.
+    if not isinstance(camera_settings, dict):
+        return
+    try:
+        index = int(camera_settings.get("index"))
+    except (TypeError, ValueError):
+        return
+    if _active_reader_index() != index:
+        return
+    controls = {
+        "resolution": camera_settings.get("resolution") or "",
+        "focus": camera_settings.get("focus"),
+        "brightness": camera_settings.get("brightness"),
+        "contrast": camera_settings.get("contrast"),
+    }
+    global _pending_controls
+    with _controls_lock:
+        _pending_controls = (index, controls)
+
+def _take_pending(index):
+    global _pending_controls
+    with _controls_lock:
+        pending = _pending_controls
+        if pending is None or pending[0] != int(index):
+            return None
+        _pending_controls = None
+        return pending[1]
 
 def _active_reader_index():
     # The reader thread owns this index, including while the first open is
@@ -206,6 +334,9 @@ def _read_capture(cap, index, stop, generation):
     empty_logged = False
     read_error_at = 0.0
     while not stop.is_set() and generation == _capture_generation:
+        pending = _take_pending(index)
+        if pending is not None:
+            _apply_controls(cap, pending, index)
         try:
             ok, frame = cap.read()
         except Exception:
@@ -260,6 +391,7 @@ def _capture_loop(index, stop, generation):
             with _frame_lock:
                 if generation == _capture_generation:
                     _capture_error = None
+            _apply_controls(cap, _saved_controls(), index)
             try:
                 _read_capture(cap, index, stop, generation)
             except Exception:

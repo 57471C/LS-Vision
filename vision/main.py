@@ -1,5 +1,6 @@
 import os
 import sys
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -63,6 +64,20 @@ app.add_middleware(
 @app.get("/health")
 def health():
     return {"status": "ok", "engine": "python-sidecar"}
+
+@app.post("/shutdown")
+def shutdown():
+    # Answer first, then release the camera and exit this process.
+    def _exit():
+        try:
+            _shutdown_capture()
+        except Exception:
+            log.exception("shutdown capture release failed")
+        log.info("shutdown pid=%s", os.getpid())
+        os._exit(0)
+
+    threading.Timer(0.2, _exit).start()
+    return {"status": "pass", "message": "Stopping vision sidecar."}
 
 app.include_router(camera_router)
 app.include_router(barcode_router)

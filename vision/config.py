@@ -11,7 +11,7 @@ from pydantic import BaseModel, ValidationError, field_validator, model_validato
 # Local BoM source choice. A missing file means the JSON sample BoM.
 # The settings-page unlock password is not stored here.
 # A SQL Server Authentication password is stored with the other connection fields.
-# config.local.json stores the BoM source, the operator ERP button, the detect ROI, and the model file name.
+# config.local.json stores the BoM source, the operator ERP button, the detect ROI, the model file name, and the primary camera.
 # An API key is stored with the other API fields. POST /bom/api posts the job card number.
 # bom-source.json is read only when config.local.json is absent.
 BOM_SOURCE_PATH = Path(__file__).parent / "bom-source.json"
@@ -23,6 +23,8 @@ MAX_SCAN_SECONDS = 60
 MODEL_DIR = Path(__file__).parent / "models"
 DEFAULT_MODEL_NAME = "best.pt"
 _MODEL_SUFFIXES = {".pt", ".onnx"}
+MAX_CAMERA_INDEX = 32
+CAMERA_RESOLUTIONS = ("640x480", "1280x720", "1920x1080")
 
 class ApiSourceUpdate(BaseModel):
     baseUrl: Optional[str] = ""
@@ -98,6 +100,27 @@ class DetectRoiBox(BaseModel):
 class DetectRoiUpdate(BaseModel):
     roi: Optional[DetectRoiBox] = None
 
+class CameraUpdate(BaseModel):
+    # Fields left out of the body stay as they are. Settings sends every field.
+    # The operator page sends index only. applyOnly updates the open camera
+    # without replacing the saved settings.
+    index: Optional[int] = None
+    resolution: Optional[str] = None
+    focus: Optional[int] = None
+    brightness: Optional[int] = None
+    contrast: Optional[int] = None
+    applyOnly: Optional[bool] = None
+
+    @field_validator("index", "focus", "brightness", "contrast", mode="before")
+    @classmethod
+    def reject_bool_and_fraction(cls, value):
+        # JSON true must not become 1. A fractional value is not a camera step.
+        if isinstance(value, bool):
+            raise ValueError("Camera values must be whole numbers")
+        if isinstance(value, float) and not value.is_integer():
+            raise ValueError("Camera values must be whole numbers")
+        return value
+
 def _blank_erp():
     return {"name": "", "url": ""}
 
@@ -122,6 +145,7 @@ def _blank_bom_source():
         "detectRoi": None,
         # Empty means best.pt. A saved name is a file in vision/models.
         "model": "",
+        "camera": _blank_camera(),
     }
 
 def _read_json_dict(path):
@@ -264,6 +288,84 @@ def _apply_saved_model(config, saved):
         config["model"] = _clean_model_name(saved.get("model"))
     return config
 
+def _blank_camera():
+    return {
+        "index": 0,
+        "resolution": "",
+        "focus": None,
+        "brightness": None,
+        "contrast": None,
+    }
+
+def _clean_camera_index(raw):
+    # bool is an int in Python. JSON true must not become camera 1.
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, float) and not raw.is_integer():
+        return None
+    try:
+        index = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if index < 0 or index > MAX_CAMERA_INDEX:
+        return None
+    return index
+
+def _clean_resolution(raw):
+    if not isinstance(raw, str):
+        return ""
+    value = raw.strip().lower().replace("×", "x").replace(" ", "")
+    if value in CAMERA_RESOLUTIONS:
+        return value
+    return ""
+
+def _clean_camera_level(raw):
+    """A stored focus, brightness, or contrast step, or None when it is unset or invalid."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, float) and not raw.is_integer():
+        return None
+    try:
+        level = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if level < 0 or level > 100:
+        return None
+    return level
+
+def _stored_camera(raw):
+    camera = _blank_camera()
+    if not isinstance(raw, dict):
+        return camera
+    index = _clean_camera_index(raw.get("index"))
+    if index is not None:
+        camera["index"] = index
+    camera["resolution"] = _clean_resolution(raw.get("resolution"))
+    for field in ("focus", "brightness", "contrast"):
+        camera[field] = _clean_camera_level(raw.get(field))
+    return camera
+
+def _apply_saved_camera(config, saved):
+    if "camera" in saved:
+        config["camera"] = _stored_camera(saved.get("camera"))
+    return config
+
+def _camera_level_or_error(raw, label):
+    if raw is None:
+        return None, None
+    level = _clean_camera_level(raw)
+    if level is None:
+        return None, f"{label} must be a whole number from 0 to 100, or blank"
+    return level, None
+
+def _resolution_or_error(raw):
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return "", None
+    cleaned = _clean_resolution(raw)
+    if not cleaned:
+        return None, "Resolution must be 640x480, 1280x720, 1920x1080, or blank"
+    return cleaned, None
+
 def _clean_erp(name, url):
     name = " ".join((name or "").split())
     url = (url or "").strip()
@@ -350,7 +452,8 @@ def load_bom_source():
         _apply_saved_scan(config, saved)
         _apply_saved_test_mode(config, saved)
         _apply_saved_detect_roi(config, saved)
-        return _apply_saved_model(config, saved)
+        _apply_saved_model(config, saved)
+        return _apply_saved_camera(config, saved)
     if BOM_SOURCE_PATH.exists():
         saved = _read_json_dict(BOM_SOURCE_PATH)
         if saved is None:
@@ -361,7 +464,8 @@ def load_bom_source():
         _apply_saved_scan(config, saved)
         _apply_saved_test_mode(config, saved)
         _apply_saved_detect_roi(config, saved)
-        return _apply_saved_model(config, saved)
+        _apply_saved_model(config, saved)
+        return _apply_saved_camera(config, saved)
     return config
 
 def save_bom_source(config):
@@ -389,6 +493,7 @@ def save_bom_source(config):
         "testMode": config.get("testMode") is True,
         "detectRoi": _clean_detect_roi(config.get("detectRoi")),
         "model": _clean_model_name(config.get("model")),
+        "camera": _stored_camera(config.get("camera")),
     }
     CONFIG_LOCAL_PATH.write_text(
         json.dumps(stored, indent=2) + "\n",
@@ -445,6 +550,7 @@ def update_bom_source(body: BomSourceUpdate):
     config["testMode"] = existing.get("testMode") is True
     config["detectRoi"] = _clean_detect_roi(existing.get("detectRoi"))
     config["model"] = _clean_model_name(existing.get("model"))
+    config["camera"] = _stored_camera(existing.get("camera"))
     saved = save_bom_source(config)
     if body.source == "mssql":
         message = "Saved. Inspect queries MSSQL using vision/bom_queries.sql."
@@ -539,3 +645,66 @@ def update_detect_roi(body: DetectRoiUpdate):
     else:
         message = "Saved. Detection uses the full image."
     return {"status": "pass", "message": message, "roi": saved["detectRoi"]}
+
+def _camera_response(saved, message):
+    camera = saved.get("camera") or _blank_camera()
+    return {
+        "status": "pass",
+        "message": message,
+        "index": camera["index"],
+        "resolution": camera["resolution"],
+        "focus": camera["focus"],
+        "brightness": camera["brightness"],
+        "contrast": camera["contrast"],
+    }
+
+@router.get("/settings/camera")
+def get_camera():
+    camera = load_bom_source().get("camera") or _blank_camera()
+    return {
+        "index": camera["index"],
+        "resolution": camera["resolution"],
+        "focus": camera["focus"],
+        "brightness": camera["brightness"],
+        "contrast": camera["contrast"],
+    }
+
+@router.post("/settings/camera")
+def update_camera(body: CameraUpdate):
+    config = load_bom_source()
+    camera = _stored_camera(config.get("camera"))
+    sent = body.model_fields_set
+    if "index" in sent:
+        index = _clean_camera_index(body.index)
+        if index is None:
+            return {
+                "status": "fail",
+                "message": f"Camera index must be a whole number from 0 to {MAX_CAMERA_INDEX}",
+            }
+        camera["index"] = index
+    if "resolution" in sent:
+        resolution, error = _resolution_or_error(body.resolution)
+        if error:
+            return {"status": "fail", "message": error}
+        camera["resolution"] = resolution
+    for field, label in (
+        ("focus", "Focus"),
+        ("brightness", "Brightness"),
+        ("contrast", "Contrast"),
+    ):
+        if field not in sent:
+            continue
+        level, error = _camera_level_or_error(getattr(body, field), label)
+        if error:
+            return {"status": "fail", "message": error}
+        camera[field] = level
+    # Imported here so config can load without the camera stack.
+    from cameras import publish_camera_controls
+
+    if body.applyOnly is True:
+        publish_camera_controls(camera)
+        return _camera_response({"camera": camera}, "Applied.")
+    config["camera"] = camera
+    saved = save_bom_source(config)
+    publish_camera_controls(saved.get("camera") or {})
+    return _camera_response(saved, "Saved. The camera uses these image settings.")

@@ -20,5 +20,12 @@
 	"scanSeconds": 8,
 	"testMode": false,
 	"detectRoi": null,
-	"model": "best.pt"
+	"model": "best.pt",
+	"camera": {
+		"index": 0,
+		"resolution": "",
+		"focus": null,
+		"brightness": null,
+		"contrast": null
+	}
 }
