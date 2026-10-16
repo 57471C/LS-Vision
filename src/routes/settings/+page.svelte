@@ -1,6 +1,6 @@
 <script lang="ts">
 // biome-ignore-all lint/correctness/noUnusedVariables: Biome 2.4 does not treat Svelte template references as uses
-import { onMount } from "svelte";
+import { onDestroy, onMount } from "svelte";
 
 const DEV_PASSWORD = "admin";
 const UNLOCK_KEY = "ls-vision-settings-open";
@@ -63,6 +63,10 @@ let cameraNotice = "";
 let cameraListNotice = "";
 let previewNotice = "";
 let savingCamera = false;
+let killingSidecar = false;
+let sidecarUp = false;
+let sidecarNotice = "";
+let sidecarTimer: ReturnType<typeof setInterval> | null = null;
 
 const PREVIEW_LABEL = "camera-preview";
 const PREVIEW_CHANNEL = "ls-vision-camera-preview";
@@ -338,6 +342,7 @@ function unlock() {
 	unlocked = true;
 	sessionStorage.setItem(UNLOCK_KEY, "1");
 	loadSource();
+	watchSidecar();
 }
 
 function onAuthChange() {
@@ -352,7 +357,9 @@ function lock() {
 	password = "";
 	gateMessage = "";
 	mssqlPassword = "";
+	sidecarNotice = "";
 	sessionStorage.removeItem(UNLOCK_KEY);
+	stopSidecarWatch();
 }
 
 async function saveScan() {
@@ -639,6 +646,87 @@ function inTauri(): boolean {
 	return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
+function invokeError(err: unknown, fallback: string): string {
+	if (typeof err === "string" && err.trim()) return err;
+	return errorMessage(err, fallback);
+}
+
+async function refreshSidecar() {
+	if (killingSidecar) return;
+	try {
+		const res = await fetch("http://127.0.0.1:8008/health");
+		sidecarUp = res.ok;
+	} catch {
+		sidecarUp = false;
+	}
+}
+
+function watchSidecar() {
+	void refreshSidecar();
+	if (sidecarTimer !== null) return;
+	sidecarTimer = setInterval(() => {
+		void refreshSidecar();
+	}, 2000);
+}
+
+function stopSidecarWatch() {
+	if (sidecarTimer !== null) {
+		clearInterval(sidecarTimer);
+		sidecarTimer = null;
+	}
+	sidecarUp = false;
+}
+
+async function killSidecar() {
+	if (killingSidecar || !sidecarUp) return;
+	killingSidecar = true;
+	sidecarNotice = "";
+	let stopped = false;
+	try {
+		try {
+			const res = await fetch("http://127.0.0.1:8008/shutdown", {
+				method: "POST",
+			});
+			if (res.ok) stopped = true;
+		} catch {
+			// The process can close the socket before the response finishes.
+			stopped = true;
+		}
+		if (inTauri()) {
+			try {
+				const { invoke } = await import("@tauri-apps/api/core");
+				const message = await invoke<string>("kill_vision_sidecar");
+				if (
+					typeof message === "string" &&
+					message.toLowerCase().includes("stopped")
+				) {
+					stopped = true;
+				}
+			} catch (err: unknown) {
+				if (!stopped) {
+					sidecarNotice = invokeError(err, "Could not stop the vision sidecar");
+				}
+			}
+		}
+		sidecarUp = true;
+		for (let attempt = 0; attempt < 8; attempt += 1) {
+			await new Promise((resolve) => setTimeout(resolve, 200));
+			try {
+				const res = await fetch("http://127.0.0.1:8008/health");
+				sidecarUp = res.ok;
+			} catch {
+				sidecarUp = false;
+			}
+			if (!sidecarUp) break;
+		}
+		if (!sidecarUp) sidecarNotice = "Stopped vision sidecar.";
+		else if (!sidecarNotice)
+			sidecarNotice = "Could not stop the vision sidecar.";
+	} finally {
+		killingSidecar = false;
+	}
+}
+
 function postPreviewIndex(index: number) {
 	const channel = new BroadcastChannel(PREVIEW_CHANNEL);
 	channel.postMessage({ index });
@@ -706,6 +794,11 @@ onMount(() => {
 	if (!unlocked) return;
 	void loadSource();
 	if (section === "camera") void loadCameraSettings();
+	watchSidecar();
+});
+
+onDestroy(() => {
+	stopSidecarWatch();
 });
 </script>
 
@@ -725,6 +818,19 @@ onMount(() => {
 		</div>
 		<div class="flex items-center gap-2">
 			{#if unlocked}
+				{#if sidecarUp || killingSidecar}
+					<button
+						type="button"
+						class="inline-flex min-h-11 items-center border border-red-800 bg-red-600 px-4 text-sm font-semibold text-white disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
+						on:click={killSidecar}
+						disabled={killingSidecar}
+					>
+						{killingSidecar ? "Stopping..." : "Kill Vision Sidecar"}
+					</button>
+				{/if}
+				{#if sidecarNotice}
+					<p class="max-w-64 text-sm text-neutral-200">{sidecarNotice}</p>
+				{/if}
 				<button
 					type="button"
 					class="inline-flex min-h-11 items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100"
