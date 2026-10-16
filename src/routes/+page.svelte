@@ -1187,8 +1187,8 @@ function beginSidecarWait() {
 }
 
 async function startSidecar() {
-	if (sidecarStarting) return;
-	if (!sidecarUp) beginSidecarWait();
+	if (sidecarStarting || sidecarUp) return;
+	beginSidecarWait();
 	try {
 		const res = await invoke("start_vision_sidecar");
 		console.log(res);
@@ -1492,14 +1492,18 @@ async function decodeAndInspect() {
 			</a>
 			<button
 				type="button"
-				class="inline-flex min-h-11 min-w-44 items-center justify-center gap-2 border px-3 text-sm font-semibold {sidecarStarting
-					? 'cursor-wait border-amber-300 bg-amber-400 text-neutral-950'
+				class="inline-flex min-h-11 min-w-44 items-center justify-center gap-2 border px-3 text-sm font-semibold disabled:opacity-100 {sidecarStarting
+					? 'cursor-wait border-amber-300 bg-amber-400 text-neutral-950 disabled:cursor-wait'
 					: sidecarUp
-						? 'border-green-700 bg-green-600 text-white'
+						? 'cursor-default border-green-700 bg-green-600 text-white disabled:cursor-default'
 						: 'border-red-800 bg-red-600 text-white'}"
-				disabled={sidecarStarting}
+				disabled={sidecarStarting || sidecarUp}
 				aria-busy={sidecarStarting}
-				aria-label={sidecarStarting ? "Starting vision sidecar" : "Start Vision Sidecar"}
+				aria-label={sidecarStarting
+					? "Starting vision sidecar"
+					: sidecarUp
+						? "Vision sidecar running"
+						: "Start Vision Sidecar"}
 				on:click={startSidecar}
 			>
 				{#if sidecarStarting}
@@ -1517,6 +1521,8 @@ async function decodeAndInspect() {
 						></span>
 					</span>
 					<span class="font-mono tabular-nums">{sidecarSeconds}s</span>
+				{:else if sidecarUp}
+					Vision sidecar running
 				{:else}
 					Start Vision Sidecar
 				{/if}
