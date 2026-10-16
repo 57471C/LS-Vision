@@ -102,12 +102,14 @@ class DetectRoiUpdate(BaseModel):
 
 class CameraUpdate(BaseModel):
     # Fields left out of the body stay as they are. Settings sends every field.
-    # The operator page sends index only.
+    # The operator page sends index only. applyOnly updates the open camera
+    # without replacing the saved settings.
     index: Optional[int] = None
     resolution: Optional[str] = None
     focus: Optional[int] = None
     brightness: Optional[int] = None
     contrast: Optional[int] = None
+    applyOnly: Optional[bool] = None
 
     @field_validator("index", "focus", "brightness", "contrast", mode="before")
     @classmethod
@@ -491,8 +493,6 @@ def save_bom_source(config):
         "testMode": config.get("testMode") is True,
         "detectRoi": _clean_detect_roi(config.get("detectRoi")),
         "model": _clean_model_name(config.get("model")),
-        # Resolution, focus, brightness, and contrast are stored only.
-        # Nothing here is applied to the capture device.
         "camera": _stored_camera(config.get("camera")),
     }
     CONFIG_LOCAL_PATH.write_text(
@@ -671,7 +671,6 @@ def get_camera():
 
 @router.post("/settings/camera")
 def update_camera(body: CameraUpdate):
-    # Image controls are saved for later. This route does not touch the device.
     config = load_bom_source()
     camera = _stored_camera(config.get("camera"))
     sent = body.model_fields_set
@@ -699,6 +698,13 @@ def update_camera(body: CameraUpdate):
         if error:
             return {"status": "fail", "message": error}
         camera[field] = level
+    # Imported here so config can load without the camera stack.
+    from cameras import publish_camera_controls
+
+    if body.applyOnly is True:
+        publish_camera_controls(camera)
+        return _camera_response({"camera": camera}, "Applied.")
     config["camera"] = camera
     saved = save_bom_source(config)
-    return _camera_response(saved, "Saved. The operator page uses this camera.")
+    publish_camera_controls(saved.get("camera") or {})
+    return _camera_response(saved, "Saved. The camera uses these image settings.")

@@ -56,9 +56,23 @@ let savingModel = false;
 let cameraIndex = 0;
 let cameraChoices: number[] = [0];
 let cameraResolution = "";
-let cameraFocus: number | null = null;
-let cameraBrightness: number | null = null;
-let cameraContrast: number | null = null;
+let cameraFocus = 50;
+let cameraBrightness = 50;
+let cameraContrast = 50;
+let savedCamera = {
+	index: 0,
+	resolution: "",
+	focus: 50,
+	brightness: 50,
+	contrast: 50,
+};
+let focusText = "50";
+let brightnessText = "50";
+let contrastText = "50";
+let cameraApplyTimer: ReturnType<typeof setTimeout> | null = null;
+let cameraPushId = 0;
+// Posts stay in order. A slow live update must not land after Reset or Cancel.
+let cameraPostChain: Promise<void> = Promise.resolve();
 let cameraNotice = "";
 let cameraListNotice = "";
 let previewNotice = "";
@@ -342,6 +356,7 @@ function unlock() {
 	unlocked = true;
 	sessionStorage.setItem(UNLOCK_KEY, "1");
 	loadSource();
+	if (section === "camera") void loadCameraSettings();
 	watchSidecar();
 }
 
@@ -538,6 +553,217 @@ function levelValue(value: unknown): number | null {
 	return value;
 }
 
+function clampLevel(value: number): number {
+	const next = Math.round(Number(value));
+	if (!Number.isInteger(next)) return 50;
+	return Math.min(100, Math.max(0, next));
+}
+
+function nudgeLevel(value: number, delta: number): number {
+	return clampLevel(value + delta);
+}
+
+function rememberLevels() {
+	focusText = String(cameraFocus);
+	brightnessText = String(cameraBrightness);
+	contrastText = String(cameraContrast);
+}
+
+function wholeLevel(raw: string): number | null {
+	const text = raw.trim();
+	if (!/^\d{1,3}$/.test(text)) return null;
+	return Number(text);
+}
+
+function cancelCameraApply() {
+	if (cameraApplyTimer !== null) {
+		clearTimeout(cameraApplyTimer);
+		cameraApplyTimer = null;
+	}
+	cameraPushId += 1;
+}
+
+function scheduleCameraApply() {
+	cameraPushId += 1;
+	const id = cameraPushId;
+	if (cameraApplyTimer !== null) clearTimeout(cameraApplyTimer);
+	cameraApplyTimer = setTimeout(() => {
+		cameraApplyTimer = null;
+		void pushCameraSettings(id);
+	}, 200);
+}
+
+function previewDraft(
+	raw: string,
+	setText: (value: string) => void,
+	assign: (value: number) => void,
+) {
+	setText(raw);
+	const parsed = wholeLevel(raw);
+	if (parsed === null || parsed > 100) {
+		cancelCameraApply();
+		return;
+	}
+	assign(parsed);
+	scheduleCameraApply();
+}
+
+function commitDraft(
+	raw: string,
+	current: number,
+	assign: (value: number) => void,
+	setText: (value: string) => void,
+) {
+	const parsed = wholeLevel(raw);
+	if (parsed === null) {
+		setText(String(current));
+		return;
+	}
+	const next = clampLevel(parsed);
+	assign(next);
+	setText(String(next));
+	if (next !== current) scheduleCameraApply();
+}
+
+function stepLevel(
+	current: number,
+	delta: number,
+	assign: (value: number) => void,
+	setText: (value: string) => void,
+) {
+	const next = nudgeLevel(current, delta);
+	assign(next);
+	setText(String(next));
+	if (next !== current) scheduleCameraApply();
+}
+
+function slideLevel(
+	raw: string,
+	current: number,
+	assign: (value: number) => void,
+	setText: (value: string) => void,
+) {
+	const next = clampLevel(Number(raw));
+	assign(next);
+	setText(String(next));
+	if (next !== current) scheduleCameraApply();
+}
+
+function cameraSettingsBody() {
+	cameraFocus = clampLevel(cameraFocus);
+	cameraBrightness = clampLevel(cameraBrightness);
+	cameraContrast = clampLevel(cameraContrast);
+	return {
+		index: Number(cameraIndex),
+		resolution: cameraResolution,
+		focus: cameraFocus,
+		brightness: cameraBrightness,
+		contrast: cameraContrast,
+	};
+}
+
+async function postCameraSettings(applyOnly = false) {
+	const res = await fetch("http://127.0.0.1:8008/settings/camera", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({
+			...cameraSettingsBody(),
+			...(applyOnly ? { applyOnly: true } : {}),
+		}),
+	});
+	const data = await res.json().catch(() => ({}));
+	if (!res.ok || data.status === "fail") {
+		throw new Error(data.message || "Save failed");
+	}
+	return data;
+}
+
+function queueCameraPost(work: () => Promise<void>): Promise<void> {
+	const run = cameraPostChain.then(work, work);
+	cameraPostChain = run.then(
+		() => undefined,
+		() => undefined,
+	);
+	return run;
+}
+
+function pushCameraSettings(id: number) {
+	void queueCameraPost(async () => {
+		if (id !== cameraPushId) return;
+		try {
+			await postCameraSettings(true);
+		} catch (err: unknown) {
+			if (id !== cameraPushId) return;
+			cameraNotice = errorMessage(err, "Could not apply the camera settings");
+		}
+	});
+}
+
+function rememberSaved() {
+	savedCamera = {
+		index: Number(cameraIndex),
+		resolution: cameraResolution,
+		focus: cameraFocus,
+		brightness: cameraBrightness,
+		contrast: cameraContrast,
+	};
+}
+
+function showCamera(next: {
+	index: number;
+	resolution: string;
+	focus: number;
+	brightness: number;
+	contrast: number;
+}) {
+	cameraIndex = next.index;
+	cameraResolution = CAMERA_RESOLUTIONS.includes(next.resolution)
+		? next.resolution
+		: "";
+	cameraFocus = clampLevel(next.focus);
+	cameraBrightness = clampLevel(next.brightness);
+	cameraContrast = clampLevel(next.contrast);
+	rememberLevels();
+	if (!cameraChoices.includes(cameraIndex)) {
+		cameraChoices = [...cameraChoices, cameraIndex].sort(
+			(left, right) => left - right,
+		);
+	}
+}
+
+async function applyShownCamera(notice: string) {
+	cancelCameraApply();
+	postPreviewIndex(Number(cameraIndex));
+	const id = ++cameraPushId;
+	await queueCameraPost(async () => {
+		if (id !== cameraPushId) return;
+		try {
+			await postCameraSettings(true);
+			if (id !== cameraPushId) return;
+			cameraNotice = notice;
+		} catch (err: unknown) {
+			if (id !== cameraPushId) return;
+			cameraNotice = errorMessage(err, "Could not apply the camera settings");
+		}
+	});
+}
+
+function resetCamera() {
+	showCamera({
+		index: Number(cameraIndex),
+		resolution: "",
+		focus: 50,
+		brightness: 50,
+		contrast: 50,
+	});
+	void applyShownCamera("Reset to defaults.");
+}
+
+function cancelCameraEdits() {
+	showCamera(savedCamera);
+	void applyShownCamera("Restored the last saved settings.");
+}
+
 function applyCamera(data: {
 	index?: unknown;
 	resolution?: unknown;
@@ -549,20 +775,15 @@ function applyCamera(data: {
 	if (Number.isInteger(index) && index >= 0 && index <= 32) cameraIndex = index;
 	const resolution = typeof data.resolution === "string" ? data.resolution : "";
 	cameraResolution = CAMERA_RESOLUTIONS.includes(resolution) ? resolution : "";
-	cameraFocus = levelValue(data.focus);
-	cameraBrightness = levelValue(data.brightness);
-	cameraContrast = levelValue(data.contrast);
+	cameraFocus = levelValue(data.focus) ?? 50;
+	cameraBrightness = levelValue(data.brightness) ?? 50;
+	cameraContrast = levelValue(data.contrast) ?? 50;
+	rememberLevels();
 	if (!cameraChoices.includes(cameraIndex)) {
 		cameraChoices = [...cameraChoices, cameraIndex].sort(
 			(left, right) => left - right,
 		);
 	}
-}
-
-function readLevel(value: number | null): number | null | undefined {
-	if (value === null || Number.isNaN(value)) return null;
-	if (!Number.isInteger(value) || value < 0 || value > 100) return undefined;
-	return value;
 }
 
 async function loadCameraDevices() {
@@ -594,6 +815,7 @@ async function loadCameraSettings() {
 		const res = await fetch("http://127.0.0.1:8008/settings/camera");
 		if (!res.ok) throw new Error(await res.text());
 		applyCamera(await res.json());
+		rememberSaved();
 	} catch (err: unknown) {
 		cameraNotice = errorMessage(err, "Could not load the camera settings");
 	}
@@ -601,42 +823,31 @@ async function loadCameraSettings() {
 }
 
 async function saveCamera() {
-	const focus = readLevel(cameraFocus);
-	const brightness = readLevel(cameraBrightness);
-	const contrast = readLevel(cameraContrast);
-	if (
-		focus === undefined ||
-		brightness === undefined ||
-		contrast === undefined
-	) {
-		cameraNotice =
-			"Focus, brightness, and contrast are whole numbers from 0 to 100, or blank.";
-		return;
+	if (cameraApplyTimer !== null) {
+		clearTimeout(cameraApplyTimer);
+		cameraApplyTimer = null;
 	}
+	rememberLevels();
+	const id = ++cameraPushId;
 	savingCamera = true;
 	cameraNotice = "";
 	try {
-		const res = await fetch("http://127.0.0.1:8008/settings/camera", {
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({
-				index: Number(cameraIndex),
-				resolution: cameraResolution,
-				focus,
-				brightness,
-				contrast,
-			}),
+		await queueCameraPost(async () => {
+			if (id !== cameraPushId) return;
+			const data = await postCameraSettings();
+			if (id !== cameraPushId) return;
+			applyCamera(data);
+			rememberSaved();
+			cameraIndex = Number(cameraIndex);
+			cameraNotice =
+				typeof data.message === "string" && data.message
+					? data.message
+					: "Saved";
 		});
-		const data = await res.json().catch(() => ({}));
-		if (!res.ok || data.status === "fail") {
-			throw new Error(data.message || "Save failed");
-		}
-		applyCamera(data);
-		cameraIndex = Number(cameraIndex);
-		cameraNotice =
-			typeof data.message === "string" && data.message ? data.message : "Saved";
 	} catch (err: unknown) {
-		cameraNotice = errorMessage(err, "Could not save the camera");
+		if (id === cameraPushId) {
+			cameraNotice = errorMessage(err, "Could not save the camera");
+		}
 	} finally {
 		savingCamera = false;
 	}
@@ -799,6 +1010,7 @@ onMount(() => {
 
 onDestroy(() => {
 	stopSidecarWatch();
+	cancelCameraApply();
 });
 </script>
 
@@ -1017,6 +1229,7 @@ onDestroy(() => {
 									<select
 										class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
 										bind:value={cameraResolution}
+										on:change={scheduleCameraApply}
 									>
 										<option value="">Not set</option>
 										<option value="640x480">640×480</option>
@@ -1024,46 +1237,121 @@ onDestroy(() => {
 										<option value="1920x1080">1920×1080</option>
 									</select>
 								</label>
-								<div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
-									<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
-										Focus
+								<div class="divide-y divide-neutral-800 border-y border-neutral-800">
+									<div class="flex items-center gap-3 py-1">
+										<span class="flex w-36 shrink-0 items-center gap-2 text-sm font-medium normal-case tracking-normal text-neutral-100">
+											<svg viewBox="0 0 24 24" class="h-5 w-5 shrink-0" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+												<circle cx="12" cy="12" r="3" />
+												<circle cx="12" cy="12" r="7.5" />
+											</svg>
+											Focus
+										</span>
+										<button type="button" class="inline-flex h-11 w-8 shrink-0 items-center justify-center text-lg text-neutral-300 hover:text-white" aria-label="Decrease focus" on:click={() => stepLevel(cameraFocus, -1, (value) => (cameraFocus = value), (value) => (focusText = value))}>−</button>
 										<input
-											type="number"
-											class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
-											bind:value={cameraFocus}
+											type="range"
+											class="camera-slider min-w-0 flex-1"
 											min="0"
 											max="100"
 											step="1"
-											inputmode="numeric"
+											value={cameraFocus}
+											style="--fill: {cameraFocus}%"
+											aria-label="Focus"
+											on:input={(event) => slideLevel(event.currentTarget.value, cameraFocus, (value) => (cameraFocus = value), (value) => (focusText = value))}
 										/>
-									</label>
-									<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
-										Brightness
+										<button type="button" class="inline-flex h-11 w-8 shrink-0 items-center justify-center text-lg text-neutral-300 hover:text-white" aria-label="Increase focus" on:click={() => stepLevel(cameraFocus, 1, (value) => (cameraFocus = value), (value) => (focusText = value))}>+</button>
 										<input
-											type="number"
-											class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
-											bind:value={cameraBrightness}
+											type="text"
+											inputmode="numeric"
+											maxlength="3"
+											class="h-9 w-14 shrink-0 border border-neutral-600 bg-neutral-950 text-center font-mono text-sm text-neutral-100"
+											aria-label="Focus value"
+											value={focusText}
+											on:input={(event) => previewDraft(event.currentTarget.value, (value) => (focusText = value), (value) => (cameraFocus = value))}
+											on:blur={() => commitDraft(focusText, cameraFocus, (value) => (cameraFocus = value), (value) => (focusText = value))}
+											on:keydown={(event) => {
+												if (event.key !== "Enter") return;
+												event.preventDefault();
+												commitDraft(focusText, cameraFocus, (value) => (cameraFocus = value), (value) => (focusText = value));
+											}}
+										/>
+									</div>
+									<div class="flex items-center gap-3 py-1">
+										<span class="flex w-36 shrink-0 items-center gap-2 text-sm font-medium normal-case tracking-normal text-neutral-100">
+											<svg viewBox="0 0 24 24" class="h-5 w-5 shrink-0" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+												<circle cx="12" cy="12" r="3.5" />
+												<path d="M12 3v2.5M12 18.5V21M4.9 4.9l1.8 1.8M17.3 17.3l1.8 1.8M3 12h2.5M18.5 12H21M4.9 19.1l1.8-1.8M17.3 6.7l1.8-1.8" />
+											</svg>
+											Brightness
+										</span>
+										<button type="button" class="inline-flex h-11 w-8 shrink-0 items-center justify-center text-lg text-neutral-300 hover:text-white" aria-label="Decrease brightness" on:click={() => stepLevel(cameraBrightness, -1, (value) => (cameraBrightness = value), (value) => (brightnessText = value))}>−</button>
+										<input
+											type="range"
+											class="camera-slider min-w-0 flex-1"
 											min="0"
 											max="100"
 											step="1"
-											inputmode="numeric"
+											value={cameraBrightness}
+											style="--fill: {cameraBrightness}%"
+											aria-label="Brightness"
+											on:input={(event) => slideLevel(event.currentTarget.value, cameraBrightness, (value) => (cameraBrightness = value), (value) => (brightnessText = value))}
 										/>
-									</label>
-									<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
-										Contrast
+										<button type="button" class="inline-flex h-11 w-8 shrink-0 items-center justify-center text-lg text-neutral-300 hover:text-white" aria-label="Increase brightness" on:click={() => stepLevel(cameraBrightness, 1, (value) => (cameraBrightness = value), (value) => (brightnessText = value))}>+</button>
 										<input
-											type="number"
-											class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
-											bind:value={cameraContrast}
+											type="text"
+											inputmode="numeric"
+											maxlength="3"
+											class="h-9 w-14 shrink-0 border border-neutral-600 bg-neutral-950 text-center font-mono text-sm text-neutral-100"
+											aria-label="Brightness value"
+											value={brightnessText}
+											on:input={(event) => previewDraft(event.currentTarget.value, (value) => (brightnessText = value), (value) => (cameraBrightness = value))}
+											on:blur={() => commitDraft(brightnessText, cameraBrightness, (value) => (cameraBrightness = value), (value) => (brightnessText = value))}
+											on:keydown={(event) => {
+												if (event.key !== "Enter") return;
+												event.preventDefault();
+												commitDraft(brightnessText, cameraBrightness, (value) => (cameraBrightness = value), (value) => (brightnessText = value));
+											}}
+										/>
+									</div>
+									<div class="flex items-center gap-3 py-1">
+										<span class="flex w-36 shrink-0 items-center gap-2 text-sm font-medium normal-case tracking-normal text-neutral-100">
+											<svg viewBox="0 0 24 24" class="h-5 w-5 shrink-0" aria-hidden="true">
+												<circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" stroke-width="2" />
+												<path d="M12 4a8 8 0 0 0 0 16z" fill="currentColor" />
+											</svg>
+											Contrast
+										</span>
+										<button type="button" class="inline-flex h-11 w-8 shrink-0 items-center justify-center text-lg text-neutral-300 hover:text-white" aria-label="Decrease contrast" on:click={() => stepLevel(cameraContrast, -1, (value) => (cameraContrast = value), (value) => (contrastText = value))}>−</button>
+										<input
+											type="range"
+											class="camera-slider min-w-0 flex-1"
 											min="0"
 											max="100"
 											step="1"
-											inputmode="numeric"
+											value={cameraContrast}
+											style="--fill: {cameraContrast}%"
+											aria-label="Contrast"
+											on:input={(event) => slideLevel(event.currentTarget.value, cameraContrast, (value) => (cameraContrast = value), (value) => (contrastText = value))}
 										/>
-									</label>
+										<button type="button" class="inline-flex h-11 w-8 shrink-0 items-center justify-center text-lg text-neutral-300 hover:text-white" aria-label="Increase contrast" on:click={() => stepLevel(cameraContrast, 1, (value) => (cameraContrast = value), (value) => (contrastText = value))}>+</button>
+										<input
+											type="text"
+											inputmode="numeric"
+											maxlength="3"
+											class="h-9 w-14 shrink-0 border border-neutral-600 bg-neutral-950 text-center font-mono text-sm text-neutral-100"
+											aria-label="Contrast value"
+											value={contrastText}
+											on:input={(event) => previewDraft(event.currentTarget.value, (value) => (contrastText = value), (value) => (cameraContrast = value))}
+											on:blur={() => commitDraft(contrastText, cameraContrast, (value) => (cameraContrast = value), (value) => (contrastText = value))}
+											on:keydown={(event) => {
+												if (event.key !== "Enter") return;
+												event.preventDefault();
+												commitDraft(contrastText, cameraContrast, (value) => (cameraContrast = value), (value) => (contrastText = value));
+											}}
+										/>
+									</div>
 								</div>
 								<p class="text-sm text-neutral-400">
-									Resolution, focus, brightness, and contrast are saved with the camera. They are not sent to the device yet. Leave a number blank to clear it.
+									Resolution, focus, brightness, and contrast are sent to this camera. Reset returns the defaults. Cancel returns the last saved settings.
 								</p>
 							</fieldset>
 							<div class="flex flex-wrap items-center gap-2">
@@ -1073,6 +1361,22 @@ onDestroy(() => {
 									disabled={savingCamera}
 								>
 									{savingCamera ? "Saving..." : "Save"}
+								</button>
+								<button
+									type="button"
+									class="inline-flex min-h-11 items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100 disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
+									on:click={resetCamera}
+									disabled={savingCamera}
+								>
+									Reset
+								</button>
+								<button
+									type="button"
+									class="inline-flex min-h-11 items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100 disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
+									on:click={cancelCameraEdits}
+									disabled={savingCamera}
+								>
+									Cancel
 								</button>
 								<button
 									type="button"
@@ -1564,5 +1868,56 @@ onDestroy(() => {
 
 	.settings-scroll::-webkit-scrollbar-corner {
 		background: #171717;
+	}
+
+	.camera-slider {
+		-webkit-appearance: none;
+		appearance: none;
+		height: 18px;
+		background: transparent;
+		cursor: pointer;
+	}
+
+	.camera-slider::-webkit-slider-runnable-track {
+		height: 4px;
+		border-radius: 999px;
+		background: linear-gradient(to right, #3b82f6 var(--fill), #d4d4d4 var(--fill));
+	}
+
+	.camera-slider::-webkit-slider-thumb {
+		-webkit-appearance: none;
+		appearance: none;
+		width: 16px;
+		height: 16px;
+		margin-top: -6px;
+		border: 2px solid #f5f5f5;
+		border-radius: 999px;
+		background: #3b82f6;
+	}
+
+	.camera-slider:focus-visible::-webkit-slider-thumb {
+		outline: 2px solid #93c5fd;
+		outline-offset: 2px;
+	}
+
+	.camera-slider::-moz-range-track {
+		height: 4px;
+		border: none;
+		border-radius: 999px;
+		background: #d4d4d4;
+	}
+
+	.camera-slider::-moz-range-progress {
+		height: 4px;
+		border-radius: 999px;
+		background: #3b82f6;
+	}
+
+	.camera-slider::-moz-range-thumb {
+		width: 16px;
+		height: 16px;
+		border: 2px solid #f5f5f5;
+		border-radius: 999px;
+		background: #3b82f6;
 	}
 </style>
