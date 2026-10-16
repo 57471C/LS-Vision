@@ -21,6 +21,7 @@ type WatchBody = InspectView & {
 	snapshot?: boolean;
 	barcode?: string;
 	image?: string;
+	jobCardNumber?: string;
 };
 
 type SnapshotView = {
@@ -97,6 +98,15 @@ let result: InspectView | null = null;
 let bom: BomView | null = null;
 let loading = false;
 let cameraIndex = 0;
+let cameraIndexes: number[] = [];
+let camerasReady = false;
+let cameraLookupFailed = false;
+let camerasPromise: Promise<boolean> | null = null;
+// The live view reads these names so it updates when the camera list arrives.
+$: camerasMissing = camerasReady && cameraIndexes.length === 0;
+$: cameraFeedOn =
+	(camerasReady && cameraIndexes.includes(Number(cameraIndex))) ||
+	(cameraLookupFailed && !camerasReady);
 let feedOn = true;
 let snapshot: SnapshotView | null = null;
 let detections: Detection[] = [];
@@ -158,12 +168,13 @@ function stopWatch() {
 }
 
 function startWatch() {
-	if (snapshot) return;
+	// A dead sidecar uses the same paused countdown as Stop feed.
+	if (snapshot || camerasMissing || !sidecarUp || !feedOn) return;
 	stopWatch();
 	streamLeft = streamMs / 1000;
 	void watchFeed();
 	streamTimer = setInterval(() => {
-		if (!feedOn || snapshot) return;
+		if (!feedOn || snapshot || !sidecarUp) return;
 		if (streamLeft <= 1) {
 			streamLeft = streamMs / 1000;
 			void watchFeed();
@@ -181,6 +192,7 @@ function clearStreamRetry() {
 }
 
 function showLiveFeed() {
+	if (camerasMissing) return;
 	clearStreamRetry();
 	streamRetries = 0;
 	// Changing the img src aborts the previous request and fires its error.
@@ -456,7 +468,13 @@ function inspectView(body: WatchBody): InspectView {
 async function showSnapshot(body: WatchBody) {
 	if (!body.image) return;
 	const kitCode = body.kitCode || body.barcode || barcode;
-	barcode = kitCode;
+	// API keeps the decoded job card in the field. The still is labelled with the kit.
+	if (bomSource === "api") {
+		const card = body.jobCardNumber || body.barcode;
+		if (card) barcode = card;
+	} else {
+		barcode = kitCode;
+	}
 	result = inspectView(body);
 	storeBom(result);
 	const generation = holdStill(body.image, kitCode);
@@ -465,19 +483,17 @@ async function showSnapshot(body: WatchBody) {
 
 async function watchFeed() {
 	if (!feedOn || snapshot || watchInFlight || loading) return;
+	// Wait for the camera list. A snapshot open before that would grab index 0
+	// and make the probe fight the reader.
+	if (!cameraFeedOn) return;
 	watchInFlight = true;
 	const index = cameraIndex;
 	try {
-		// Wait until the saved source is known. API lookup does not decode.
+		// Test mode is decided with the saved source. The sidecar skips decode
+		// for that mode and still logs the path. Every other source decodes.
 		await ensureBomSource();
-		if (
-			!pageAlive ||
-			bomSource === "api" ||
-			!feedOn ||
-			snapshot ||
-			loading ||
-			index !== cameraIndex
-		) {
+		await loadTestMode();
+		if (!pageAlive || !feedOn || snapshot || loading || index !== cameraIndex) {
 			return;
 		}
 		const res = await fetch(
@@ -490,6 +506,7 @@ async function watchFeed() {
 			loading ||
 			!feedOn ||
 			snapshot ||
+			testMode ||
 			index !== cameraIndex ||
 			!body.snapshot ||
 			!body.image
@@ -540,6 +557,85 @@ async function loadErp() {
 	}
 }
 
+function cameraList(value: unknown): number[] {
+	if (!Array.isArray(value)) return [];
+	const found: number[] = [];
+	for (const item of value) {
+		if (typeof item !== "number" || !Number.isInteger(item) || item < 0)
+			continue;
+		if (!found.includes(item)) found.push(item);
+	}
+	found.sort((left, right) => left - right);
+	return found;
+}
+
+function noteCameraLookupFailed() {
+	// A later missed read must not clear a list that is already on screen.
+	if (camerasReady) return;
+	cameraLookupFailed = true;
+}
+
+async function loadCamerasOnce(): Promise<boolean> {
+	const selected = Number(cameraIndex);
+	try {
+		const res = await fetch(
+			`http://127.0.0.1:8008/cameras?selected=${selected}`,
+		);
+		if (!pageAlive) return false;
+		if (!res.ok) {
+			noteCameraLookupFailed();
+			return false;
+		}
+		const data = (await res.json()) as { cameras?: unknown };
+		if (!pageAlive) return false;
+		const found = cameraList(data.cameras);
+		const current = Number(cameraIndex);
+		// They picked another index while the probe was running. Keep it.
+		if (
+			current !== selected &&
+			Number.isInteger(current) &&
+			current >= 0 &&
+			!found.includes(current)
+		) {
+			cameraIndexes = cameraList([...found, current]);
+			camerasReady = true;
+			cameraLookupFailed = false;
+			return true;
+		}
+		cameraIndexes = found;
+		camerasReady = true;
+		cameraLookupFailed = false;
+		if (current === selected && found.length > 0 && !found.includes(selected)) {
+			cameraIndex = found[0];
+		}
+		return true;
+	} catch {
+		if (pageAlive) noteCameraLookupFailed();
+		return false;
+	}
+}
+
+function loadCameras(): Promise<boolean> {
+	if (!camerasPromise) {
+		camerasPromise = loadCamerasOnce().finally(() => {
+			camerasPromise = null;
+		});
+	}
+	return camerasPromise;
+}
+
+async function connectCameras() {
+	await loadCameras();
+	if (!pageAlive || snapshot || !feedOn) return;
+	if (camerasMissing) {
+		stopWatch();
+		clearStreamRetry();
+		return;
+	}
+	if (!cameraFeedOn) return;
+	showLiveFeed();
+}
+
 async function checkSidecar() {
 	if (!pageAlive) return;
 	const wasUp = sidecarUp;
@@ -550,14 +646,18 @@ async function checkSidecar() {
 		sidecarUp = false;
 	}
 	if (sidecarUp) stopSidecarWait();
+	else {
+		stopWatch();
+		clearStreamRetry();
+	}
 	if (pageAlive && sidecarUp && !wasUp) {
 		void loadErp();
 		void loadScan();
 		void loadTestMode();
 		void loadDetectRoi();
 		void loadBomSource();
-if (feedOn && !snapshot) showLiveFeed();
-void loadModel();
+		void loadModel();
+		void connectCameras();
 	}
 }
 
@@ -622,6 +722,7 @@ function asRoi(value: unknown): DetectRoi | null {
 function readAdminFlag() {
 	admin = sessionStorage.getItem(ADMIN_FLAG) === "1";
 	void loadBomSource();
+	void loadTestMode();
 	if (sidecarUp) void loadModel();
 }
 
@@ -640,6 +741,7 @@ async function loadModel() {
 function rememberPaneSize() {
 	paneWidth = paneImage?.naturalWidth ?? 0;
 	paneHeight = paneImage?.naturalHeight ?? 0;
+	measureFrame();
 }
 
 function measureFrame() {
@@ -647,7 +749,14 @@ function measureFrame() {
 	frameHeight = paneFrame?.clientHeight ?? 0;
 }
 
-function zoomFrame(): {
+function zoomFrame(
+	drawing: boolean,
+	detectRoi: DetectRoi | null,
+	paneWidth: number,
+	paneHeight: number,
+	frameWidth: number,
+	frameHeight: number,
+): {
 	left: number;
 	top: number;
 	width: number;
@@ -670,6 +779,17 @@ function zoomFrame(): {
 		height: paneHeight * scale,
 	};
 }
+
+// The still reads this value. {@const zoom = zoomFrame()} is compiled with
+// untrack, so it kept the first result and a saved region never zoomed.
+$: zoom = zoomFrame(
+	drawing,
+	detectRoi,
+	paneWidth,
+	paneHeight,
+	frameWidth,
+	frameHeight,
+);
 
 function showDraft(box: DetectRoi) {
 	const img = paneImage;
@@ -983,7 +1103,6 @@ onMount(() => {
 	healthTimer = setInterval(() => {
 		void checkSidecar();
 	}, 3000);
-	if (feedOn) startWatch();
 });
 
 onDestroy(() => {
@@ -1221,8 +1340,14 @@ async function runInspect() {
 }
 
 async function decodeAndInspect() {
-	if (bomSource === "api") {
-		await runApiLookup();
+	if (loading) return;
+	await ensureBomSource();
+	await loadTestMode();
+	if (!pageAlive) return;
+	// Test mode never reads the camera. The typed code selects the kit, then
+	// the page asks for an image file. SQL/JSON and API keep their own lookup.
+	if (testMode) {
+		await runInspect();
 		return;
 	}
 	loading = true;
@@ -1276,21 +1401,28 @@ async function decodeAndInspect() {
 		</div>
 		<div class="flex flex-wrap items-center gap-2">
 			<p
-				class="inline-flex min-h-9 items-center gap-2 border px-2.5 text-xs font-semibold uppercase tracking-wide {snapshot
+				class="inline-flex min-h-9 items-center gap-2 border px-2.5 text-xs font-semibold uppercase tracking-wide {snapshot ||
+				(sidecarUp && camerasMissing)
 					? 'border-amber-700/80 bg-amber-950 text-amber-200'
-					: feedOn
+					: feedOn && sidecarUp && cameraFeedOn
 						? 'border-neutral-600 bg-neutral-800 text-neutral-100'
 						: 'border-neutral-700 bg-neutral-900 text-neutral-400'}"
 			>
 				<span
-					class="h-2 w-2 shrink-0 {snapshot
+					class="h-2 w-2 shrink-0 {snapshot || (sidecarUp && camerasMissing)
 						? 'bg-amber-400'
-						: feedOn
+						: feedOn && sidecarUp && cameraFeedOn
 							? 'bg-green-400'
 							: 'bg-neutral-500'}"
 					aria-hidden="true"
 				></span>
-				{snapshot ? "Stream stopped" : feedOn ? `Streaming · ${streamLeft}s` : "Stream paused"}
+				{snapshot
+					? "Stream stopped"
+					: sidecarUp && camerasMissing
+						? "No cameras found"
+						: feedOn && sidecarUp && cameraFeedOn
+							? `Streaming · ${streamLeft}s`
+							: "Stream paused"}
 			</p>
 			<a
 				href="/settings"
@@ -1364,8 +1496,15 @@ async function decodeAndInspect() {
 				class="min-h-11 border border-neutral-600 bg-neutral-950 px-3 font-mono text-base normal-case tracking-normal text-neutral-100"
 				bind:value={cameraIndex}
 			>
-				<option value={0}>0</option>
-				<option value={1}>1</option>
+				{#if camerasMissing}
+					<option value={cameraIndex}>No cameras found</option>
+				{:else if cameraIndexes.length > 0}
+					{#each cameraIndexes as index (index)}
+						<option value={index}>{index}</option>
+					{/each}
+				{:else}
+					<option value={cameraIndex}>{cameraIndex}</option>
+				{/if}
 			</select>
 		</label>
 		<button
@@ -1374,7 +1513,7 @@ async function decodeAndInspect() {
 			on:click={decodeAndInspect}
 			disabled={loading}
 		>
-			{bomSource === "api" ? "Look up" : "Decode QR / Barcode"}
+			{testMode ? "Use typed code" : "Decode QR / Barcode"}
 		</button>
 		<button
 			type="button"
@@ -1445,8 +1584,7 @@ async function decodeAndInspect() {
 						<p class="font-mono text-sm tabular-nums">Starting sidecar · {sidecarSeconds}s</p>
 					</div>
 				{/if}
-				{#if snapshot || feedOn}
-					{@const zoom = zoomFrame()}
+				{#if snapshot || (feedOn && cameraFeedOn)}
 					<div
 						class="absolute {zoom ? '' : 'inset-0'}"
 						style={zoom
@@ -1463,7 +1601,7 @@ async function decodeAndInspect() {
 								class="h-full w-full {zoom ? 'object-fill' : 'object-contain'}"
 								on:load={rememberPaneSize}
 							/>
-						{:else}
+						{:else if cameraFeedOn}
 							<img
 								bind:this={paneImage}
 								src="http://127.0.0.1:8008/camera/stream?index={cameraIndex}&feed={streamEpoch}"
@@ -1473,7 +1611,7 @@ async function decodeAndInspect() {
 								on:error={retryStream}
 							/>
 						{/if}
-						{#if paneWidth > 0 && paneHeight > 0 && !drawing && detectRoi}
+						{#if (snapshot || cameraFeedOn) && paneWidth > 0 && paneHeight > 0 && !drawing && detectRoi}
 							{@const x = detectRoi.x * paneWidth}
 							{@const y = detectRoi.y * paneHeight}
 							{@const w = detectRoi.w * paneWidth}
@@ -1560,7 +1698,18 @@ async function decodeAndInspect() {
 							{/if}
 						{/if}
 					</div>
-				{:else}
+				{:else if feedOn && camerasMissing}
+					<div
+						class="absolute inset-0 flex items-center justify-center px-6 text-center text-lg font-semibold text-amber-200"
+						role="status"
+					>
+						No cameras found
+					</div>
+				{:else if feedOn && sidecarUp && !sidecarStarting}
+					<div class="absolute inset-0 flex items-center justify-center text-lg text-neutral-400">
+						Looking for cameras...
+					</div>
+				{:else if !feedOn}
 					<div class="absolute inset-0 flex items-center justify-center text-lg text-neutral-500">
 						Feed stopped
 					</div>
@@ -1739,9 +1888,13 @@ async function decodeAndInspect() {
 				<div class="px-4 py-8">
 					<p class="text-lg font-medium text-neutral-300">No result yet</p>
 					<p class="mt-1 text-sm text-neutral-500">
-						{bomSource === "api"
-							? "Enter a job card number and press Enter."
-							: "Decode a barcode or press Enter."}
+						{testMode
+							? bomSource === "api"
+								? "Type a job card number, then choose an image."
+								: "Type a barcode, then choose an image."
+							: bomSource === "api"
+								? "A decoded barcode is used as the job card number."
+								: "Decode a barcode or press Enter."}
 					</p>
 				</div>
 			{/if}

@@ -197,6 +197,10 @@ _frames_published = 0
 _OPEN_RETRY_SECONDS = 0.3
 _SWITCH_SETTLE_SECONDS = 0.2
 _FRAME_WAIT_SECONDS = 5.0
+# Bench cameras use DirectShow indexes 0 through 5. Three misses in a row
+# means the higher indexes are empty too, so the scan stops there.
+_CAMERA_PROBE_LAST = 5
+_CAMERA_PROBE_MISS_LIMIT = 3
 # Last raw frame a snapshot held. POST /detect uses it when
 # the request does not include an image.
 _latest_snapshot = None
@@ -1056,6 +1060,8 @@ def _inspect_api(job_card, source):
         return _inspect_fail(job_card, error)
     result = _inspect_pass(kit_ic, job)
     result["data"] = data
+    # The pass payload's barcode is the kit IC. Keep the number that was looked up.
+    result["jobCardNumber"] = _as_text(job_card)
     return result
 
 def load_bom():
@@ -1115,16 +1121,71 @@ def _open_capture(index):
             time.sleep(_OPEN_RETRY_SECONDS)
     return None, last_error
 
-def _open_camera(index):
+def _active_reader_index():
+    # The reader thread owns this index, including while the first open is
+    # still in progress. A second VideoCapture on it fails and drops the feed.
+    with _capture_lock:
+        thread = _capture_thread
+        target = _capture_target
+        alive = thread is not None and thread.is_alive()
+    if not alive or target is None:
+        return None
+    try:
+        return int(target)
+    except (TypeError, ValueError):
+        return None
+
+def _camera_opens(index):
+    # One DirectShow open, the same backend the reader uses. There is no MSMF
+    # fallback; that backend stays black for one of the bench cameras.
     cap = cv2.VideoCapture()
-    if hasattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC"):
-        cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 2000)
-    if not cap.open(index, cv2.CAP_DSHOW):
-        log.warning("camera %s probe CAP_DSHOW did not open; trying the default backend", index)
-        cap.open(index)
-    if not cap.isOpened():
-        log.warning("camera %s probe did not open", index)
-    return cap
+    opened = False
+    try:
+        if hasattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC"):
+            cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 2000)
+        cap.open(int(index), cv2.CAP_DSHOW)
+        opened = bool(cap.isOpened())
+    except Exception:
+        log.exception("camera %s probe failed", index)
+        return False
+    finally:
+        _release_cap(cap)
+    if opened:
+        log.info("camera %s probe opened", index)
+    else:
+        log.info("camera %s probe did not open", index)
+    return opened
+
+def _discover_camera_indices(opens, held=None, selected=None):
+    # `opens(index)` probes one index. `held` is not probed. `selected` is the
+    # operator's current index; if the miss streak stops the scan before it,
+    # that index is still probed so a working choice stays in the list.
+    available = []
+    misses = 0
+    visited = set()
+    for index in range(_CAMERA_PROBE_LAST + 1):
+        visited.add(index)
+        if held is not None and index == held:
+            available.append(index)
+            misses = 0
+            continue
+        if opens(index):
+            available.append(index)
+            misses = 0
+        else:
+            misses += 1
+            if misses >= _CAMERA_PROBE_MISS_LIMIT:
+                break
+    if held is not None and held not in available:
+        available.append(held)
+    if (
+        selected is not None
+        and selected not in available
+        and selected not in visited
+        and opens(selected)
+    ):
+        available.append(selected)
+    return sorted(set(available))
 
 def _stop_reader_locked():
     global _capture_thread, _capture_target, camera, _camera_index, _latest_frame, _frames_published
@@ -1343,20 +1404,85 @@ def _clean_code(text):
         return text[:-1]
     return text
 
-def _decode(image):
-    if pyzbar is None:
-        return []
-    codes = []
-    for barcode in pyzbar.decode(image):
+def _pyzbar_for_decode():
+    # cv2 prepends its bin directory on import, and anything loaded later can
+    # do the same. Restore the bundled barcode DLLs before every decode.
+    global pyzbar, _PYZBAR_ERROR
+    _prefer_bundled_dlls()
+    if pyzbar is not None:
+        return pyzbar
+    try:
+        from pyzbar import pyzbar as loaded
+    except OSError as exc:
+        pyzbar = None
+        _PYZBAR_ERROR = str(exc)
+        log.error("pyzbar failed to load: %s", _PYZBAR_ERROR)
+        return None
+    pyzbar = loaded
+    _PYZBAR_ERROR = None
+    log.info("pyzbar loaded")
+    return pyzbar
+
+def _collect_codes(decoded, origin_x=0, origin_y=0):
+    results = []
+    for obj in decoded:
         try:
-            text = barcode.data.decode("utf-8")
+            text = obj.data.decode("utf-8")
         except UnicodeDecodeError:
-            text = barcode.data.decode("latin-1", errors="replace")
-        codes.append({
+            text = obj.data.decode("latin-1", errors="replace")
+        results.append({
+            "type": obj.type,
             "data": _clean_code(text),
-            "type": barcode.type,
+            "rect": {
+                "x": obj.rect.left + origin_x,
+                "y": obj.rect.top + origin_y,
+                "w": obj.rect.width,
+                "h": obj.rect.height,
+            },
         })
-    return codes
+    return results
+
+def _log_decoded(codes):
+    if codes:
+        log.info(
+            "barcode decoded %s",
+            ", ".join(f"{item['type']} {item['data']}" for item in codes),
+        )
+        return
+    log.info("barcode decode found no code")
+
+def _scan_image(image, origin_x=0, origin_y=0):
+    # pyzbar keeps only channel 0 of a colour array. A black label is still
+    # visible there, but a mark that is dark in luminance and bright in blue
+    # is not. Try grayscale first, then the original image.
+    loaded = _pyzbar_for_decode()
+    if loaded is None:
+        return None
+    views = []
+    shape = getattr(image, "shape", ())
+    if len(shape) == 3 and shape[2] >= 3:
+        views.append(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY))
+    views.append(image)
+    last_error = None
+    for view in views:
+        try:
+            found = _collect_codes(loaded.decode(view), origin_x, origin_y)
+        except Exception as exc:
+            last_error = exc
+            continue
+        if found:
+            return found
+    if last_error is not None:
+        raise last_error
+    return []
+
+def _decode(image):
+    found = _scan_image(image)
+    if found is None:
+        log.warning("barcode decode failed: %s", _pyzbar_load_error())
+        return []
+    _log_decoded(found)
+    return [{"data": item["data"], "type": item["type"]} for item in found]
 
 def _pyzbar_load_error():
     return (
@@ -1442,24 +1568,12 @@ def iter_camera_stream(index):
         log.info("camera %s stream closed", index)
 
 def _codes_from_frame(frame):
-    decoded = pyzbar.decode(frame)
-    results = []
-    for obj in decoded:
-        try:
-            text = obj.data.decode("utf-8")
-        except UnicodeDecodeError:
-            text = obj.data.decode("latin-1", errors="replace")
-        results.append({
-            "type": obj.type,
-            "data": _clean_code(text),
-            "rect": {
-                "x": obj.rect.left,
-                "y": obj.rect.top,
-                "w": obj.rect.width,
-                "h": obj.rect.height,
-            },
-        })
-    return results
+    found = _scan_image(frame)
+    if found is None:
+        log.warning("barcode decode failed: %s", _pyzbar_load_error())
+        return []
+    _log_decoded(found)
+    return found
 
 @app.get("/health")
 def health():
@@ -1485,7 +1599,8 @@ def _camera_decode(index):
     if frame is None:
         return {"status": "fail", "message": error or "No frame"}
 
-    if pyzbar is None:
+    if _pyzbar_for_decode() is None:
+        log.warning("barcode decode failed: %s", _pyzbar_load_error())
         return {
             "status": "fail",
             "message": _pyzbar_load_error(),
@@ -1508,21 +1623,29 @@ def camera_snapshot(index: int = 0):
         return {"status": "fail", "snapshot": False, "message": "Snapshot failed"}
 
 def _camera_snapshot(index):
-    # An API BoM is the typed job card number. Do not decode a barcode for it.
-    if load_bom_source().get("source") == "api":
+    # Test mode is the manual path: typed code and an image file, no camera decode.
+    # Otherwise every source decodes. API uses that code as the job card number.
+    # JSON and MSSQL look the same code up as a kit IC.
+    config = load_bom_source()
+    if config.get("testMode") is True:
+        log.info("path manual: test mode, skip barcode decode")
         return {
             "status": "idle",
             "snapshot": False,
-            "message": "Enter a job card number.",
+            "message": "Test mode uses the typed code.",
         }
 
-    # Freeze this frame only when its barcode is in the current BoM (JSON or MSSQL).
+    kind = config.get("source") or "json"
+    log.info("path barcode: source=%s", kind)
+
+    # Freeze this frame only when its lookup passes.
     # The copy comes from the reader thread. This route does not call cap.read().
     frame, error = _frame_or_error(index)
     if frame is None:
         return {"status": "fail", "snapshot": False, "message": error or "No frame"}
 
-    if pyzbar is None:
+    if _pyzbar_for_decode() is None:
+        log.warning("barcode decode failed: %s", _pyzbar_load_error())
         return {
             "status": "fail",
             "snapshot": False,
@@ -1540,6 +1663,10 @@ def _camera_snapshot(index):
         }
 
     barcode = codes[0]["data"]
+    if kind == "api":
+        log.info("path barcode: API job card %s", barcode)
+    else:
+        log.info("path barcode: BoM lookup %s", barcode)
     looked = lookup_bom(barcode)
     if looked.get("status") != "pass":
         return {
@@ -1567,23 +1694,18 @@ def _camera_snapshot(index):
     }
 
 @app.get("/cameras")
-def cameras(count: int = 4):
-    count = max(1, min(count, 8))
-    available = []
-    with _frame_lock:
-        active_index = _camera_index if camera is not None and camera.isOpened() else None
-    for index in range(count):
-        if index == active_index:
-            available.append(index)
-            continue
-        cap = _open_camera(index)
-        try:
-            opened = cap.isOpened()
-        finally:
-            _release_cap(cap)
-        if opened:
-            available.append(index)
-    return {"cameras": available, "active": CAMERA_INDEX}
+def cameras(selected: Optional[int] = None):
+    # The probe opens DirectShow devices. Match the reader and use an STA.
+    _init_capture_com()
+    if selected is not None and selected < 0:
+        selected = None
+    held = _active_reader_index()
+    found = _discover_camera_indices(_camera_opens, held=held, selected=selected)
+    log.info("cameras found %s (held=%s selected=%s)", found, held, selected)
+    return {
+        "cameras": found,
+        "active": held if held is not None else CAMERA_INDEX,
+    }
 
 @app.get("/barcode/roi")
 def get_barcode_roi():
@@ -1601,11 +1723,12 @@ def set_barcode_roi(req: RoiUpdate):
 
 @app.post("/barcode")
 def read_barcode(req: Optional[BarcodeRequest] = Body(default=None)):
-    if pyzbar is None:
+    if _pyzbar_for_decode() is None:
+        log.warning("barcode decode failed: %s", _pyzbar_load_error())
         return {
             "status": "fail",
             "barcode": None,
-            "message": "pyzbar failed to load libzbar. Install the Visual C++ 2013 x64 redistributable (MSVCR120.dll). " + (_PYZBAR_ERROR or ""),
+            "message": _pyzbar_load_error(),
             "codes": [],
         }
 
@@ -1633,10 +1756,7 @@ def read_barcode(req: Optional[BarcodeRequest] = Body(default=None)):
 
     try:
         crop, used_roi = _crop_roi(frame, roi)
-        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        codes = _decode(gray)
-        if not codes:
-            codes = _decode(crop)
+        codes = _decode(crop)
     except Exception:
         log.exception("barcode read failed")
         return {
@@ -2124,11 +2244,14 @@ def lookup_bom(barcode):
 
 @app.post("/inspect")
 def inspect(req: InspectRequest):
+    kind = load_bom_source().get("source") or "json"
+    log.info("path manual: typed code %s source=%s", req.barcode, kind)
     return lookup_bom(req.barcode)
 
 @app.post("/bom/api")
 def bom_api(body: BomApiRequest):
     # baseUrl, path, and key come from config.local.json, not the request.
+    log.info("path manual: API job card %s", body.jobCardNumber)
     try:
         return _api_bom_data(body.jobCardNumber, load_bom_source())
     except BomApiError as exc:
