@@ -98,6 +98,8 @@ let result: InspectView | null = null;
 let bom: BomView | null = null;
 let loading = false;
 let cameraIndex = 0;
+// Set when the saved camera is missing, so focus does not put that index back.
+let skippedSavedIndex: number | null = null;
 let cameraIndexes: number[] = [];
 let camerasReady = false;
 let cameraLookupFailed = false;
@@ -606,6 +608,7 @@ async function loadCamerasOnce(): Promise<boolean> {
 		camerasReady = true;
 		cameraLookupFailed = false;
 		if (current === selected && found.length > 0 && !found.includes(selected)) {
+			skippedSavedIndex = selected;
 			cameraIndex = found[0];
 		}
 		return true;
@@ -657,7 +660,10 @@ async function checkSidecar() {
 		void loadDetectRoi();
 		void loadBomSource();
 		void loadModel();
-		void connectCameras();
+		void (async () => {
+			await loadCamera();
+			if (pageAlive) await connectCameras();
+		})();
 	}
 }
 
@@ -719,11 +725,51 @@ function asRoi(value: unknown): DetectRoi | null {
 	return { x: row.x, y: row.y, w: row.w, h: row.h };
 }
 
+async function loadCamera() {
+	try {
+		const res = await fetch("http://127.0.0.1:8008/settings/camera");
+		if (!res.ok) return;
+		const data = await res.json();
+		const index = Number(data.index);
+		if (!Number.isInteger(index) || index < 0 || index > 32) return;
+		if (index === skippedSavedIndex) return;
+		cameraIndex = index;
+	} catch {
+		// A missed read keeps the current camera.
+	}
+}
+
+async function applySavedCamera() {
+	const previous = Number(cameraIndex);
+	await loadCamera();
+	if (!pageAlive || !sidecarUp) return;
+	if (Number(cameraIndex) !== previous) await loadCameras();
+}
+
+async function saveCameraIndex() {
+	skippedSavedIndex = null;
+	const index = Number(cameraIndex);
+	cameraIndex = index;
+	if (!Number.isInteger(index) || index < 0 || index > 32) return;
+	try {
+		await fetch("http://127.0.0.1:8008/settings/camera", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ index }),
+		});
+	} catch {
+		// The live view still uses the picked index. The next launch reads the last save.
+	}
+}
+
 function readAdminFlag() {
 	admin = sessionStorage.getItem(ADMIN_FLAG) === "1";
 	void loadBomSource();
 	void loadTestMode();
-	if (sidecarUp) void loadModel();
+	if (sidecarUp) {
+		void loadModel();
+		void applySavedCamera();
+	}
 }
 
 async function loadModel() {
@@ -1495,6 +1541,7 @@ async function decodeAndInspect() {
 			<select
 				class="min-h-11 border border-neutral-600 bg-neutral-950 px-3 font-mono text-base normal-case tracking-normal text-neutral-100"
 				bind:value={cameraIndex}
+				on:change={saveCameraIndex}
 			>
 				{#if camerasMissing}
 					<option value={cameraIndex}>No cameras found</option>

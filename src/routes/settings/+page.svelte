@@ -9,7 +9,7 @@ const SECTION_KEY = "ls-vision-settings-section";
 type BomSource = "json" | "mssql" | "api";
 type AuthMode = "windows" | "sql";
 type MssqlFields = { server: string; database: string; user: string };
-type SettingsSection = "camera" | "training" | "database";
+type SettingsSection = "camera" | "capture" | "training" | "database";
 type DetectRoi = { x: number; y: number; w: number; h: number };
 
 const sectionOn =
@@ -53,6 +53,20 @@ let modelActive = "best.pt";
 let modelLoaded = false;
 let modelNotice = "";
 let savingModel = false;
+let cameraIndex = 0;
+let cameraChoices: number[] = [0];
+let cameraResolution = "";
+let cameraFocus: number | null = null;
+let cameraBrightness: number | null = null;
+let cameraContrast: number | null = null;
+let cameraNotice = "";
+let cameraListNotice = "";
+let previewNotice = "";
+let savingCamera = false;
+
+const PREVIEW_LABEL = "camera-preview";
+const PREVIEW_CHANNEL = "ls-vision-camera-preview";
+const CAMERA_RESOLUTIONS = ["640x480", "1280x720", "1920x1080"];
 
 function storedUnlocked(): boolean {
 	if (typeof sessionStorage === "undefined") return false;
@@ -62,7 +76,12 @@ function storedUnlocked(): boolean {
 function storedSection(): SettingsSection {
 	if (typeof sessionStorage === "undefined") return "camera";
 	const value = sessionStorage.getItem(SECTION_KEY);
-	if (value === "camera" || value === "training" || value === "database") {
+	if (
+		value === "camera" ||
+		value === "capture" ||
+		value === "training" ||
+		value === "database"
+	) {
 		return value;
 	}
 	return "camera";
@@ -71,6 +90,7 @@ function storedSection(): SettingsSection {
 function selectSection(next: SettingsSection) {
 	section = next;
 	sessionStorage.setItem(SECTION_KEY, next);
+	if (next === "camera") void loadCameraSettings();
 	if (next === "training") void loadModel();
 }
 
@@ -493,8 +513,199 @@ async function saveSource() {
 	}
 }
 
+function cameraList(value: unknown): number[] {
+	if (!Array.isArray(value)) return [];
+	const found: number[] = [];
+	for (const item of value) {
+		if (typeof item !== "number" || !Number.isInteger(item) || item < 0)
+			continue;
+		if (!found.includes(item)) found.push(item);
+	}
+	found.sort((left, right) => left - right);
+	return found;
+}
+
+function levelValue(value: unknown): number | null {
+	if (typeof value !== "number" || !Number.isInteger(value)) return null;
+	if (value < 0 || value > 100) return null;
+	return value;
+}
+
+function applyCamera(data: {
+	index?: unknown;
+	resolution?: unknown;
+	focus?: unknown;
+	brightness?: unknown;
+	contrast?: unknown;
+}) {
+	const index = Number(data.index);
+	if (Number.isInteger(index) && index >= 0 && index <= 32) cameraIndex = index;
+	const resolution = typeof data.resolution === "string" ? data.resolution : "";
+	cameraResolution = CAMERA_RESOLUTIONS.includes(resolution) ? resolution : "";
+	cameraFocus = levelValue(data.focus);
+	cameraBrightness = levelValue(data.brightness);
+	cameraContrast = levelValue(data.contrast);
+	if (!cameraChoices.includes(cameraIndex)) {
+		cameraChoices = [...cameraChoices, cameraIndex].sort(
+			(left, right) => left - right,
+		);
+	}
+}
+
+function readLevel(value: number | null): number | null | undefined {
+	if (value === null || Number.isNaN(value)) return null;
+	if (!Number.isInteger(value) || value < 0 || value > 100) return undefined;
+	return value;
+}
+
+async function loadCameraDevices() {
+	cameraListNotice = "";
+	try {
+		const res = await fetch(
+			`http://127.0.0.1:8008/cameras?selected=${cameraIndex}`,
+		);
+		if (!res.ok) throw new Error(await res.text());
+		const data = await res.json();
+		const selected = Number(cameraIndex);
+		const found = cameraList(data.cameras);
+		if (!found.includes(selected)) found.push(selected);
+		found.sort((left, right) => left - right);
+		cameraIndex = selected;
+		cameraChoices = found;
+	} catch (err: unknown) {
+		cameraChoices = [cameraIndex];
+		cameraListNotice = errorMessage(
+			err,
+			"Could not list cameras. Is the vision sidecar running?",
+		);
+	}
+}
+
+async function loadCameraSettings() {
+	cameraNotice = "";
+	try {
+		const res = await fetch("http://127.0.0.1:8008/settings/camera");
+		if (!res.ok) throw new Error(await res.text());
+		applyCamera(await res.json());
+	} catch (err: unknown) {
+		cameraNotice = errorMessage(err, "Could not load the camera settings");
+	}
+	await loadCameraDevices();
+}
+
+async function saveCamera() {
+	const focus = readLevel(cameraFocus);
+	const brightness = readLevel(cameraBrightness);
+	const contrast = readLevel(cameraContrast);
+	if (
+		focus === undefined ||
+		brightness === undefined ||
+		contrast === undefined
+	) {
+		cameraNotice =
+			"Focus, brightness, and contrast are whole numbers from 0 to 100, or blank.";
+		return;
+	}
+	savingCamera = true;
+	cameraNotice = "";
+	try {
+		const res = await fetch("http://127.0.0.1:8008/settings/camera", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				index: Number(cameraIndex),
+				resolution: cameraResolution,
+				focus,
+				brightness,
+				contrast,
+			}),
+		});
+		const data = await res.json().catch(() => ({}));
+		if (!res.ok || data.status === "fail") {
+			throw new Error(data.message || "Save failed");
+		}
+		applyCamera(data);
+		cameraIndex = Number(cameraIndex);
+		cameraNotice =
+			typeof data.message === "string" && data.message ? data.message : "Saved";
+	} catch (err: unknown) {
+		cameraNotice = errorMessage(err, "Could not save the camera");
+	} finally {
+		savingCamera = false;
+	}
+}
+
+function inTauri(): boolean {
+	return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+
+function postPreviewIndex(index: number) {
+	const channel = new BroadcastChannel(PREVIEW_CHANNEL);
+	channel.postMessage({ index });
+	channel.close();
+}
+
+function onCameraIndexChange() {
+	cameraIndex = Number(cameraIndex);
+	postPreviewIndex(cameraIndex);
+}
+
+async function openPreview() {
+	previewNotice = "";
+	const index = Number(cameraIndex);
+	if (!Number.isInteger(index) || index < 0) {
+		previewNotice = "Choose a camera first.";
+		return;
+	}
+	const url = `/camera-preview?index=${index}`;
+	if (!inTauri()) {
+		const popup = window.open(url, PREVIEW_LABEL, "popup,width=800,height=600");
+		if (!popup) {
+			previewNotice = "The browser blocked the preview window.";
+			return;
+		}
+		previewNotice =
+			"Preview opened in a browser window. Always on top is available in the desktop app.";
+		return;
+	}
+	try {
+		const { WebviewWindow } = await import("@tauri-apps/api/webviewWindow");
+		const existing = await WebviewWindow.getByLabel(PREVIEW_LABEL);
+		if (existing) {
+			await existing.setAlwaysOnTop(true);
+			await existing.setFocus();
+			postPreviewIndex(index);
+			return;
+		}
+		const preview = new WebviewWindow(PREVIEW_LABEL, {
+			url,
+			title: `Camera ${index}`,
+			width: 800,
+			height: 600,
+			alwaysOnTop: true,
+			resizable: true,
+			focus: true,
+			center: true,
+		});
+		preview.once("tauri://created", () => {
+			postPreviewIndex(index);
+		});
+		preview.once("tauri://error", (event) => {
+			const payload = event.payload;
+			previewNotice =
+				typeof payload === "string" && payload
+					? payload
+					: "Could not open the camera preview.";
+		});
+	} catch (err: unknown) {
+		previewNotice = errorMessage(err, "Could not open the camera preview.");
+	}
+}
+
 onMount(() => {
-	if (unlocked) loadSource();
+	if (!unlocked) return;
+	void loadSource();
+	if (section === "camera") void loadCameraSettings();
 });
 </script>
 
@@ -591,6 +802,28 @@ onMount(() => {
 				</button>
 				<button
 					type="button"
+					class={section === "capture" ? sectionOn : sectionOff}
+					aria-current={section === "capture" ? "page" : undefined}
+					on:click={() => selectSection("capture")}
+				>
+					<svg
+						xmlns="http://www.w3.org/2000/svg"
+						viewBox="0 0 24 24"
+						class="h-5 w-5"
+						fill="none"
+						stroke="currentColor"
+						stroke-width="2"
+						aria-hidden="true"
+					>
+						<path d="M4 8V5a1 1 0 0 1 1-1h3" />
+						<path d="M16 4h3a1 1 0 0 1 1 1v3" />
+						<path d="M20 16v3a1 1 0 0 1-1 1h-3" />
+						<path d="M8 20H5a1 1 0 0 1-1-1v-3" />
+					</svg>
+					Capture
+				</button>
+				<button
+					type="button"
 					class={section === "training" ? sectionOn : sectionOff}
 					aria-current={section === "training" ? "page" : undefined}
 					on:click={() => selectSection("training")}
@@ -641,6 +874,118 @@ onMount(() => {
 					{#if section === "camera"}
 						<h2 id="settings-section-heading" class="text-lg font-semibold tracking-tight">
 							Camera
+						</h2>
+						<form
+							class="flex flex-col gap-4 border border-neutral-700 bg-neutral-900 p-4"
+							on:submit|preventDefault={saveCamera}
+						>
+							<fieldset class="flex flex-col gap-3">
+								<legend class="text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+									Primary camera
+								</legend>
+								<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+									Camera
+									<select
+										class="border border-neutral-600 bg-neutral-950 px-3 py-2 font-mono text-base font-medium normal-case tracking-normal text-neutral-100"
+										bind:value={cameraIndex}
+										on:change={onCameraIndexChange}
+									>
+										{#each cameraChoices as index (index)}
+											<option value={index}>{index}</option>
+										{/each}
+									</select>
+								</label>
+								<p class="text-sm text-neutral-400">
+									The operator page opens this camera. A camera that is unplugged at launch is tried again next time.
+								</p>
+								{#if cameraListNotice}
+									<p class="text-sm text-neutral-200">{cameraListNotice}</p>
+								{/if}
+							</fieldset>
+							<fieldset class="flex flex-col gap-3">
+								<legend class="text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+									Image
+								</legend>
+								<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+									Resolution
+									<select
+										class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
+										bind:value={cameraResolution}
+									>
+										<option value="">Not set</option>
+										<option value="640x480">640×480</option>
+										<option value="1280x720">1280×720</option>
+										<option value="1920x1080">1920×1080</option>
+									</select>
+								</label>
+								<div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
+									<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+										Focus
+										<input
+											type="number"
+											class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
+											bind:value={cameraFocus}
+											min="0"
+											max="100"
+											step="1"
+											inputmode="numeric"
+										/>
+									</label>
+									<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+										Brightness
+										<input
+											type="number"
+											class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
+											bind:value={cameraBrightness}
+											min="0"
+											max="100"
+											step="1"
+											inputmode="numeric"
+										/>
+									</label>
+									<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+										Contrast
+										<input
+											type="number"
+											class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
+											bind:value={cameraContrast}
+											min="0"
+											max="100"
+											step="1"
+											inputmode="numeric"
+										/>
+									</label>
+								</div>
+								<p class="text-sm text-neutral-400">
+									Resolution, focus, brightness, and contrast are saved with the camera. They are not sent to the device yet. Leave a number blank to clear it.
+								</p>
+							</fieldset>
+							<div class="flex flex-wrap items-center gap-2">
+								<button
+									type="submit"
+									class="inline-flex min-h-11 items-center border border-blue-500 bg-blue-600 px-4 text-sm font-semibold text-white disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
+									disabled={savingCamera}
+								>
+									{savingCamera ? "Saving..." : "Save"}
+								</button>
+								<button
+									type="button"
+									class="inline-flex min-h-11 items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100"
+									on:click={openPreview}
+								>
+									Preview
+								</button>
+							</div>
+							{#if cameraNotice}
+								<p class="text-sm text-neutral-200">{cameraNotice}</p>
+							{/if}
+							{#if previewNotice}
+								<p class="text-sm text-neutral-200">{previewNotice}</p>
+							{/if}
+						</form>
+					{:else if section === "capture"}
+						<h2 id="settings-section-heading" class="text-lg font-semibold tracking-tight">
+							Capture
 						</h2>
 						<form
 							class="flex flex-col gap-4 border border-neutral-700 bg-neutral-900 p-4"
