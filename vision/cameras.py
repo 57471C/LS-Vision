@@ -604,17 +604,19 @@ def _camera_decode(index):
     }
 
 @router.get("/camera/snapshot")
-def camera_snapshot(index: int = 0):
+def camera_snapshot(index: int = 0, frame: bool = False):
     try:
-        return _camera_snapshot(index)
+        return _camera_snapshot(index, frame_only=frame)
     except Exception:
         log.exception("camera snapshot failed")
         return {"status": "fail", "snapshot": False, "message": "Snapshot failed"}
 
-def _camera_snapshot(index):
+def _camera_snapshot(index, frame_only=False):
     # Test mode is the manual path: typed code and an image file, no camera decode.
     # Otherwise every source decodes. API uses that code as the job card number.
     # JSON and MSSQL look the same code up as a kit IC.
+    # frame=1 returns that same reader frame as a JPEG and skips pyzbar and the
+    # BoM lookup. The plain route still decodes. Neither path calls cap.read().
     config = load_bom_source()
     if config.get("testMode") is True:
         log.info("path manual: test mode, skip barcode decode")
@@ -623,6 +625,20 @@ def _camera_snapshot(index):
             "snapshot": False,
             "message": "Test mode uses the typed code.",
         }
+
+    if frame_only:
+        log.info("path barcode: frame only")
+        frame, error = _frame_or_error(index)
+        if frame is None:
+            return {"status": "fail", "snapshot": False, "message": error or "No frame"}
+        image = _jpeg_data_url(frame)
+        if not image:
+            return {
+                "status": "fail",
+                "snapshot": False,
+                "message": "Could not encode the frame",
+            }
+        return {"status": "pass", "snapshot": False, "image": image}
 
     kind = config.get("source") or "json"
     log.info("path barcode: source=%s", kind)

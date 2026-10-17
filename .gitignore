@@ -21,3 +21,6 @@ vision/models/*.pt
 vision/models/*.onnx
 # Sidecar startup and camera errors, including launches from the packaged exe.
 vision/sidecar.log
+# Temporary frame saved by decode_barcode while barcode misses are being traced.
+vision/debug-barcode.jpg
+vision/barcode-debug.log

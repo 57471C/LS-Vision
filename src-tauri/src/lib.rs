@@ -1,3 +1,4 @@
+mod barcode;
 mod bom;
 mod local_config;
 
@@ -21,7 +22,8 @@ pub fn run() {
             local_config::list_vision_models,
             local_config::set_active_model,
             bom::load_bom_json,
-            bom::post_bom_api
+            bom::post_bom_api,
+            barcode::decode_barcode
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
