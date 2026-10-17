@@ -6,6 +6,7 @@ const DEV_PASSWORD = "admin";
 const UNLOCK_KEY = "ls-vision-settings-open";
 const SECTION_KEY = "ls-vision-settings-section";
 const RUST_CONFIG_KEY = "ls-vision-rust-config";
+const RUST_BOM_KEY = "ls-vision-rust-bom";
 const DEFAULT_SQL_DRIVER = "ODBC Driver 18 for SQL Server";
 
 type BomSource = "json" | "mssql" | "api";
@@ -86,6 +87,7 @@ let sidecarTimer: ReturnType<typeof setInterval> | null = null;
 let desktop = false;
 let desktopChecked = false;
 let rustConfig = false;
+let rustBom = false;
 let configLoadId = 0;
 
 const PREVIEW_LABEL = "camera-preview";
@@ -1148,11 +1150,22 @@ function onRustConfigChange() {
 	void loadSource();
 }
 
+function onRustBomChange() {
+	if (!desktop) {
+		rustBom = false;
+		return;
+	}
+	sessionStorage.setItem(RUST_BOM_KEY, rustBom ? "1" : "0");
+}
+
 onMount(() => {
 	desktop = inTauri();
 	desktopChecked = true;
 	if (desktop && sessionStorage.getItem(RUST_CONFIG_KEY) === "1") {
 		rustConfig = true;
+	}
+	if (desktop && sessionStorage.getItem(RUST_BOM_KEY) === "1") {
+		rustBom = true;
 	}
 	if (!unlocked) return;
 	void loadSource();
@@ -1355,6 +1368,25 @@ onDestroy(() => {
 								Settings loads and saves vision/config.local.json in the app, lists the files in
 								vision/models, and stores the chosen model name there. Detection, the camera, and the
 								other settings stay on the vision sidecar.
+								{#if desktopChecked && !desktop}
+									Open the desktop app to use this.
+								{/if}
+							</span>
+						</span>
+					</label>
+					<label class="flex items-start gap-3 border border-neutral-700 bg-neutral-900 p-4 text-sm text-neutral-200">
+						<input
+							type="checkbox"
+							class="mt-1 h-4 w-4 accent-blue-500"
+							bind:checked={rustBom}
+							disabled={!desktop}
+							on:change={onRustBomChange}
+						/>
+						<span class="flex flex-col gap-1">
+							<span class="font-semibold text-neutral-100">Use Rust for BoM lookup</span>
+							<span class="text-neutral-400">
+								JSON file lookup and the job card API run in the app. SQL, and the camera decode, stay
+								on the vision sidecar.
 								{#if desktopChecked && !desktop}
 									Open the desktop app to use this.
 								{/if}

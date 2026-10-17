@@ -21,7 +21,7 @@ pub struct ActiveModel {
     pub message: String,
 }
 
-fn project_root() -> Result<PathBuf, String> {
+pub(crate) fn project_root() -> Result<PathBuf, String> {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .map(Path::to_path_buf)
@@ -93,7 +93,7 @@ fn read_json_object(path: &Path, label: &str) -> Result<Option<Value>, String> {
     }
 }
 
-fn load_document(root: &Path) -> Result<Value, String> {
+pub(crate) fn load_document(root: &Path) -> Result<Value, String> {
     let config_path = config_file(root);
     if let Some(value) = read_json_object(&config_path, "vision/config.local.json")? {
         return Ok(value);

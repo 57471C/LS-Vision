@@ -1,3 +1,4 @@
+mod bom;
 mod local_config;
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
@@ -18,7 +19,9 @@ pub fn run() {
             local_config::load_local_config,
             local_config::save_local_config,
             local_config::list_vision_models,
-            local_config::set_active_model
+            local_config::set_active_model,
+            bom::load_bom_json,
+            bom::post_bom_api
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
