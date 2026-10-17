@@ -19,6 +19,9 @@ use crate::local_config;
 const MAX_IMAGE_BYTES: usize = 12 * 1024 * 1024;
 const READ_ERROR: &str = "Could not read the image.";
 const NO_CODE: &str = "No code detected";
+// Setup/debug only. Set this to true to save vision/debug-barcode.jpg and append
+// vision/barcode-debug.log. Leave it false during normal operation.
+const BARCODE_SETUP_DEBUG: bool = false;
 
 #[tauri::command]
 pub fn decode_barcode(image: String) -> Result<Value, String> {
@@ -26,9 +29,11 @@ pub fn decode_barcode(image: String) -> Result<Value, String> {
     match prepare(&image)? {
         None => {
             // A snapshot body with no image is a miss, not a crate error.
-            record_debug(&format!(
-                "barcode debug chars={chars} bytes=0 result=no-image"
-            ));
+            if BARCODE_SETUP_DEBUG {
+                record_debug(&format!(
+                    "barcode debug chars={chars} bytes=0 result=no-image"
+                ));
+            }
             Ok(idle())
         }
         Some(bytes) => decode_bytes(chars, &bytes),
@@ -171,23 +176,25 @@ fn decode_bytes(chars: usize, bytes: &[u8]) -> Result<Value, String> {
     if bytes.len() > MAX_IMAGE_BYTES {
         return Err(READ_ERROR.to_string());
     }
-    let saved = store_debug_jpeg(bytes);
     let loaded = image::load_from_memory(bytes);
-    let mut line = image_debug_line(chars, bytes);
-    match &loaded {
-        Ok(image) => line.push_str(&format!(
-            " width={} height={}",
-            image.width(),
-            image.height()
-        )),
-        Err(err) => line.push_str(&format!(" load_error={err}")),
+    if BARCODE_SETUP_DEBUG {
+        let saved = store_debug_jpeg(bytes);
+        let mut line = image_debug_line(chars, bytes);
+        match &loaded {
+            Ok(image) => line.push_str(&format!(
+                " width={} height={}",
+                image.width(),
+                image.height()
+            )),
+            Err(err) => line.push_str(&format!(" load_error={err}")),
+        }
+        match &saved {
+            Ok(Some(path)) => line.push_str(&format!(" saved={}", path.display())),
+            Ok(None) => {}
+            Err(err) => line.push_str(&format!(" save_error={err}")),
+        }
+        record_debug(&line);
     }
-    match &saved {
-        Ok(Some(path)) => line.push_str(&format!(" saved={}", path.display())),
-        Ok(None) => {}
-        Err(err) => line.push_str(&format!(" save_error={err}")),
-    }
-    record_debug(&line);
 
     let image = loaded.map_err(|_| READ_ERROR.to_string())?;
     let mut hints = DecodeHints::default();
@@ -210,13 +217,15 @@ fn decode_bytes(chars: usize, bytes: &[u8]) -> Result<Value, String> {
         },
         Err(err) => from_crate_error(err),
     };
-    let status = value["status"].as_str().unwrap_or("").to_string();
-    let detail = value["message"]
-        .as_str()
-        .or_else(|| value["barcode"].as_str())
-        .unwrap_or("")
-        .to_string();
-    record_debug(&format!("barcode debug result={status} {detail}"));
+    if BARCODE_SETUP_DEBUG {
+        let status = value["status"].as_str().unwrap_or("").to_string();
+        let detail = value["message"]
+            .as_str()
+            .or_else(|| value["barcode"].as_str())
+            .unwrap_or("")
+            .to_string();
+        record_debug(&format!("barcode debug result={status} {detail}"));
+    }
     Ok(value)
 }
 

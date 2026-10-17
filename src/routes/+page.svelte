@@ -2,6 +2,11 @@
 // biome-ignore-all lint/correctness/noUnusedVariables: Biome 2.4 does not treat Svelte template references as uses
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import {
+	BarcodeFormat,
+	BrowserMultiFormatReader,
+	DecodeHintType,
+} from "@zxing/library";
 import { onDestroy, onMount, tick } from "svelte";
 
 type Part = { ic: string; des: string; qty: number };
@@ -161,6 +166,11 @@ let erpAttempt = 0;
 let erpLoadedUrl = "";
 let erpCloseButton: HTMLButtonElement | null = null;
 let modelName = "best.pt";
+let barcodeDecoder = "";
+let modelFiles: string[] = [];
+let modelMenuOpen = false;
+let savingModel = false;
+let modelNotice = "";
 
 function stopWatch() {
 	if (streamTimer !== null) {
@@ -466,6 +476,94 @@ function decodedText(body: RustDecode): string {
 	return body.barcode;
 }
 
+function stripOneTrailingSlash(text: string): string {
+	return text.endsWith("/") ? text.slice(0, -1) : text;
+}
+
+type QrBarcodeDetector = {
+	detect: (source: ImageBitmap) => Promise<{ rawValue?: string }[]>;
+};
+
+function qrBarcodeDetector(): {
+	new (options?: { formats?: string[] }): QrBarcodeDetector;
+	getSupportedFormats?: () => Promise<string[]>;
+} | null {
+	const host = globalThis as {
+		BarcodeDetector?: {
+			new (options?: { formats?: string[] }): QrBarcodeDetector;
+			getSupportedFormats?: () => Promise<string[]>;
+		};
+	};
+	const Detector = host.BarcodeDetector;
+	return typeof Detector === "function" ? Detector : null;
+}
+
+async function readNative(image: string): Promise<string> {
+	const Detector = qrBarcodeDetector();
+	if (!Detector) return "";
+	let bitmap: ImageBitmap | null = null;
+	try {
+		if (Detector.getSupportedFormats) {
+			const formats = await Detector.getSupportedFormats();
+			if (!formats.includes("qr_code")) return "";
+		}
+		const detector = new Detector({ formats: ["qr_code"] });
+		bitmap = await createImageBitmap(await (await fetch(image)).blob());
+		const found = await detector.detect(bitmap);
+		const text = found.find((item) => item.rawValue)?.rawValue ?? "";
+		if (!text) return "";
+		return stripOneTrailingSlash(text);
+	} catch {
+		return "";
+	} finally {
+		bitmap?.close();
+	}
+}
+
+function zxingReader(): BrowserMultiFormatReader {
+	const hints = new Map();
+	hints.set(DecodeHintType.POSSIBLE_FORMATS, [BarcodeFormat.QR_CODE]);
+	hints.set(DecodeHintType.TRY_HARDER, true);
+	return new BrowserMultiFormatReader(hints);
+}
+
+async function readZxing(image: string): Promise<string> {
+	const reader = zxingReader();
+	try {
+		const found = await reader.decodeFromImageUrl(image);
+		const text = found.getText();
+		if (!text) return "";
+		return stripOneTrailingSlash(text);
+	} catch {
+		return "";
+	} finally {
+		reader.reset();
+	}
+}
+
+async function decodeCameraImage(image: string): Promise<RustDecode> {
+	const fromNative = await readNative(image);
+	if (fromNative) {
+		barcodeDecoder = "native";
+		console.info("barcode detector native");
+		return { status: "pass", barcode: fromNative };
+	}
+	const fromZxing = await readZxing(image);
+	if (fromZxing) {
+		barcodeDecoder = "js";
+		console.info("barcode detector zxing");
+		return { status: "pass", barcode: fromZxing };
+	}
+	const decoded = await invoke<RustDecode>("decode_barcode", { image });
+	if (decodedText(decoded)) {
+		barcodeDecoder = "rust";
+		console.info("barcode detector rust");
+	} else {
+		barcodeDecoder = "";
+	}
+	return decoded;
+}
+
 async function readFrame(index: number): Promise<WatchBody> {
 	const res = await fetch(
 		`http://127.0.0.1:8008/camera/snapshot?index=${index}&frame=1`,
@@ -515,7 +613,7 @@ async function watchFeed() {
 	const index = cameraIndex;
 	try {
 		// Test mode is the typed code. The sidecar snapshot route still skips
-		// decode for that mode. Every other source sends the frame to Rust.
+		// decode for that mode. Every other source tries native, then JS, then Rust.
 		await ensureBomSource();
 		await loadTestMode();
 		if (!pageAlive || !feedOn || snapshot || loading || index !== cameraIndex) {
@@ -527,9 +625,7 @@ async function watchFeed() {
 		}
 		const frame = await readFrame(index);
 		if (!stillWatches(index) || !frame.image) return;
-		const decoded = await invoke<RustDecode>("decode_barcode", {
-			image: frame.image,
-		});
+		const decoded = await decodeCameraImage(frame.image);
 		const code = decodedText(decoded);
 		if (!stillWatches(index) || !code) return;
 		const view = await lookupCode(code);
@@ -786,6 +882,7 @@ async function saveCameraIndex() {
 
 function readAdminFlag() {
 	admin = sessionStorage.getItem(ADMIN_FLAG) === "1";
+	if (!admin) modelMenuOpen = false;
 	bomSourceReady = loadBomSource();
 	void loadTestMode();
 	void loadModel();
@@ -798,21 +895,99 @@ function matchModelName(name: string, files: string[]): string {
 	return files.find((item) => item.toLowerCase() === cleaned) ?? "";
 }
 
+function readModelFiles(value: unknown): string[] {
+	if (!Array.isArray(value)) return [];
+	return value.filter(
+		(item): item is string => typeof item === "string" && item.length > 0,
+	);
+}
+
+function closeModelMenu() {
+	if (savingModel) return;
+	modelMenuOpen = false;
+}
+
 async function loadModel() {
 	try {
 		const listed = await invoke<unknown>("list_vision_models");
 		const config = await invoke<{ model?: unknown }>("load_local_config");
-		const files = Array.isArray(listed)
-			? listed.filter(
-					(item): item is string => typeof item === "string" && item.length > 0,
-				)
-			: [];
+		const files = readModelFiles(listed);
+		modelFiles = files;
 		const stored = typeof config.model === "string" ? config.model : "";
 		const match = matchModelName(stored, files);
 		const fallback = matchModelName("best.pt", files);
 		modelName = match || fallback || "best.pt";
 	} catch {
 		// A missed read keeps the last model name.
+	}
+}
+
+async function toggleModelMenu() {
+	if (!admin || savingModel) return;
+	if (modelMenuOpen) {
+		modelMenuOpen = false;
+		return;
+	}
+	modelMenuOpen = true;
+	modelNotice = "";
+	await loadModel();
+}
+
+async function reloadSidecarModel(filename: string) {
+	let res: Response;
+	try {
+		res = await fetch("http://127.0.0.1:8008/settings/model", {
+			cache: "no-store",
+		});
+	} catch {
+		throw new Error(
+			"Saved. The sidecar is not running, so the model was not reloaded.",
+		);
+	}
+	if (!res.ok) throw new Error("Saved. The sidecar did not reload the model.");
+	const body = (await res.json()) as {
+		status?: unknown;
+		loaded?: unknown;
+		active?: unknown;
+		message?: unknown;
+	};
+	const message = typeof body.message === "string" ? body.message.trim() : "";
+	const active = typeof body.active === "string" ? body.active.trim() : "";
+	const loadedThisFile =
+		body.status !== "fail" &&
+		body.loaded === true &&
+		active.toLowerCase() === filename.toLowerCase();
+	if (!loadedThisFile) {
+		throw new Error(message || "Saved. The sidecar did not reload the model.");
+	}
+	modelName = active;
+}
+
+async function chooseModel(filename: string) {
+	if (!admin || savingModel) return;
+	if (filename.toLowerCase() === modelName.toLowerCase()) {
+		modelMenuOpen = false;
+		return;
+	}
+	savingModel = true;
+	modelNotice = "";
+	try {
+		const saved = await invoke<{
+			active?: unknown;
+			files?: unknown;
+		}>("set_active_model", { filename });
+		const files = readModelFiles(saved.files);
+		if (files.length > 0) modelFiles = files;
+		const active =
+			typeof saved.active === "string" && saved.active.trim()
+				? saved.active.trim()
+				: filename;
+		await reloadSidecarModel(active);
+		modelMenuOpen = false;
+	} catch (err: unknown) {
+		modelNotice = invokeError(err, "Could not switch the model");
+	} finally {
+		savingModel = false;
 	}
 }
 
@@ -1154,6 +1329,7 @@ function closeErp() {
 function onErpKey(event: KeyboardEvent) {
 	if (event.key === "Escape" && erpOpen) closeErp();
 	else if (event.key === "Escape" && drawing) cancelRoiDraw();
+	else if (event.key === "Escape" && modelMenuOpen) closeModelMenu();
 }
 
 function onIframeError() {
@@ -1463,9 +1639,7 @@ async function decodeAndInspect() {
 			};
 			return;
 		}
-		const decoded = await invoke<RustDecode>("decode_barcode", {
-			image: frame.image,
-		});
+		const decoded = await decodeCameraImage(frame.image);
 		if (!pageAlive) return;
 		const code = decodedText(decoded);
 		if (!code) {
@@ -2023,12 +2197,71 @@ async function decodeAndInspect() {
 	</div>
 
 	<footer class="flex shrink-0 items-center border-t border-neutral-800 bg-neutral-900 px-4 py-1.5">
-		<p class="text-[11px] font-semibold uppercase tracking-widest text-neutral-500">
+		<div class="text-[11px] font-semibold uppercase tracking-widest text-neutral-500">
 			Model
-			<span class="ml-2 font-mono text-xs font-medium normal-case tracking-normal text-neutral-300">
-				{modelName}
-			</span>
-		</p>
+			{#if admin}
+				<span class="relative inline-block">
+					<button
+						type="button"
+						class="ml-2 font-mono text-xs font-medium normal-case tracking-normal text-neutral-300 underline-offset-2 hover:underline disabled:text-neutral-500"
+						aria-haspopup="menu"
+						aria-expanded={modelMenuOpen}
+						aria-label="Choose model"
+						disabled={savingModel}
+						on:click={toggleModelMenu}
+					>
+						{modelName}
+					</button>
+					{#if modelMenuOpen}
+						<button
+							type="button"
+							class="fixed inset-0 z-40 cursor-default"
+							aria-label="Close model menu"
+							on:click={closeModelMenu}
+						></button>
+						<span
+							role="menu"
+							aria-label="Models"
+							class="absolute bottom-full left-0 z-50 mb-2 max-h-60 min-w-44 overflow-auto border border-neutral-600 bg-neutral-900 py-1 shadow-lg"
+						>
+							{#each modelFiles as file (file)}
+								<button
+									type="button"
+									role="menuitem"
+									class="block w-full px-3 py-2 text-left font-mono text-xs font-medium normal-case tracking-normal hover:bg-neutral-800 disabled:text-neutral-500 {file.toLowerCase() ===
+									modelName.toLowerCase()
+										? 'bg-neutral-800 text-neutral-100'
+										: 'text-neutral-300'}"
+									disabled={savingModel}
+									on:click={() => chooseModel(file)}
+								>
+									{file}
+								</button>
+							{:else}
+								<span class="block px-3 py-2 text-sm font-medium normal-case tracking-normal text-neutral-400">
+									No .pt or .onnx files in vision/models.
+								</span>
+							{/each}
+							{#if modelNotice}
+								<span class="block px-3 py-2 text-sm font-medium normal-case tracking-normal text-red-300">
+									{modelNotice}
+								</span>
+							{/if}
+						</span>
+					{/if}
+				</span>
+			{:else}
+				<span class="ml-2 font-mono text-xs font-medium normal-case tracking-normal text-neutral-300">
+					{modelName}
+				</span>
+			{/if}
+			{#if admin}
+				<span class="ml-4">Barcode</span>
+				<span class="ml-2 font-mono text-xs font-medium normal-case tracking-normal text-neutral-300">
+					{barcodeDecoder || "—"}
+				</span>
+			{/if}
+		</div>
 	</footer>
 
 	<button
