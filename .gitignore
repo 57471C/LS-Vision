@@ -15,6 +15,7 @@ vision/bom-source.json
 vision/bom_queries.sql
 # Local settings written by the Settings page. Copy vision/config.example.json to start.
 vision/config.local.json
+vision/config.local.json.tmp
 # Trained weights stay on the machine. Place best.pt in vision/models/.
 vision/models/*.pt
 vision/models/*.onnx
