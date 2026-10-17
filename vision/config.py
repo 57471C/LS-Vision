@@ -143,6 +143,7 @@ def _blank_bom_source():
         "scanSeconds": DEFAULT_SCAN_SECONDS,
         "testMode": False,
         "detectRoi": None,
+        "barcodeRoi": None,
         # Empty means best.pt. A saved name is a file in vision/models.
         "model": "",
         "camera": _blank_camera(),
@@ -266,6 +267,25 @@ def _clean_detect_roi(raw):
 def _apply_saved_detect_roi(config, saved):
     if "detectRoi" in saved:
         config["detectRoi"] = _clean_detect_roi(saved.get("detectRoi"))
+    return config
+
+def _clean_barcode_roi(raw):
+    # Kept beside detectRoi. The operator crops the barcode frame. Detection does not.
+    if not isinstance(raw, dict):
+        return None
+    cleaned = {}
+    for key in ("x", "y", "width", "height"):
+        value = raw.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        if value != value or value in (float("inf"), float("-inf")):
+            return None
+        cleaned[key] = value
+    return cleaned
+
+def _apply_saved_barcode_roi(config, saved):
+    if "barcodeRoi" in saved:
+        config["barcodeRoi"] = _clean_barcode_roi(saved.get("barcodeRoi"))
     return config
 
 def _clean_model_name(raw):
@@ -452,6 +472,7 @@ def load_bom_source():
         _apply_saved_scan(config, saved)
         _apply_saved_test_mode(config, saved)
         _apply_saved_detect_roi(config, saved)
+        _apply_saved_barcode_roi(config, saved)
         _apply_saved_model(config, saved)
         return _apply_saved_camera(config, saved)
     if BOM_SOURCE_PATH.exists():
@@ -464,6 +485,7 @@ def load_bom_source():
         _apply_saved_scan(config, saved)
         _apply_saved_test_mode(config, saved)
         _apply_saved_detect_roi(config, saved)
+        _apply_saved_barcode_roi(config, saved)
         _apply_saved_model(config, saved)
         return _apply_saved_camera(config, saved)
     return config
@@ -492,6 +514,7 @@ def save_bom_source(config):
         "scanSeconds": _clean_scan_seconds(config.get("scanSeconds")) or DEFAULT_SCAN_SECONDS,
         "testMode": config.get("testMode") is True,
         "detectRoi": _clean_detect_roi(config.get("detectRoi")),
+        "barcodeRoi": _clean_barcode_roi(config.get("barcodeRoi")),
         "model": _clean_model_name(config.get("model")),
         "camera": _stored_camera(config.get("camera")),
     }
@@ -549,6 +572,7 @@ def update_bom_source(body: BomSourceUpdate):
     config["scanSeconds"] = existing.get("scanSeconds", DEFAULT_SCAN_SECONDS)
     config["testMode"] = existing.get("testMode") is True
     config["detectRoi"] = _clean_detect_roi(existing.get("detectRoi"))
+    config["barcodeRoi"] = _clean_barcode_roi(existing.get("barcodeRoi"))
     config["model"] = _clean_model_name(existing.get("model"))
     config["camera"] = _stored_camera(existing.get("camera"))
     saved = save_bom_source(config)

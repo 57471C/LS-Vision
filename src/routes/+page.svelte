@@ -2,6 +2,11 @@
 // biome-ignore-all lint/correctness/noUnusedVariables: Biome 2.4 does not treat Svelte template references as uses
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import {
+	BarcodeFormat,
+	BrowserMultiFormatReader,
+	DecodeHintType,
+} from "@zxing/library";
 import { onDestroy, onMount, tick } from "svelte";
 
 type Part = { ic: string; des: string; qty: number };
@@ -37,6 +42,13 @@ type DetectRoi = {
 	y: number;
 	w: number;
 	h: number;
+};
+
+type BarcodeRoi = {
+	x: number;
+	y: number;
+	width: number;
+	height: number;
 };
 
 type Detection = {
@@ -118,6 +130,7 @@ let detectGeneration = 0;
 let testMode = false;
 let admin = false;
 let detectRoi: DetectRoi | null = null;
+let barcodeRoi: BarcodeRoi | null = null;
 let draftRoi: DetectRoi | null = null;
 let draftMark: {
 	left: number;
@@ -126,7 +139,9 @@ let draftMark: {
 	height: number;
 } | null = null;
 let drawing = false;
+let barcodeDrawing = false;
 let savingRoi = false;
+let savingBarcodeRoi = false;
 let roiMessage = "";
 let roiDrag: { x: number; y: number } | null = null;
 let paneImage: HTMLImageElement | null = null;
@@ -161,6 +176,7 @@ let erpAttempt = 0;
 let erpLoadedUrl = "";
 let erpCloseButton: HTMLButtonElement | null = null;
 let modelName = "best.pt";
+let barcodeDecoder = "";
 
 function stopWatch() {
 	if (streamTimer !== null) {
@@ -231,6 +247,7 @@ function toggleFeed() {
 
 function resumeLiveFeed() {
 	cancelRoiDraw();
+	cancelBarcodeDraw();
 	detectGeneration += 1;
 	snapshot = null;
 	detections = [];
@@ -243,6 +260,7 @@ function resumeLiveFeed() {
 
 function holdStill(image: string, kitCode: string) {
 	cancelRoiDraw();
+	cancelBarcodeDraw();
 	detectGeneration += 1;
 	paneWidth = 0;
 	paneHeight = 0;
@@ -466,6 +484,164 @@ function decodedText(body: RustDecode): string {
 	return body.barcode;
 }
 
+// Drop one trailing slash. A second slash stays.
+function stripOneTrailingSlash(text: string): string {
+	return text.endsWith("/") ? text.slice(0, -1) : text;
+}
+
+type QrBarcodeDetector = {
+	detect: (source: ImageBitmap) => Promise<{ rawValue?: string }[]>;
+};
+
+function qrBarcodeDetector(): {
+	new (options?: { formats?: string[] }): QrBarcodeDetector;
+	getSupportedFormats?: () => Promise<string[]>;
+} | null {
+	const host = globalThis as {
+		BarcodeDetector?: {
+			new (options?: { formats?: string[] }): QrBarcodeDetector;
+			getSupportedFormats?: () => Promise<string[]>;
+		};
+	};
+	const Detector = host.BarcodeDetector;
+	return typeof Detector === "function" ? Detector : null;
+}
+
+function asBarcodeRoi(value: unknown): BarcodeRoi | null {
+	if (!value || typeof value !== "object") return null;
+	const row = value as BarcodeRoi;
+	const nums = [row.x, row.y, row.width, row.height];
+	if (!nums.every((n) => typeof n === "number" && Number.isFinite(n)))
+		return null;
+	if (row.width <= 0 || row.height <= 0) return null;
+	return { x: row.x, y: row.y, width: row.width, height: row.height };
+}
+
+// Values from 0 to 1 are a portion of the frame. Anything larger is pixels.
+function pixelBarcodeRoi(
+	roi: BarcodeRoi | null,
+	imageWidth: number,
+	imageHeight: number,
+): BarcodeRoi | null {
+	if (!roi || imageWidth < 1 || imageHeight < 1) return null;
+	const { x, y, width, height } = roi;
+	if (width <= 0 || height <= 0) return null;
+	const portion =
+		x >= 0 && y >= 0 && x <= 1 && y <= 1 && width <= 1 && height <= 1;
+	const left = portion ? x * imageWidth : x;
+	const top = portion ? y * imageHeight : y;
+	const boxW = portion ? width * imageWidth : width;
+	const boxH = portion ? height * imageHeight : height;
+	if (boxW <= 0 || boxH <= 0) return null;
+	const x0 = Math.max(0, Math.min(imageWidth - 1, Math.floor(left)));
+	const y0 = Math.max(0, Math.min(imageHeight - 1, Math.floor(top)));
+	const x1 = Math.max(x0 + 1, Math.min(imageWidth, Math.ceil(left + boxW)));
+	const y1 = Math.max(y0 + 1, Math.min(imageHeight, Math.ceil(top + boxH)));
+	const croppedW = x1 - x0;
+	const croppedH = y1 - y0;
+	if (croppedW <= 0 || croppedH <= 0) return null;
+	return { x: x0, y: y0, width: croppedW, height: croppedH };
+}
+
+async function cropBarcodeImage(image: string): Promise<string> {
+	if (!barcodeRoi) return image;
+	let source: ImageBitmap | null = null;
+	try {
+		source = await createImageBitmap(await (await fetch(image)).blob());
+		const box = pixelBarcodeRoi(barcodeRoi, source.width, source.height);
+		if (!box) return image;
+		const canvas = document.createElement("canvas");
+		canvas.width = box.width;
+		canvas.height = box.height;
+		const context = canvas.getContext("2d");
+		if (!context) return image;
+		context.drawImage(
+			source,
+			box.x,
+			box.y,
+			box.width,
+			box.height,
+			0,
+			0,
+			box.width,
+			box.height,
+		);
+		console.info(
+			`barcode roi applied x=${box.x} y=${box.y} width=${box.width} height=${box.height}`,
+		);
+		return canvas.toDataURL("image/jpeg", 0.8);
+	} catch {
+		return image;
+	} finally {
+		source?.close();
+	}
+}
+
+async function readNative(image: string): Promise<string> {
+	const Detector = qrBarcodeDetector();
+	if (!Detector) return "";
+	let bitmap: ImageBitmap | null = null;
+	try {
+		if (Detector.getSupportedFormats) {
+			const formats = await Detector.getSupportedFormats();
+			if (!formats.includes("qr_code")) return "";
+		}
+		const detector = new Detector({ formats: ["qr_code"] });
+		bitmap = await createImageBitmap(await (await fetch(image)).blob());
+		const found = await detector.detect(bitmap);
+		const text = found.find((item) => item.rawValue)?.rawValue ?? "";
+		if (!text) return "";
+		return stripOneTrailingSlash(text);
+	} catch {
+		return "";
+	} finally {
+		bitmap?.close();
+	}
+}
+
+function zxingReader(): BrowserMultiFormatReader {
+	const hints = new Map();
+	hints.set(DecodeHintType.POSSIBLE_FORMATS, [BarcodeFormat.QR_CODE]);
+	hints.set(DecodeHintType.TRY_HARDER, true);
+	return new BrowserMultiFormatReader(hints);
+}
+
+async function readZxing(image: string): Promise<string> {
+	const reader = zxingReader();
+	try {
+		const found = await reader.decodeFromImageUrl(image);
+		const text = found.getText();
+		if (!text) return "";
+		return stripOneTrailingSlash(text);
+	} catch {
+		return "";
+	} finally {
+		reader.reset();
+	}
+}
+
+async function decodeCameraImage(image: string): Promise<RustDecode> {
+	const frame = await cropBarcodeImage(image);
+	const fromNative = await readNative(frame);
+	if (fromNative) {
+		barcodeDecoder = "Native";
+		console.info("barcode detector native");
+		return { status: "pass", barcode: fromNative };
+	}
+	const fromZxing = await readZxing(frame);
+	if (fromZxing) {
+		barcodeDecoder = "JS";
+		console.info("barcode detector zxing");
+		return { status: "pass", barcode: fromZxing };
+	}
+	const decoded = await invoke<RustDecode>("decode_barcode", { image: frame });
+	if (decodedText(decoded)) {
+		barcodeDecoder = "Rust";
+		console.info("barcode detector rust");
+	}
+	return decoded;
+}
+
 async function readFrame(index: number): Promise<WatchBody> {
 	const res = await fetch(
 		`http://127.0.0.1:8008/camera/snapshot?index=${index}&frame=1`,
@@ -515,7 +691,8 @@ async function watchFeed() {
 	const index = cameraIndex;
 	try {
 		// Test mode is the typed code. The sidecar snapshot route still skips
-		// decode for that mode. Every other source sends the frame to Rust.
+		// decode for that mode. Every other source tries the native QR detector,
+		// then ZXing, then Rust.
 		await ensureBomSource();
 		await loadTestMode();
 		if (!pageAlive || !feedOn || snapshot || loading || index !== cameraIndex) {
@@ -527,9 +704,7 @@ async function watchFeed() {
 		}
 		const frame = await readFrame(index);
 		if (!stillWatches(index) || !frame.image) return;
-		const decoded = await invoke<RustDecode>("decode_barcode", {
-			image: frame.image,
-		});
+		const decoded = await decodeCameraImage(frame.image);
 		const code = decodedText(decoded);
 		if (!stillWatches(index) || !code) return;
 		const view = await lookupCode(code);
@@ -682,6 +857,7 @@ async function checkSidecar() {
 		void loadScan();
 		void loadTestMode();
 		void loadDetectRoi();
+		void loadBarcodeRoi();
 		void loadBomSource();
 		void loadModel();
 		void (async () => {
@@ -786,6 +962,7 @@ async function saveCameraIndex() {
 
 function readAdminFlag() {
 	admin = sessionStorage.getItem(ADMIN_FLAG) === "1";
+	void loadBarcodeRoi();
 	bomSourceReady = loadBomSource();
 	void loadTestMode();
 	void loadModel();
@@ -908,8 +1085,16 @@ function cancelRoiDraw() {
 	roiDrag = null;
 }
 
+function cancelBarcodeDraw() {
+	barcodeDrawing = false;
+	draftRoi = null;
+	draftMark = null;
+	roiDrag = null;
+}
+
 function beginSetRoi() {
 	if (!admin) return;
+	if (barcodeDrawing) cancelBarcodeDraw();
 	if (drawing) {
 		cancelRoiDraw();
 		roiMessage = "";
@@ -957,7 +1142,7 @@ function rectFromPoints(
 }
 
 function onRoiPointerDown(event: PointerEvent) {
-	if (!drawing) return;
+	if (!drawing && !barcodeDrawing) return;
 	const point = pointInImage(event);
 	if (!point) return;
 	(event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
@@ -989,6 +1174,15 @@ function onRoiPointerUp(event: PointerEvent) {
 	}
 	draftRoi = roi;
 	showDraft(roi);
+	if (barcodeDrawing) {
+		void saveBarcodeRoi({
+			x: roi.x,
+			y: roi.y,
+			width: roi.w,
+			height: roi.h,
+		});
+		return;
+	}
 	void saveDetectRoi(roi);
 }
 
@@ -1044,6 +1238,77 @@ function clearDetectRoi() {
 	if (!admin || savingRoi) return;
 	cancelRoiDraw();
 	void saveDetectRoi(null);
+}
+
+async function loadBarcodeRoi() {
+	try {
+		const config = await invoke<{ barcodeRoi?: unknown }>("load_local_config");
+		barcodeRoi = asBarcodeRoi(config.barcodeRoi);
+	} catch {
+		// A missed read keeps the current barcode region.
+	}
+}
+
+function roundBarcodeRoi(roi: BarcodeRoi): BarcodeRoi {
+	const round = (value: number) => Math.round(value * 10000) / 10000;
+	return {
+		x: round(roi.x),
+		y: round(roi.y),
+		width: round(roi.width),
+		height: round(roi.height),
+	};
+}
+
+async function saveBarcodeRoi(roi: BarcodeRoi | null) {
+	if (!admin) return;
+	savingBarcodeRoi = true;
+	roiMessage = "";
+	try {
+		const config = await invoke<Record<string, unknown>>("load_local_config");
+		config.barcodeRoi = roi ? roundBarcodeRoi(roi) : null;
+		await invoke("save_local_config", { config });
+		barcodeRoi = asBarcodeRoi(config.barcodeRoi);
+		draftRoi = null;
+		draftMark = null;
+		barcodeDrawing = false;
+		roiDrag = null;
+		roiMessage = barcodeRoi
+			? "Saved. Barcode decode uses this region."
+			: "Saved. Barcode decode uses the full frame.";
+	} catch (err: unknown) {
+		roiMessage = invokeError(err, "Could not save the barcode ROI");
+	} finally {
+		savingBarcodeRoi = false;
+	}
+}
+
+function beginSetBarcodeRoi() {
+	if (!admin) return;
+	if (barcodeDrawing) {
+		cancelBarcodeDraw();
+		roiMessage = "";
+		return;
+	}
+	if (snapshot) {
+		roiMessage = "Resume the live feed, then draw the barcode region.";
+		return;
+	}
+	if (!cameraFeedOn) {
+		roiMessage = "Start the camera, then draw the barcode region.";
+		return;
+	}
+	cancelRoiDraw();
+	roiMessage = "";
+	barcodeDrawing = true;
+	draftRoi = null;
+	draftMark = null;
+	roiDrag = null;
+}
+
+function clearBarcodeRoi() {
+	if (!admin || savingBarcodeRoi) return;
+	cancelBarcodeDraw();
+	void saveBarcodeRoi(null);
 }
 
 function rerunDetect() {
@@ -1154,6 +1419,7 @@ function closeErp() {
 function onErpKey(event: KeyboardEvent) {
 	if (event.key === "Escape" && erpOpen) closeErp();
 	else if (event.key === "Escape" && drawing) cancelRoiDraw();
+	else if (event.key === "Escape" && barcodeDrawing) cancelBarcodeDraw();
 }
 
 function onIframeError() {
@@ -1447,7 +1713,7 @@ async function decodeAndInspect() {
 		if (!frame.image) {
 			// A sidecar that does not know frame=1 still returns the code on a
 			// BoM miss, and no image. Keep that code. A new sidecar puts the
-			// JPEG here and leaves the barcode for Rust.
+			// JPEG here. The native QR detector reads it first, then ZXing, then Rust.
 			if (frame.barcode) {
 				barcode = frame.barcode;
 				dropBom();
@@ -1463,9 +1729,7 @@ async function decodeAndInspect() {
 			};
 			return;
 		}
-		const decoded = await invoke<RustDecode>("decode_barcode", {
-			image: frame.image,
-		});
+		const decoded = await decodeCameraImage(frame.image);
 		if (!pageAlive) return;
 		const code = decodedText(decoded);
 		if (!code) {
@@ -1660,6 +1924,24 @@ async function decodeAndInspect() {
 			>
 				Clear ROI
 			</button>
+			{#if !snapshot}
+				<button
+					type="button"
+					class="inline-flex min-h-11 items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100 disabled:text-neutral-500"
+					on:click={beginSetBarcodeRoi}
+					disabled={savingBarcodeRoi}
+				>
+					{barcodeDrawing ? "Cancel" : "Set barcode ROI"}
+				</button>
+				<button
+					type="button"
+					class="inline-flex min-h-11 items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100 disabled:text-neutral-500"
+					on:click={clearBarcodeRoi}
+					disabled={savingBarcodeRoi || !barcodeRoi}
+				>
+					Clear barcode ROI
+				</button>
+			{/if}
 		{/if}
 		{#if erpUrl}
 			<button
@@ -1773,6 +2055,27 @@ async function decodeAndInspect() {
 								/>
 							</svg>
 						{/if}
+						{#if !snapshot && !drawing && !barcodeDrawing && cameraFeedOn && paneWidth > 0 && paneHeight > 0}
+							{@const box = pixelBarcodeRoi(barcodeRoi, paneWidth, paneHeight)}
+							{#if box}
+								<svg
+									class="pointer-events-none absolute inset-0 z-10 h-full w-full"
+									viewBox="0 0 {paneWidth} {paneHeight}"
+									preserveAspectRatio="xMidYMid meet"
+								>
+									<rect
+										x={box.x}
+										y={box.y}
+										width={box.width}
+										height={box.height}
+										fill="none"
+										stroke="#67e8f9"
+										stroke-width="2"
+										vector-effect="non-scaling-stroke"
+									/>
+								</svg>
+							{/if}
+						{/if}
 						{#if snapshot && paneWidth > 0 && paneHeight > 0 && detections.length > 0}
 							{@const marks = detectionMarks(zoom)}
 							{@const viewW = zoom ? zoom.width : frameWidth}
@@ -1868,7 +2171,7 @@ async function decodeAndInspect() {
 						{feedOn ? "Resume live feed" : "Back to feed"}
 					</button>
 				{/if}
-				{#if drawing && snapshot}
+				{#if (drawing && snapshot) || (barcodeDrawing && !snapshot)}
 					<div
 						class="absolute inset-0 z-30 cursor-crosshair"
 						on:pointerdown={onRoiPointerDown}
@@ -1877,7 +2180,9 @@ async function decodeAndInspect() {
 						on:pointercancel={onRoiPointerUp}
 					></div>
 					<p class="pointer-events-none absolute left-3 top-3 z-40 bg-neutral-950/80 px-3 py-2 text-sm text-amber-200">
-						Drag a rectangle on the snapshot.
+						{barcodeDrawing
+							? "Drag a rectangle on the camera."
+							: "Drag a rectangle on the snapshot."}
 					</p>
 					{#if draftMark}
 						<div
@@ -2028,6 +2333,12 @@ async function decodeAndInspect() {
 			<span class="ml-2 font-mono text-xs font-medium normal-case tracking-normal text-neutral-300">
 				{modelName}
 			</span>
+			{#if admin}
+				<span class="ml-4">Barcode</span>
+				<span class="ml-2 font-mono text-xs font-medium normal-case tracking-normal text-neutral-300">
+					{barcodeDecoder || "—"}
+				</span>
+			{/if}
 		</p>
 	</footer>
 
