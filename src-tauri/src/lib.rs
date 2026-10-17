@@ -1,3 +1,5 @@
+mod local_config;
+
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
 fn greet(name: &str) -> String {
@@ -12,7 +14,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             greet,
             start_vision_sidecar,
-            kill_vision_sidecar
+            kill_vision_sidecar,
+            local_config::load_local_config,
+            local_config::save_local_config,
+            local_config::list_vision_models,
+            local_config::set_active_model
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
