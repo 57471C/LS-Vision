@@ -175,7 +175,7 @@ let erpChecking = false;
 let erpAttempt = 0;
 let erpLoadedUrl = "";
 let erpCloseButton: HTMLButtonElement | null = null;
-let modelName = "best.pt";
+let modelName = "best.onnx";
 let barcodeDecoder = "";
 let modelFiles: string[] = [];
 let modelMenuOpen = false;
@@ -431,30 +431,45 @@ function detectionMarks(
 	return marks;
 }
 
+async function requestDetections(body: { image?: string }): Promise<{
+	detections?: unknown;
+	image_base64?: unknown;
+	message?: unknown;
+}> {
+	// .onnx runs in Rust. A .pt file still uses the sidecar until that path is removed.
+	if (modelName.toLowerCase().endsWith(".onnx")) {
+		return await invoke("detect_image", {
+			image: body.image ?? null,
+		});
+	}
+	const res = await fetch("http://127.0.0.1:8008/detect", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify(body),
+	});
+	const payload = (await res.json()) as {
+		detections?: unknown;
+		image_base64?: unknown;
+		message?: unknown;
+	};
+	if (!res.ok) {
+		throw new Error(
+			typeof payload.message === "string" && payload.message
+				? payload.message
+				: "Detect failed",
+		);
+	}
+	return payload;
+}
+
 async function runDetect(generation: number, body: { image?: string }) {
 	if (generation !== detectGeneration) return;
 	detectState = "running";
 	detections = [];
 	detectMessage = "";
 	try {
-		const res = await fetch("http://127.0.0.1:8008/detect", {
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify(body),
-		});
-		const payload = (await res.json()) as {
-			detections?: unknown;
-			image_base64?: unknown;
-			message?: unknown;
-		};
+		const payload = await requestDetections(body);
 		if (generation !== detectGeneration || !pageAlive) return;
-		if (!res.ok) {
-			throw new Error(
-				typeof payload.message === "string" && payload.message
-					? payload.message
-					: "Detect failed",
-			);
-		}
 		detections = asDetections(payload.detections);
 		detectMessage = typeof payload.message === "string" ? payload.message : "";
 		const encoded = payload.image_base64;
@@ -575,7 +590,9 @@ async function cropBarcodeImage(image: string): Promise<string> {
 	} finally {
 		source?.close();
 	}
-}async function readNative(image: string): Promise<string> {
+}
+
+async function readNative(image: string): Promise<string> {
 	const Detector = qrBarcodeDetector();
 	if (!Detector) return "";
 	let bitmap: ImageBitmap | null = null;
@@ -975,6 +992,16 @@ function matchModelName(name: string, files: string[]): string {
 	return files.find((item) => item.toLowerCase() === cleaned) ?? "";
 }
 
+function preferredModel(files: string[]): string {
+	return (
+		matchModelName("best.onnx", files) ||
+		matchModelName("best.pt", files) ||
+		files.find((item) => item.toLowerCase().endsWith(".onnx")) ||
+		files[0] ||
+		"best.onnx"
+	);
+}
+
 function readModelFiles(value: unknown): string[] {
 	if (!Array.isArray(value)) return [];
 	return value.filter(
@@ -995,8 +1022,7 @@ async function loadModel() {
 		modelFiles = files;
 		const stored = typeof config.model === "string" ? config.model : "";
 		const match = matchModelName(stored, files);
-		const fallback = matchModelName("best.pt", files);
-		modelName = match || fallback || "best.pt";
+		modelName = match || preferredModel(files);
 	} catch {
 		// A missed read keeps the last model name.
 	}
@@ -1062,8 +1088,18 @@ async function chooseModel(filename: string) {
 			typeof saved.active === "string" && saved.active.trim()
 				? saved.active.trim()
 				: filename;
-		await reloadSidecarModel(active);
-		modelMenuOpen = false;
+		if (active.toLowerCase().endsWith(".onnx")) {
+			modelName = active;
+			modelMenuOpen = false;
+			try {
+				await reloadSidecarModel(active);
+			} catch {
+				modelNotice = `Saved. Active model is ${active}.`;
+			}
+		} else {
+			await reloadSidecarModel(active);
+			modelMenuOpen = false;
+		}
 	} catch (err: unknown) {
 		modelNotice = invokeError(err, "Could not switch the model");
 	} finally {

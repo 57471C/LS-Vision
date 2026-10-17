@@ -50,7 +50,7 @@ let roiNotice = "";
 let savingRoi = false;
 let modelFiles: string[] = [];
 let modelName = "";
-let modelActive = "best.pt";
+let modelActive = "best.onnx";
 let modelNotice = "";
 let savingModel = false;
 let cameraIndex = 0;
@@ -261,7 +261,7 @@ function applyModel(data: {
 }) {
 	modelFiles = readModelFiles(data.files);
 	const active = typeof data.active === "string" ? data.active.trim() : "";
-	modelActive = active || "best.pt";
+	modelActive = active || "best.onnx";
 	const selected = typeof data.model === "string" ? data.model : "";
 	if (modelFiles.includes(selected)) modelName = selected;
 	else if (modelFiles.includes(modelActive)) modelName = modelActive;
@@ -279,16 +279,20 @@ async function loadModelFromRust() {
 	const config = await invokeRust<BomDocument>("load_local_config");
 	const stored = stringField(config.model);
 	const match = matchFile(stored, files);
-	const fallback = matchFile("best.pt", files);
+	const fallback =
+		matchFile("best.onnx", files) ||
+		matchFile("best.pt", files) ||
+		files.find((item) => item.toLowerCase().endsWith(".onnx")) ||
+		"";
 	applyModel({
 		model: match,
-		active: match || fallback || "best.pt",
+		active: match || fallback || "best.onnx",
 		files,
 	});
 	if (stored.trim() && !match) {
 		modelNotice = fallback
 			? `${stored.trim()} was not found. Using ${fallback}.`
-			: `${stored.trim()} was not found. best.pt was not found.`;
+			: `${stored.trim()} was not found. best.onnx was not found.`;
 		return;
 	}
 	modelNotice = "";
@@ -1649,9 +1653,9 @@ onDestroy(() => {
 								</label>
 								<p class="text-sm text-neutral-400">
 									{#if modelFiles.length === 0}
-										No .pt or .onnx files in vision/models. Detection uses best.pt when that file is present.
+										No .pt or .onnx files in vision/models. Detection uses best.onnx when that file is present, otherwise best.pt.
 									{:else}
-										Choose a .pt or .onnx file in vision/models. A missing file, or no selection, uses best.pt.
+										Choose a .pt or .onnx file in vision/models. A missing file, or no selection, uses best.onnx when that file is present, otherwise best.pt.
 									{/if}
 								</p>
 							</fieldset>
