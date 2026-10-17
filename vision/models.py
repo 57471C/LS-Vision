@@ -74,40 +74,40 @@ def _model_file(name):
         return found
     return None
 
-def _model_choice():
-    # Returns (stored name, file to load, note). A missing or empty choice uses best.pt.
-    files = _list_model_files()
-    stored = _clean_model_name(load_bom_source().get("model"))
-    match = _match_model_file(stored, files)
-    default_name = _match_model_file(DEFAULT_MODEL_NAME, files)
-    if match:
-        return stored, match, ""
-    if default_name:
-        if stored:
-            return stored, default_name, f"{stored} was not found. Using {default_name}."
-        return "", default_name, ""
-    if stored:
-        return stored, DEFAULT_MODEL_NAME, f"{stored} was not found. {DEFAULT_MODEL_NAME} was not found."
-    return "", DEFAULT_MODEL_NAME, f"YOLO model {DEFAULT_MODEL_NAME} was not found."
-
 def _model_payload():
     # detect imports this module. Load it here so the two can call each other.
+    # GET /settings/model uses this to load the filename saved in config.local.json.
     import detect
 
     model, load_message = detect._ensure_yolo()
     files = _list_model_files()
-    stored, choice, note = _model_choice()
-    selected = _match_model_file(stored, files) or _match_model_file(choice, files)
-    active = choice
+    stored = _clean_model_name(load_bom_source().get("model")) or ""
+    requested = stored or DEFAULT_MODEL_NAME
+    active = ""
     with detect._yolo_lock:
-        if model is not None and detect._yolo_loaded_key:
+        if detect._yolo_loaded_key:
             active = Path(detect._yolo_loaded_key[0]).name
+    ok = (
+        model is not None
+        and active.lower() == requested.lower()
+        and not load_message
+    )
+    if ok:
+        return {
+            "status": "pass",
+            "model": active,
+            "active": active,
+            "files": files,
+            "loaded": True,
+            "message": "",
+        }
     return {
-        "model": selected or active,
+        "status": "fail",
+        "model": requested,
         "active": active,
         "files": files,
         "loaded": model is not None,
-        "message": load_message or note or "",
+        "message": load_message or f"{requested} was not loaded.",
     }
 
 router = APIRouter()
@@ -130,13 +130,9 @@ def update_model(body: ModelUpdate):
     config["model"] = match
     save_bom_source(config)
     payload = _model_payload()
-    if payload["loaded"]:
-        if payload["message"]:
-            text = f"Saved. {payload['message']}"
-        else:
-            text = f"Saved. Detection uses {payload['active']}."
-    else:
-        text = f"Saved. {payload['message'] or 'The model is not loaded.'}"
-    payload["message"] = text
+    if payload.get("status") == "fail":
+        payload["message"] = f"Saved. {payload['message']}"
+        return payload
+    payload["message"] = f"Saved. Detection uses {payload['active']}."
     payload["status"] = "pass"
     return payload

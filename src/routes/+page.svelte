@@ -177,6 +177,10 @@ let erpLoadedUrl = "";
 let erpCloseButton: HTMLButtonElement | null = null;
 let modelName = "best.pt";
 let barcodeDecoder = "";
+let modelFiles: string[] = [];
+let modelMenuOpen = false;
+let savingModel = false;
+let modelNotice = "";
 
 function stopWatch() {
 	if (streamTimer !== null) {
@@ -484,7 +488,6 @@ function decodedText(body: RustDecode): string {
 	return body.barcode;
 }
 
-// Drop one trailing slash. A second slash stays.
 function stripOneTrailingSlash(text: string): string {
 	return text.endsWith("/") ? text.slice(0, -1) : text;
 }
@@ -516,7 +519,6 @@ function asBarcodeRoi(value: unknown): BarcodeRoi | null {
 	if (row.width <= 0 || row.height <= 0) return null;
 	return { x: row.x, y: row.y, width: row.width, height: row.height };
 }
-
 // Values from 0 to 1 are a portion of the frame. Anything larger is pixels.
 function pixelBarcodeRoi(
 	roi: BarcodeRoi | null,
@@ -525,7 +527,6 @@ function pixelBarcodeRoi(
 ): BarcodeRoi | null {
 	if (!roi || imageWidth < 1 || imageHeight < 1) return null;
 	const { x, y, width, height } = roi;
-	if (width <= 0 || height <= 0) return null;
 	const portion =
 		x >= 0 && y >= 0 && x <= 1 && y <= 1 && width <= 1 && height <= 1;
 	const left = portion ? x * imageWidth : x;
@@ -542,7 +543,6 @@ function pixelBarcodeRoi(
 	if (croppedW <= 0 || croppedH <= 0) return null;
 	return { x: x0, y: y0, width: croppedW, height: croppedH };
 }
-
 async function cropBarcodeImage(image: string): Promise<string> {
 	if (!barcodeRoi) return image;
 	let source: ImageBitmap | null = null;
@@ -575,9 +575,7 @@ async function cropBarcodeImage(image: string): Promise<string> {
 	} finally {
 		source?.close();
 	}
-}
-
-async function readNative(image: string): Promise<string> {
+}async function readNative(image: string): Promise<string> {
 	const Detector = qrBarcodeDetector();
 	if (!Detector) return "";
 	let bitmap: ImageBitmap | null = null;
@@ -624,20 +622,22 @@ async function decodeCameraImage(image: string): Promise<RustDecode> {
 	const frame = await cropBarcodeImage(image);
 	const fromNative = await readNative(frame);
 	if (fromNative) {
-		barcodeDecoder = "Native";
+		barcodeDecoder = "native";
 		console.info("barcode detector native");
 		return { status: "pass", barcode: fromNative };
 	}
 	const fromZxing = await readZxing(frame);
 	if (fromZxing) {
-		barcodeDecoder = "JS";
+		barcodeDecoder = "js";
 		console.info("barcode detector zxing");
 		return { status: "pass", barcode: fromZxing };
 	}
 	const decoded = await invoke<RustDecode>("decode_barcode", { image: frame });
 	if (decodedText(decoded)) {
-		barcodeDecoder = "Rust";
+		barcodeDecoder = "rust";
 		console.info("barcode detector rust");
+	} else {
+		barcodeDecoder = "";
 	}
 	return decoded;
 }
@@ -691,8 +691,7 @@ async function watchFeed() {
 	const index = cameraIndex;
 	try {
 		// Test mode is the typed code. The sidecar snapshot route still skips
-		// decode for that mode. Every other source tries the native QR detector,
-		// then ZXing, then Rust.
+		// decode for that mode. Every other source tries native, then JS, then Rust.
 		await ensureBomSource();
 		await loadTestMode();
 		if (!pageAlive || !feedOn || snapshot || loading || index !== cameraIndex) {
@@ -962,6 +961,7 @@ async function saveCameraIndex() {
 
 function readAdminFlag() {
 	admin = sessionStorage.getItem(ADMIN_FLAG) === "1";
+	if (!admin) modelMenuOpen = false;
 	void loadBarcodeRoi();
 	bomSourceReady = loadBomSource();
 	void loadTestMode();
@@ -975,21 +975,99 @@ function matchModelName(name: string, files: string[]): string {
 	return files.find((item) => item.toLowerCase() === cleaned) ?? "";
 }
 
+function readModelFiles(value: unknown): string[] {
+	if (!Array.isArray(value)) return [];
+	return value.filter(
+		(item): item is string => typeof item === "string" && item.length > 0,
+	);
+}
+
+function closeModelMenu() {
+	if (savingModel) return;
+	modelMenuOpen = false;
+}
+
 async function loadModel() {
 	try {
 		const listed = await invoke<unknown>("list_vision_models");
 		const config = await invoke<{ model?: unknown }>("load_local_config");
-		const files = Array.isArray(listed)
-			? listed.filter(
-					(item): item is string => typeof item === "string" && item.length > 0,
-				)
-			: [];
+		const files = readModelFiles(listed);
+		modelFiles = files;
 		const stored = typeof config.model === "string" ? config.model : "";
 		const match = matchModelName(stored, files);
 		const fallback = matchModelName("best.pt", files);
 		modelName = match || fallback || "best.pt";
 	} catch {
 		// A missed read keeps the last model name.
+	}
+}
+
+async function toggleModelMenu() {
+	if (!admin || savingModel) return;
+	if (modelMenuOpen) {
+		modelMenuOpen = false;
+		return;
+	}
+	modelMenuOpen = true;
+	modelNotice = "";
+	await loadModel();
+}
+
+async function reloadSidecarModel(filename: string) {
+	let res: Response;
+	try {
+		res = await fetch("http://127.0.0.1:8008/settings/model", {
+			cache: "no-store",
+		});
+	} catch {
+		throw new Error(
+			"Saved. The sidecar is not running, so the model was not reloaded.",
+		);
+	}
+	if (!res.ok) throw new Error("Saved. The sidecar did not reload the model.");
+	const body = (await res.json()) as {
+		status?: unknown;
+		loaded?: unknown;
+		active?: unknown;
+		message?: unknown;
+	};
+	const message = typeof body.message === "string" ? body.message.trim() : "";
+	const active = typeof body.active === "string" ? body.active.trim() : "";
+	const loadedThisFile =
+		body.status !== "fail" &&
+		body.loaded === true &&
+		active.toLowerCase() === filename.toLowerCase();
+	if (!loadedThisFile) {
+		throw new Error(message || "Saved. The sidecar did not reload the model.");
+	}
+	modelName = active;
+}
+
+async function chooseModel(filename: string) {
+	if (!admin || savingModel) return;
+	if (filename.toLowerCase() === modelName.toLowerCase()) {
+		modelMenuOpen = false;
+		return;
+	}
+	savingModel = true;
+	modelNotice = "";
+	try {
+		const saved = await invoke<{
+			active?: unknown;
+			files?: unknown;
+		}>("set_active_model", { filename });
+		const files = readModelFiles(saved.files);
+		if (files.length > 0) modelFiles = files;
+		const active =
+			typeof saved.active === "string" && saved.active.trim()
+				? saved.active.trim()
+				: filename;
+		await reloadSidecarModel(active);
+		modelMenuOpen = false;
+	} catch (err: unknown) {
+		modelNotice = invokeError(err, "Could not switch the model");
+	} finally {
+		savingModel = false;
 	}
 }
 
@@ -1419,6 +1497,7 @@ function closeErp() {
 function onErpKey(event: KeyboardEvent) {
 	if (event.key === "Escape" && erpOpen) closeErp();
 	else if (event.key === "Escape" && drawing) cancelRoiDraw();
+	else if (event.key === "Escape" && modelMenuOpen) closeModelMenu();
 	else if (event.key === "Escape" && barcodeDrawing) cancelBarcodeDraw();
 }
 
@@ -2328,18 +2407,71 @@ async function decodeAndInspect() {
 	</div>
 
 	<footer class="flex shrink-0 items-center border-t border-neutral-800 bg-neutral-900 px-4 py-1.5">
-		<p class="text-[11px] font-semibold uppercase tracking-widest text-neutral-500">
+		<div class="text-[11px] font-semibold uppercase tracking-widest text-neutral-500">
 			Model
-			<span class="ml-2 font-mono text-xs font-medium normal-case tracking-normal text-neutral-300">
-				{modelName}
-			</span>
+			{#if admin}
+				<span class="relative inline-block">
+					<button
+						type="button"
+						class="ml-2 font-mono text-xs font-medium normal-case tracking-normal text-neutral-300 underline-offset-2 hover:underline disabled:text-neutral-500"
+						aria-haspopup="menu"
+						aria-expanded={modelMenuOpen}
+						aria-label="Choose model"
+						disabled={savingModel}
+						on:click={toggleModelMenu}
+					>
+						{modelName}
+					</button>
+					{#if modelMenuOpen}
+						<button
+							type="button"
+							class="fixed inset-0 z-40 cursor-default"
+							aria-label="Close model menu"
+							on:click={closeModelMenu}
+						></button>
+						<span
+							role="menu"
+							aria-label="Models"
+							class="absolute bottom-full left-0 z-50 mb-2 max-h-60 min-w-44 overflow-auto border border-neutral-600 bg-neutral-900 py-1 shadow-lg"
+						>
+							{#each modelFiles as file (file)}
+								<button
+									type="button"
+									role="menuitem"
+									class="block w-full px-3 py-2 text-left font-mono text-xs font-medium normal-case tracking-normal hover:bg-neutral-800 disabled:text-neutral-500 {file.toLowerCase() ===
+									modelName.toLowerCase()
+										? 'bg-neutral-800 text-neutral-100'
+										: 'text-neutral-300'}"
+									disabled={savingModel}
+									on:click={() => chooseModel(file)}
+								>
+									{file}
+								</button>
+							{:else}
+								<span class="block px-3 py-2 text-sm font-medium normal-case tracking-normal text-neutral-400">
+									No .pt or .onnx files in vision/models.
+								</span>
+							{/each}
+							{#if modelNotice}
+								<span class="block px-3 py-2 text-sm font-medium normal-case tracking-normal text-red-300">
+									{modelNotice}
+								</span>
+							{/if}
+						</span>
+					{/if}
+				</span>
+			{:else}
+				<span class="ml-2 font-mono text-xs font-medium normal-case tracking-normal text-neutral-300">
+					{modelName}
+				</span>
+			{/if}
 			{#if admin}
 				<span class="ml-4">Barcode</span>
 				<span class="ml-2 font-mono text-xs font-medium normal-case tracking-normal text-neutral-300">
 					{barcodeDecoder || "—"}
 				</span>
 			{/if}
-		</p>
+		</div>
 	</footer>
 
 	<button

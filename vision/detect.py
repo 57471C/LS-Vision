@@ -1,5 +1,6 @@
 import base64
 import threading
+from pathlib import Path
 from typing import Optional
 
 import cameras
@@ -9,14 +10,14 @@ from cameras import _jpeg_base64
 from fastapi import APIRouter, Body
 from pydantic import BaseModel
 
-from config import DEFAULT_MODEL_NAME, _clean_detect_roi, load_bom_source
-from models import _model_choice, _model_file
+from config import DEFAULT_MODEL_NAME, _clean_detect_roi, _clean_model_name, load_bom_source
+from models import _model_file
 
 yolo_model = None
 _yolo_lock = threading.RLock()
 # (path, mtime_ns) of the weights object in yolo_model. None when nothing is loaded.
 _yolo_loaded_key = None
-# (stored name, resolved name, mtime_ns) of the last load attempt, including failures.
+# (requested name, path or "", mtime_ns) of the last load attempt, including failures.
 _yolo_attempt_key = None
 _yolo_message = ""
 
@@ -48,56 +49,98 @@ def _finish_load(path, note):
     print(f"Loaded YOLO model {path.name} with {len(labels)} part classes")
     return loaded, path, mtime, note
 
-def _load_choice(path, note):
-    # path is an existing weights file, or None when the choice is missing.
-    if path is None:
-        return None, None, None, note or f"YOLO model {DEFAULT_MODEL_NAME} was not found."
+def _saved_model_name():
+    # Empty config means best.pt. A different saved name is not replaced here.
+    stored = _clean_model_name(load_bom_source().get("model")) or ""
+    return stored or DEFAULT_MODEL_NAME
+
+def _loaded_name():
+    if not _yolo_loaded_key:
+        return ""
+    return Path(_yolo_loaded_key[0]).name
+
+def _store_loaded(attempt, loaded, used_path, used_mtime, message):
+    global yolo_model, _yolo_loaded_key, _yolo_attempt_key, _yolo_message
+    yolo_model = loaded
+    if loaded is not None and used_path is not None:
+        _yolo_loaded_key = (str(used_path), used_mtime)
+    else:
+        _yolo_loaded_key = None
+    _yolo_attempt_key = attempt
+    _yolo_message = message or ""
+    if _yolo_message:
+        print(_yolo_message)
+    return yolo_model, _yolo_message
+
+def _keep_loaded(attempt, message):
+    # The requested file did not load. Leave the weights already in memory.
+    global _yolo_attempt_key, _yolo_message
+    previous = _loaded_name()
+    if previous:
+        if message and message[-1] not in ".!?":
+            message = f"{message}."
+        message = f"{message} Detection is still using {previous}."
+    _yolo_attempt_key = attempt
+    _yolo_message = message
+    print(message)
+    return yolo_model, _yolo_message
+
+def _startup_default(attempt, message):
+    # Nothing is loaded yet, and the saved file is missing or unreadable.
+    default_path = _model_file(DEFAULT_MODEL_NAME)
+    if default_path is None:
+        return _store_loaded(attempt, None, None, None, message)
     try:
-        return _finish_load(path, note)
+        loaded, used_path, used_mtime, _note = _finish_load(default_path, "")
     except Exception as exc:
-        print(f"YOLO model {path.name} failed to load: {_short_error(exc)}")
-        default_path = _model_file(DEFAULT_MODEL_NAME)
-        if default_path is not None and default_path.resolve() != path.resolve():
-            fallback = f"{path.name} failed to load. Using {default_path.name}."
-            try:
-                return _finish_load(default_path, fallback)
-            except Exception as fallback_exc:
-                print(f"YOLO model {default_path.name} failed to load: {_short_error(fallback_exc)}")
-                message = f"{path.name} failed to load. {default_path.name} failed to load: {_short_error(fallback_exc)}"
-                return None, None, None, message
-        return None, None, None, f"{path.name} failed to load: {_short_error(exc)}"
+        text = f"{message} {default_path.name} failed to load: {_short_error(exc)}"
+        return _store_loaded(attempt, None, None, None, text)
+    return _store_loaded(
+        attempt,
+        loaded,
+        used_path,
+        used_mtime,
+        f"{message} Using {default_path.name}.",
+    )
 
 def _ensure_yolo():
-    # Reload when the saved file name or the file's mtime changes. A failed file is not retried
-    # until one of those changes, so the next detection stays fast.
-    global yolo_model, _yolo_loaded_key, _yolo_attempt_key, _yolo_message
-    stored, choice, note = _model_choice()
-    path = _model_file(choice)
+    # Read the filename in config.local.json and load that file. Reload when the
+    # name or the file mtime changes. A failed file is not retried until then.
+    # If a model is already loaded, a missing or broken file leaves it in place.
+    global _yolo_attempt_key, _yolo_message
+    requested = _saved_model_name()
+    path = _model_file(requested)
     mtime = None
     if path is not None:
         try:
             mtime = path.stat().st_mtime_ns
         except OSError:
             path = None
-    attempt = (stored, choice, mtime)
+    attempt = (requested, str(path) if path is not None else "", mtime)
     with _yolo_lock:
         if _yolo_attempt_key == attempt:
             return yolo_model, _yolo_message
         if path is not None and yolo_model is not None and _yolo_loaded_key == (str(path), mtime):
             _yolo_attempt_key = attempt
-            _yolo_message = note
-            return yolo_model, _yolo_message
-        loaded, used_path, used_mtime, message = _load_choice(path, note)
-        yolo_model = loaded
-        if loaded is not None and used_path is not None:
-            _yolo_loaded_key = (str(used_path), used_mtime)
-        else:
-            _yolo_loaded_key = None
-        _yolo_attempt_key = attempt
-        _yolo_message = message
-        if message:
-            print(message)
-        return yolo_model, _yolo_message
+            _yolo_message = ""
+            return yolo_model, ""
+        if path is None:
+            message = f"{requested} was not found in vision/models."
+            if yolo_model is not None:
+                return _keep_loaded(attempt, message)
+            if requested.lower() != DEFAULT_MODEL_NAME.lower():
+                return _startup_default(attempt, message)
+            return _store_loaded(attempt, None, None, None, message)
+        try:
+            loaded, used_path, used_mtime, _note = _finish_load(path, "")
+        except Exception as exc:
+            message = f"{requested} failed to load: {_short_error(exc)}"
+            if yolo_model is not None:
+                return _keep_loaded(attempt, message)
+            if requested.lower() != DEFAULT_MODEL_NAME.lower():
+                return _startup_default(attempt, message)
+            return _store_loaded(attempt, None, None, None, message)
+        return _store_loaded(attempt, loaded, used_path, used_mtime, "")
 
 def _image_from_encoded(value):
     if not isinstance(value, str) or not value.strip():

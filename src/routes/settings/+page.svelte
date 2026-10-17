@@ -1059,7 +1059,10 @@ async function openPreview() {
 }
 
 onMount(() => {
-	if (!unlocked) return;
+	if (!unlocked) {
+		void loadModel();
+		return;
+	}
 	void loadSource();
 	if (section === "camera") void loadCameraSettings();
 	watchSidecar();
