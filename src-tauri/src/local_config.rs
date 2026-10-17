@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 const CONFIG_FILE: &str = "config.local.json";
 const LEGACY_FILE: &str = "bom-source.json";
@@ -244,19 +244,6 @@ fn active_name(stored: &str, files: &[String]) -> String {
     DEFAULT_MODEL_NAME.to_string()
 }
 
-fn detection_note(stored: &str, active: &str, files: &[String]) -> String {
-    if !stored.is_empty() && match_model(stored, files).is_none() {
-        if match_model(DEFAULT_MODEL_NAME, files).is_some() {
-            return format!("{stored} was not found. Using {active}.");
-        }
-        return format!("{stored} was not found. {DEFAULT_MODEL_NAME} was not found.");
-    }
-    if stored.is_empty() && match_model(DEFAULT_MODEL_NAME, files).is_none() {
-        return format!("YOLO model {DEFAULT_MODEL_NAME} was not found.");
-    }
-    format!("The sidecar uses {active} on the next detection.")
-}
-
 fn store_active_model(root: &Path, filename: &str) -> Result<ActiveModel, String> {
     let files = list_models(root)?;
     let model = select_model_name(filename, &files)?;
@@ -264,7 +251,7 @@ fn store_active_model(root: &Path, filename: &str) -> Result<ActiveModel, String
     assign_model(&mut document, &model)?;
     save_document(root, &document)?;
     let active = active_name(&model, &files);
-    let message = format!("Saved. {}", detection_note(&model, &active, &files));
+    let message = format!("Saved. Active model is {active}.");
     Ok(ActiveModel {
         model,
         active,
@@ -298,6 +285,7 @@ pub fn set_active_model(filename: String) -> Result<ActiveModel, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Map;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     struct TempProject {
@@ -460,7 +448,7 @@ mod tests {
             saved.files,
             vec!["Best.pt".to_string(), "other.onnx".to_string()]
         );
-        assert!(saved.message.contains("Best.pt"));
+        assert_eq!(saved.message, "Saved. Active model is Best.pt.");
 
         let document = load_document(project.root()).unwrap();
         assert_eq!(document["model"], "Best.pt");
@@ -494,7 +482,7 @@ mod tests {
         let saved = store_active_model(project.root(), "  ").unwrap();
         assert_eq!(saved.model, "");
         assert_eq!(saved.active, "best.pt");
-        assert!(saved.message.contains("best.pt"));
+        assert_eq!(saved.message, "Saved. Active model is best.pt.");
         assert_eq!(load_document(project.root()).unwrap()["model"], "");
         assert_eq!(load_document(project.root()).unwrap()["source"], "json");
     }

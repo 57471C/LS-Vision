@@ -1747,7 +1747,6 @@ onDestroy(() => {
 									{#if rustConfig}
 										Chosen file
 										<span class="font-mono text-neutral-100">{modelActive}</span>.
-										The sidecar loads it on the next detection.
 									{:else}
 										Current model
 										<span class="font-mono text-neutral-100">{modelActive}</span>
