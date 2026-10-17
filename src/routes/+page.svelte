@@ -90,13 +90,10 @@ type DetectedCount = {
 const DEFAULT_SCAN_SECONDS = 8;
 // Settings unlock is the admin flag for this tab. It is not stored in config.
 const ADMIN_FLAG = "ls-vision-settings-open";
-const RUST_BOM_KEY = "ls-vision-rust-bom";
 
 let barcode = "";
 let bomSource: "json" | "mssql" | "api" = "json";
 let bomSourceReady: Promise<void> | null = null;
-let desktop = false;
-let rustBom = false;
 let result: InspectView | null = null;
 let bom: BomView | null = null;
 let loading = false;
@@ -676,25 +673,8 @@ function ensureBomSource(): Promise<void> {
 }
 
 async function loadBomSource() {
-	if (rustBom && inTauri()) {
-		try {
-			const data = await invoke<{ source?: unknown }>("load_local_config");
-			if (
-				data.source === "api" ||
-				data.source === "mssql" ||
-				data.source === "json"
-			) {
-				bomSource = data.source;
-				return;
-			}
-		} catch {
-			// Fall through to the sidecar when the local file cannot be read.
-		}
-	}
 	try {
-		const res = await fetch("http://127.0.0.1:8008/settings/bom-source");
-		if (!res.ok) return;
-		const data = await res.json();
+		const data = await invoke<{ source?: unknown }>("load_local_config");
 		if (
 			data.source === "api" ||
 			data.source === "mssql" ||
@@ -780,38 +760,33 @@ async function saveCameraIndex() {
 	}
 }
 
-function inTauri(): boolean {
-	return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-}
-
-function onRustBomChange() {
-	if (!inTauri()) {
-		rustBom = false;
-		return;
-	}
-	sessionStorage.setItem(RUST_BOM_KEY, rustBom ? "1" : "0");
-	bomSourceReady = loadBomSource();
-}
-
 function readAdminFlag() {
 	admin = sessionStorage.getItem(ADMIN_FLAG) === "1";
-	desktop = inTauri();
-	rustBom = desktop && sessionStorage.getItem(RUST_BOM_KEY) === "1";
 	bomSourceReady = loadBomSource();
 	void loadTestMode();
-	if (sidecarUp) {
-		void loadModel();
-		void applySavedCamera();
-	}
+	void loadModel();
+	if (sidecarUp) void applySavedCamera();
+}
+
+function matchModelName(name: string, files: string[]): string {
+	const cleaned = name.trim().toLowerCase();
+	if (!cleaned) return "";
+	return files.find((item) => item.toLowerCase() === cleaned) ?? "";
 }
 
 async function loadModel() {
 	try {
-		const res = await fetch("http://127.0.0.1:8008/settings/model");
-		if (!res.ok) return;
-		const data = await res.json();
-		const active = typeof data.active === "string" ? data.active.trim() : "";
-		if (active) modelName = active;
+		const listed = await invoke<unknown>("list_vision_models");
+		const config = await invoke<{ model?: unknown }>("load_local_config");
+		const files = Array.isArray(listed)
+			? listed.filter(
+					(item): item is string => typeof item === "string" && item.length > 0,
+				)
+			: [];
+		const stored = typeof config.model === "string" ? config.model : "";
+		const match = matchModelName(stored, files);
+		const fallback = matchModelName("best.pt", files);
+		modelName = match || fallback || "best.pt";
 	} catch {
 		// A missed read keeps the last model name.
 	}
@@ -1353,52 +1328,14 @@ function viewFromApiData(data: unknown): InspectView {
 	return { status: "fail", message: "BoM API response has no kit IC." };
 }
 
-function apiFailureMessage(
-	body: unknown,
-	text: string,
-	status: number,
-): string {
-	if (body && typeof body === "object" && !Array.isArray(body)) {
-		const row = body as Record<string, unknown>;
-		if (typeof row.message === "string" && row.message.trim()) {
-			return row.message.trim();
-		}
-	}
-	if (text.trim()) return text.trim();
-	return `BoM API lookup failed (${status}).`;
-}
-
 async function runApiLookup() {
 	if (loading) return;
 	loading = true;
 	result = null;
 	try {
-		let body: unknown = null;
-		if (rustBom && inTauri()) {
-			body = await invoke("post_bom_api", {
-				jobCardNumber: barcode.trim(),
-			});
-		} else {
-			const res = await fetch("http://127.0.0.1:8008/bom/api", {
-				method: "POST",
-				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ jobCardNumber: barcode.trim() }),
-			});
-			const text = await res.text();
-			try {
-				body = text ? JSON.parse(text) : null;
-			} catch {
-				body = null;
-			}
-			if (!res.ok || !body) {
-				result = {
-					status: "fail",
-					message: apiFailureMessage(body, text, res.status),
-				};
-				dropBom();
-				return;
-			}
-		}
+		const body = await invoke("post_bom_api", {
+			jobCardNumber: barcode.trim(),
+		});
 		const view = viewFromApiData(body);
 		result = view;
 		if (view.status === "pass") {
@@ -1441,7 +1378,7 @@ async function runInspect() {
 		await runApiLookup();
 		return;
 	}
-	if (rustBom && inTauri() && bomSource === "json") {
+	if (bomSource === "json") {
 		await runJsonLookup();
 		return;
 	}
@@ -1625,20 +1562,6 @@ async function decodeAndInspect() {
 				bind:value={barcode}
 			/>
 		</label>
-		{#if desktop}
-			<label
-				class="mb-0.5 flex min-h-11 items-center gap-2 self-end text-[11px] font-semibold uppercase tracking-widest text-neutral-400"
-				title="JSON file lookup and the job card API run in the app. SQL stays on the sidecar."
-			>
-				<input
-					type="checkbox"
-					class="h-4 w-4 accent-blue-500"
-					bind:checked={rustBom}
-					on:change={onRustBomChange}
-				/>
-				Use Rust for BoM
-			</label>
-		{/if}
 		<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
 			Camera
 			<select

@@ -5,8 +5,6 @@ import { onDestroy, onMount } from "svelte";
 const DEV_PASSWORD = "admin";
 const UNLOCK_KEY = "ls-vision-settings-open";
 const SECTION_KEY = "ls-vision-settings-section";
-const RUST_CONFIG_KEY = "ls-vision-rust-config";
-const RUST_BOM_KEY = "ls-vision-rust-bom";
 const DEFAULT_SQL_DRIVER = "ODBC Driver 18 for SQL Server";
 
 type BomSource = "json" | "mssql" | "api";
@@ -53,7 +51,6 @@ let savingRoi = false;
 let modelFiles: string[] = [];
 let modelName = "";
 let modelActive = "best.pt";
-let modelLoaded = false;
 let modelNotice = "";
 let savingModel = false;
 let cameraIndex = 0;
@@ -84,10 +81,6 @@ let killingSidecar = false;
 let sidecarUp = false;
 let sidecarNotice = "";
 let sidecarTimer: ReturnType<typeof setInterval> | null = null;
-let desktop = false;
-let desktopChecked = false;
-let rustConfig = false;
-let rustBom = false;
 let configLoadId = 0;
 
 const PREVIEW_LABEL = "camera-preview";
@@ -238,20 +231,11 @@ async function invokeRust<T>(
 
 async function loadSource() {
 	const id = ++configLoadId;
-	const useRust = rustConfig;
 	notice = "";
 	try {
-		if (useRust) {
-			const data = await invokeRust<BomDocument>("load_local_config");
-			if (id !== configLoadId) return;
-			applyBomSource(data);
-		} else {
-			const res = await fetch("http://127.0.0.1:8008/settings/bom-source");
-			if (id !== configLoadId) return;
-			if (!res.ok) throw new Error(await res.text());
-			applyBomSource(await res.json());
-		}
+		const data = await invokeRust<BomDocument>("load_local_config");
 		if (id !== configLoadId) return;
+		applyBomSource(data);
 		await loadErp();
 		await loadScan();
 		await loadTestMode();
@@ -259,12 +243,7 @@ async function loadSource() {
 		await loadModel();
 	} catch (err: unknown) {
 		if (id !== configLoadId) return;
-		notice = useRust
-			? invokeError(err, "Could not load vision/config.local.json.")
-			: errorMessage(
-					err,
-					"Could not load the BoM source. Is the vision sidecar running?",
-				);
+		notice = invokeError(err, "Could not load vision/config.local.json.");
 	}
 }
 
@@ -279,12 +258,10 @@ function applyModel(data: {
 	model?: unknown;
 	active?: unknown;
 	files?: unknown;
-	loaded?: unknown;
 }) {
 	modelFiles = readModelFiles(data.files);
 	const active = typeof data.active === "string" ? data.active.trim() : "";
 	modelActive = active || "best.pt";
-	modelLoaded = data.loaded === true;
 	const selected = typeof data.model === "string" ? data.model : "";
 	if (modelFiles.includes(selected)) modelName = selected;
 	else if (modelFiles.includes(modelActive)) modelName = modelActive;
@@ -307,7 +284,6 @@ async function loadModelFromRust() {
 		model: match,
 		active: match || fallback || "best.pt",
 		files,
-		loaded: false,
 	});
 	if (stored.trim() && !match) {
 		modelNotice = fallback
@@ -320,57 +296,27 @@ async function loadModelFromRust() {
 
 async function loadModel() {
 	try {
-		if (rustConfig) {
-			await loadModelFromRust();
-			return;
-		}
-		const res = await fetch("http://127.0.0.1:8008/settings/model");
-		if (!res.ok) throw new Error(await res.text());
-		const data = await res.json();
-		applyModel(data);
-		modelNotice = typeof data.message === "string" ? data.message : "";
+		await loadModelFromRust();
 	} catch (err: unknown) {
-		modelNotice = rustConfig
-			? invokeError(err, "Could not load the model list")
-			: errorMessage(err, "Could not load the model list");
+		modelNotice = invokeError(err, "Could not load the model list");
 	}
 }
 
 async function saveModel() {
 	savingModel = true;
 	modelNotice = "";
-	const useRust = rustConfig;
 	try {
-		if (useRust) {
-			const data = await invokeRust<{
-				model?: unknown;
-				active?: unknown;
-				files?: unknown;
-				message?: unknown;
-			}>("set_active_model", { filename: modelName });
-			applyModel({ ...data, loaded: false });
-			modelNotice =
-				typeof data.message === "string" && data.message
-					? data.message
-					: "Saved";
-			return;
-		}
-		const res = await fetch("http://127.0.0.1:8008/settings/model", {
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ filename: modelName }),
-		});
-		const data = await res.json().catch(() => ({}));
-		if (!res.ok || data.status === "fail") {
-			throw new Error(data.message || "Save failed");
-		}
+		const data = await invokeRust<{
+			model?: unknown;
+			active?: unknown;
+			files?: unknown;
+			message?: unknown;
+		}>("set_active_model", { filename: modelName });
 		applyModel(data);
 		modelNotice =
 			typeof data.message === "string" && data.message ? data.message : "Saved";
 	} catch (err: unknown) {
-		modelNotice = useRust
-			? invokeError(err, "Could not save the model")
-			: errorMessage(err, "Could not save the model");
+		modelNotice = invokeError(err, "Could not save the model");
 	} finally {
 		savingModel = false;
 	}
@@ -601,79 +547,46 @@ async function saveSource() {
 	}
 	saving = true;
 	notice = "";
-	const useRust = rustConfig;
 	try {
-		if (useRust) {
-			const current =
-				await invokeRust<Record<string, unknown>>("load_local_config");
-			const mssqlCurrent =
-				current.mssql &&
-				typeof current.mssql === "object" &&
-				!Array.isArray(current.mssql)
-					? (current.mssql as Record<string, unknown>)
-					: {};
-			const driver = stringField(mssqlCurrent.driver).trim();
-			const saved = await invokeRust<BomDocument>("save_local_config", {
-				config: {
-					...current,
-					source,
-					mssql: {
-						...mssqlCurrent,
-						driver: driver || DEFAULT_SQL_DRIVER,
-						server: mssql.server.trim(),
-						database: mssql.database.trim(),
-						auth,
-						user: auth === "windows" ? "" : mssql.user.trim(),
-						password: auth === "windows" ? "" : mssqlPassword,
-					},
-					api: {
-						baseUrl: apiBaseUrl.trim(),
-						path: apiPath.trim(),
-						key: apiKey.trim(),
-					},
-				},
-			});
-			applyBomSource(saved);
-			if (source === "mssql") {
-				notice = "Saved. Inspect queries MSSQL using vision/bom_queries.sql.";
-			} else if (source === "api") {
-				notice = "Saved. Look up posts the job card number to the API.";
-			} else {
-				notice = "Saved. Inspect uses vision/sample-bom.json.";
-			}
-		} else {
-			const res = await fetch("http://127.0.0.1:8008/settings/bom-source", {
-				method: "POST",
-				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({
-					source,
-					server: mssql.server,
-					database: mssql.database,
+		const current =
+			await invokeRust<Record<string, unknown>>("load_local_config");
+		const mssqlCurrent =
+			current.mssql &&
+			typeof current.mssql === "object" &&
+			!Array.isArray(current.mssql)
+				? (current.mssql as Record<string, unknown>)
+				: {};
+		const driver = stringField(mssqlCurrent.driver).trim();
+		const saved = await invokeRust<BomDocument>("save_local_config", {
+			config: {
+				...current,
+				source,
+				mssql: {
+					...mssqlCurrent,
+					driver: driver || DEFAULT_SQL_DRIVER,
+					server: mssql.server.trim(),
+					database: mssql.database.trim(),
 					auth,
-					user: auth === "windows" ? "" : mssql.user,
+					user: auth === "windows" ? "" : mssql.user.trim(),
 					password: auth === "windows" ? "" : mssqlPassword,
-					api: {
-						baseUrl: apiBaseUrl,
-						path: apiPath,
-						key: apiKey,
-					},
-				}),
-			});
-			if (!res.ok) throw new Error(await res.text());
-			const data = await res.json();
-			if (data.status !== "pass")
-				throw new Error(data.message || "Save failed");
-			source = readSource(data.source);
-			readApi(data.api);
-			auth = data.mssql?.auth === "sql" ? "sql" : "windows";
-			mssql.user = data.mssql?.user ?? "";
-			mssqlPassword = data.mssql?.password ?? "";
-			notice = data.message || "Saved";
+				},
+				api: {
+					baseUrl: apiBaseUrl.trim(),
+					path: apiPath.trim(),
+					key: apiKey.trim(),
+				},
+			},
+		});
+		applyBomSource(saved);
+		if (source === "mssql") {
+			notice = "Saved. Inspect queries MSSQL using vision/bom_queries.sql.";
+		} else if (source === "api") {
+			notice = "Saved. Look up posts the job card number to the API.";
+		} else {
+			notice = "Saved. Inspect uses vision/sample-bom.json.";
 		}
 	} catch (err: unknown) {
-		notice = useRust
-			? invokeError(err, "Could not save vision/config.local.json.")
-			: errorMessage(err, "Could not save the BoM source");
+		notice = invokeError(err, "Could not save vision/config.local.json.");
 	} finally {
 		saving = false;
 	}
@@ -1145,28 +1058,7 @@ async function openPreview() {
 	}
 }
 
-function onRustConfigChange() {
-	sessionStorage.setItem(RUST_CONFIG_KEY, rustConfig ? "1" : "0");
-	void loadSource();
-}
-
-function onRustBomChange() {
-	if (!desktop) {
-		rustBom = false;
-		return;
-	}
-	sessionStorage.setItem(RUST_BOM_KEY, rustBom ? "1" : "0");
-}
-
 onMount(() => {
-	desktop = inTauri();
-	desktopChecked = true;
-	if (desktop && sessionStorage.getItem(RUST_CONFIG_KEY) === "1") {
-		rustConfig = true;
-	}
-	if (desktop && sessionStorage.getItem(RUST_BOM_KEY) === "1") {
-		rustBom = true;
-	}
 	if (!unlocked) return;
 	void loadSource();
 	if (section === "camera") void loadCameraSettings();
@@ -1354,45 +1246,6 @@ onDestroy(() => {
 				aria-labelledby="settings-section-heading"
 			>
 				<div class="mx-auto flex max-w-2xl flex-col gap-4 p-4">
-					<label class="flex items-start gap-3 border border-neutral-700 bg-neutral-900 p-4 text-sm text-neutral-200">
-						<input
-							type="checkbox"
-							class="mt-1 h-4 w-4 accent-blue-500"
-							bind:checked={rustConfig}
-							disabled={!desktop}
-							on:change={onRustConfigChange}
-						/>
-						<span class="flex flex-col gap-1">
-							<span class="font-semibold text-neutral-100">Use Rust for config and models</span>
-							<span class="text-neutral-400">
-								Settings loads and saves vision/config.local.json in the app, lists the files in
-								vision/models, and stores the chosen model name there. Detection, the camera, and the
-								other settings stay on the vision sidecar.
-								{#if desktopChecked && !desktop}
-									Open the desktop app to use this.
-								{/if}
-							</span>
-						</span>
-					</label>
-					<label class="flex items-start gap-3 border border-neutral-700 bg-neutral-900 p-4 text-sm text-neutral-200">
-						<input
-							type="checkbox"
-							class="mt-1 h-4 w-4 accent-blue-500"
-							bind:checked={rustBom}
-							disabled={!desktop}
-							on:change={onRustBomChange}
-						/>
-						<span class="flex flex-col gap-1">
-							<span class="font-semibold text-neutral-100">Use Rust for BoM lookup</span>
-							<span class="text-neutral-400">
-								JSON file lookup and the job card API run in the app. SQL, and the camera decode, stay
-								on the vision sidecar.
-								{#if desktopChecked && !desktop}
-									Open the desktop app to use this.
-								{/if}
-							</span>
-						</span>
-					</label>
 					{#if section === "camera"}
 						<h2 id="settings-section-heading" class="text-lg font-semibold tracking-tight">
 							Camera
@@ -1776,18 +1629,8 @@ onDestroy(() => {
 									Model
 								</legend>
 								<p class="text-sm text-neutral-200">
-									{#if rustConfig}
-										Chosen file
-										<span class="font-mono text-neutral-100">{modelActive}</span>.
-									{:else}
-										Current model
-										<span class="font-mono text-neutral-100">{modelActive}</span>
-										{#if modelLoaded}
-											<span class="text-neutral-400">loaded</span>
-										{:else}
-											<span class="text-amber-200">not loaded</span>
-										{/if}
-									{/if}
+									Chosen file
+									<span class="font-mono text-neutral-100">{modelActive}</span>.
 								</p>
 								<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
 									File
