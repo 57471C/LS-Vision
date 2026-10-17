@@ -90,10 +90,13 @@ type DetectedCount = {
 const DEFAULT_SCAN_SECONDS = 8;
 // Settings unlock is the admin flag for this tab. It is not stored in config.
 const ADMIN_FLAG = "ls-vision-settings-open";
+const RUST_BOM_KEY = "ls-vision-rust-bom";
 
 let barcode = "";
 let bomSource: "json" | "mssql" | "api" = "json";
 let bomSourceReady: Promise<void> | null = null;
+let desktop = false;
+let rustBom = false;
 let result: InspectView | null = null;
 let bom: BomView | null = null;
 let loading = false;
@@ -673,6 +676,21 @@ function ensureBomSource(): Promise<void> {
 }
 
 async function loadBomSource() {
+	if (rustBom && inTauri()) {
+		try {
+			const data = await invoke<{ source?: unknown }>("load_local_config");
+			if (
+				data.source === "api" ||
+				data.source === "mssql" ||
+				data.source === "json"
+			) {
+				bomSource = data.source;
+				return;
+			}
+		} catch {
+			// Fall through to the sidecar when the local file cannot be read.
+		}
+	}
 	try {
 		const res = await fetch("http://127.0.0.1:8008/settings/bom-source");
 		if (!res.ok) return;
@@ -762,9 +780,24 @@ async function saveCameraIndex() {
 	}
 }
 
+function inTauri(): boolean {
+	return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+
+function onRustBomChange() {
+	if (!inTauri()) {
+		rustBom = false;
+		return;
+	}
+	sessionStorage.setItem(RUST_BOM_KEY, rustBom ? "1" : "0");
+	bomSourceReady = loadBomSource();
+}
+
 function readAdminFlag() {
 	admin = sessionStorage.getItem(ADMIN_FLAG) === "1";
-	void loadBomSource();
+	desktop = inTauri();
+	rustBom = desktop && sessionStorage.getItem(RUST_BOM_KEY) === "1";
+	bomSourceReady = loadBomSource();
 	void loadTestMode();
 	if (sidecarUp) {
 		void loadModel();
@@ -1169,6 +1202,11 @@ function errorMessage(err: unknown, fallback: string): string {
 	return err instanceof Error && err.message ? err.message : fallback;
 }
 
+function invokeError(err: unknown, fallback: string): string {
+	if (typeof err === "string" && err.trim()) return err;
+	return errorMessage(err, fallback);
+}
+
 function stopSidecarWait() {
 	sidecarStarting = false;
 	if (sidecarTick !== null) {
@@ -1282,6 +1320,19 @@ function kitsKeyedByIc(
 	return kits;
 }
 
+function viewFromBomFile(bom: unknown, code: string): InspectView {
+	if (!bom || typeof bom !== "object" || Array.isArray(bom)) {
+		return { status: "fail", message: "Barcode not found in BoM" };
+	}
+	const job = (bom as Record<string, unknown>)[code];
+	if (!job || typeof job !== "object" || Array.isArray(job)) {
+		return { status: "fail", message: "Barcode not found in BoM" };
+	}
+	const row = job as Record<string, unknown>;
+	const withParts = Array.isArray(row.parts) ? row : { ...row, parts: [] };
+	return viewFromKit(code, withParts);
+}
+
 function viewFromApiData(data: unknown): InspectView {
 	if (!data || typeof data !== "object" || Array.isArray(data)) {
 		return { status: "fail", message: "BoM API response has no data object." };
@@ -1322,25 +1373,31 @@ async function runApiLookup() {
 	loading = true;
 	result = null;
 	try {
-		const res = await fetch("http://127.0.0.1:8008/bom/api", {
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ jobCardNumber: barcode.trim() }),
-		});
-		const text = await res.text();
 		let body: unknown = null;
-		try {
-			body = text ? JSON.parse(text) : null;
-		} catch {
-			body = null;
-		}
-		if (!res.ok || !body) {
-			result = {
-				status: "fail",
-				message: apiFailureMessage(body, text, res.status),
-			};
-			dropBom();
-			return;
+		if (rustBom && inTauri()) {
+			body = await invoke("post_bom_api", {
+				jobCardNumber: barcode.trim(),
+			});
+		} else {
+			const res = await fetch("http://127.0.0.1:8008/bom/api", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ jobCardNumber: barcode.trim() }),
+			});
+			const text = await res.text();
+			try {
+				body = text ? JSON.parse(text) : null;
+			} catch {
+				body = null;
+			}
+			if (!res.ok || !body) {
+				result = {
+					status: "fail",
+					message: apiFailureMessage(body, text, res.status),
+				};
+				dropBom();
+				return;
+			}
 		}
 		const view = viewFromApiData(body);
 		result = view;
@@ -1349,7 +1406,27 @@ async function runApiLookup() {
 			if (testMode) void chooseAndDetect();
 		} else dropBom();
 	} catch (err: unknown) {
-		result = { status: "fail", message: errorMessage(err, "Request failed") };
+		result = { status: "fail", message: invokeError(err, "Request failed") };
+		dropBom();
+	} finally {
+		loading = false;
+	}
+}
+
+async function runJsonLookup() {
+	if (loading) return;
+	loading = true;
+	result = null;
+	try {
+		const bom = await invoke("load_bom_json");
+		const view = viewFromBomFile(bom, barcode);
+		result = view;
+		if (view.status === "pass") {
+			storeBom(view);
+			if (testMode) void chooseAndDetect();
+		} else dropBom();
+	} catch (err: unknown) {
+		result = { status: "fail", message: invokeError(err, "Request failed") };
 		dropBom();
 	} finally {
 		loading = false;
@@ -1357,11 +1434,17 @@ async function runApiLookup() {
 }
 
 async function runInspect() {
+	if (loading) return;
+	await ensureBomSource();
+	if (!pageAlive || loading) return;
 	if (bomSource === "api") {
 		await runApiLookup();
 		return;
 	}
-	if (loading) return;
+	if (rustBom && inTauri() && bomSource === "json") {
+		await runJsonLookup();
+		return;
+	}
 	loading = true;
 	result = null;
 	try {
@@ -1378,7 +1461,7 @@ async function runInspect() {
 			if (testMode) void chooseAndDetect();
 		} else dropBom();
 	} catch (err: unknown) {
-		result = { status: "fail", message: errorMessage(err, "Request failed") };
+		result = { status: "fail", message: invokeError(err, "Request failed") };
 		dropBom();
 	} finally {
 		loading = false;
@@ -1542,6 +1625,20 @@ async function decodeAndInspect() {
 				bind:value={barcode}
 			/>
 		</label>
+		{#if desktop}
+			<label
+				class="mb-0.5 flex min-h-11 items-center gap-2 self-end text-[11px] font-semibold uppercase tracking-widest text-neutral-400"
+				title="JSON file lookup and the job card API run in the app. SQL stays on the sidecar."
+			>
+				<input
+					type="checkbox"
+					class="h-4 w-4 accent-blue-500"
+					bind:checked={rustBom}
+					on:change={onRustBomChange}
+				/>
+				Use Rust for BoM
+			</label>
+		{/if}
 		<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
 			Camera
 			<select
