@@ -4,15 +4,21 @@
 
 use std::collections::HashSet;
 use std::fs::OpenOptions;
-use std::io::{Cursor, Write};
+use std::io::Write;
 use std::path::PathBuf;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use image::ImageFormat;
 use rxing::helpers::detect_in_image_with_hints;
-use rxing::{BarcodeFormat, DecodeHints, Exceptions, MultiFormatWriter, Writer};
+use rxing::{BarcodeFormat, DecodeHints, Exceptions};
+
+#[cfg(test)]
+use image::ImageFormat;
+#[cfg(test)]
+use rxing::{MultiFormatWriter, Writer};
 use serde_json::{Value, json};
+#[cfg(test)]
+use std::io::Cursor;
 
 use crate::local_config;
 
