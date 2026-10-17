@@ -235,14 +235,45 @@ fn assign_model(document: &mut Value, model: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn active_name(stored: &str, files: &[String]) -> String {
-    if let Some(found) = match_model(stored, files) {
+fn preferred_model(files: &[String]) -> String {
+    // An empty selection uses best.onnx when that file is present, then best.pt.
+    if let Some(found) = match_model("best.onnx", files) {
         return found;
     }
     if let Some(found) = match_model(DEFAULT_MODEL_NAME, files) {
         return found;
     }
-    DEFAULT_MODEL_NAME.to_string()
+    if let Some(found) = files
+        .iter()
+        .find(|name| name.to_ascii_lowercase().ends_with(".onnx"))
+    {
+        return found.clone();
+    }
+    files
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "best.onnx".to_string())
+}
+
+fn active_name(stored: &str, files: &[String]) -> String {
+    if let Some(found) = match_model(stored, files) {
+        return found;
+    }
+    preferred_model(files)
+}
+
+pub(crate) fn configured_model_name(root: &Path) -> Result<String, String> {
+    let document = load_document(root)?;
+    let stored = document
+        .get("model")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let files = list_models(root)?;
+    Ok(active_name(stored, &files))
+}
+
+pub(crate) fn vision_models_dir(root: &Path) -> PathBuf {
+    models_dir(root)
 }
 
 fn store_active_model(root: &Path, filename: &str) -> Result<ActiveModel, String> {
@@ -486,6 +517,17 @@ mod tests {
         assert_eq!(saved.message, "Saved. Active model is best.pt.");
         assert_eq!(load_document(project.root()).unwrap()["model"], "");
         assert_eq!(load_document(project.root()).unwrap()["source"], "json");
+    }
+
+    #[test]
+    fn clearing_the_model_prefers_best_onnx_when_both_exist() {
+        let project = TempProject::new("clear-onnx");
+        fs::write(models_dir(project.root()).join("best.pt"), b"x").unwrap();
+        fs::write(models_dir(project.root()).join("best.onnx"), b"x").unwrap();
+        let saved = store_active_model(project.root(), "").unwrap();
+        assert_eq!(saved.model, "");
+        assert_eq!(saved.active, "best.onnx");
+        assert_eq!(saved.message, "Saved. Active model is best.onnx.");
     }
 
     #[test]

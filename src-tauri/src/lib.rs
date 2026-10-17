@@ -1,5 +1,6 @@
 mod barcode;
 mod bom;
+mod detect;
 mod local_config;
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
@@ -23,7 +24,8 @@ pub fn run() {
             local_config::set_active_model,
             bom::load_bom_json,
             bom::post_bom_api,
-            barcode::decode_barcode
+            barcode::decode_barcode,
+            detect::detect_image
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
