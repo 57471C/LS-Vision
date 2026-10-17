@@ -133,9 +133,27 @@ Train several options, compare on validation set (especially close variants), pi
 - Optional central logging/dashboard
 
 **Later**  
-- Move vision inference fully to ONNX-in-Rust  
+- Move vision inference fully to ONNX-in-Rust (see the migration notes below)  
 - Separate training app if labeling needs grow  
 - More advanced kit grouping if required
+
+### ONNX-in-Rust migration
+
+`.pt` stays the training file. Inference uses `.onnx`. Export with:
+
+```text
+yolo export model=best.pt format=onnx
+```
+
+Put the `.onnx` file in `vision/models/`. Weight files stay out of git.
+
+**Phase 1 (in progress on this branch).** `.onnx` detection runs in Rust through ONNX Runtime (`detect_image`). The operator page calls that command when the active model name ends in `.onnx`, and still POSTs `/detect` for a `.pt` model. An empty model selection uses `best.onnx` when that file is present, then `best.pt`. A saved `.pt` name stays on the Python path. The detection JSON is unchanged: `{ detections: [{ ic, confidence, bbox }], image_base64 }`. The page still draws the boxes.
+
+Python `YOLO(best.pt)` and `YOLO(best.onnx)` already disagree on `vision/test-images/Example3.jpg` (172 boxes from the checkpoint, 181 from the ONNX graph). Rust is checked against the ONNX result.
+
+**Phase 2 (not started).** Replace the sidecar camera stream and snapshot with a Rust camera source the page can still show. Keep the native, ZXing, and Rust barcode decode, and drop the sidecar barcode calls. BoM JSON and MSSQL stay on the existing Tauri commands. Remove the sidecar spawn in `src-tauri/src/lib.rs`. Stop the health check and the "Starting sidecar" wait from depending on port 8008.
+
+**Phase 3 (not started).** Leave `vision/main.py` off the runtime path. Training notes can stay. State in the README that inference is ONNX-in-Rust and the Python sidecar is gone. Confirm the model switcher, detect ROI, barcode ROI, and Settings still work.
 
 ### Immediate next steps
 2. Collect and label part and kit images in Label Studio.

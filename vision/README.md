@@ -15,6 +15,14 @@ pip install -r requirements.txt
 
 Place your best.pt in vision/models/. Weight files (`*.pt`, `*.onnx`) stay local and are not committed.
 
+`.pt` is the training file. The operator page runs `.onnx` in Rust. Export a model with:
+
+```powershell
+yolo export model=best.pt format=onnx
+```
+
+Put the `.onnx` file in `vision/models/` next to the `.pt` file.
+
 ## Activate the environment (every new terminal)
 
 ```powershell
@@ -34,5 +42,5 @@ Health check: http://127.0.0.1:8008/health
 
 - Keep the API surface small and stable.
 - BoM lookup and inspection results should stay easy to call from Rust/Tauri.
-- Models will eventually be exported to ONNX for the Rust path.
+- `.onnx` detection runs in Rust. This sidecar still serves the camera, barcode frames, `.pt` models, and the settings routes.
 - Sample BoM for testing: `sample-bom.json`
