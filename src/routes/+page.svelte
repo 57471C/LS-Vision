@@ -454,33 +454,56 @@ async function runDetect(generation: number, body: { image?: string }) {
 	}
 }
 
-function inspectView(body: WatchBody): InspectView {
-	return {
-		status: body.status,
-		message: body.message,
-		kitCode: body.kitCode,
-		des: body.des,
-		parts: body.parts,
-		kitsFound: body.kitsFound,
-		expectedKitCount: body.expectedKitCount,
-		info: body.info,
-	};
+type RustDecode = {
+	status?: string;
+	barcode?: string;
+	type?: string;
+	message?: string;
+};
+
+function decodedText(body: RustDecode): string {
+	if (body.status !== "pass" || typeof body.barcode !== "string") return "";
+	return body.barcode;
 }
 
-async function showSnapshot(body: WatchBody) {
-	if (!body.image) return;
-	const kitCode = body.kitCode || body.barcode || barcode;
-	// API keeps the decoded job card in the field. The still is labelled with the kit.
+async function readFrame(index: number): Promise<WatchBody> {
+	const res = await fetch(
+		`http://127.0.0.1:8008/camera/snapshot?index=${index}&frame=1`,
+	);
+	const body = (await res.json()) as WatchBody;
+	if (!res.ok) throw new Error(body.message || "Decode failed");
+	return body;
+}
+
+async function lookupCode(code: string): Promise<InspectView> {
 	if (bomSource === "api") {
-		const card = body.jobCardNumber || body.barcode;
-		if (card) barcode = card;
-	} else {
-		barcode = kitCode;
+		const body = await invoke("post_bom_api", {
+			jobCardNumber: code.trim(),
+		});
+		return viewFromApiData(body);
 	}
-	result = inspectView(body);
-	storeBom(result);
-	const generation = holdStill(body.image, kitCode);
-	await runDetect(generation, { image: body.image });
+	if (bomSource === "json") {
+		const file = await invoke("load_bom_json");
+		return viewFromBomFile(file, code);
+	}
+	const res = await fetch("http://127.0.0.1:8008/inspect", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ barcode: code }),
+	});
+	if (!res.ok) throw new Error(await res.text());
+	return (await res.json()) as InspectView;
+}
+
+function stillWatches(index: number): boolean {
+	return (
+		pageAlive &&
+		!loading &&
+		feedOn &&
+		!snapshot &&
+		!testMode &&
+		index === cameraIndex
+	);
 }
 
 async function watchFeed() {
@@ -491,31 +514,32 @@ async function watchFeed() {
 	watchInFlight = true;
 	const index = cameraIndex;
 	try {
-		// Test mode is decided with the saved source. The sidecar skips decode
-		// for that mode and still logs the path. Every other source decodes.
+		// Test mode is the typed code. The sidecar snapshot route still skips
+		// decode for that mode. Every other source sends the frame to Rust.
 		await ensureBomSource();
 		await loadTestMode();
 		if (!pageAlive || !feedOn || snapshot || loading || index !== cameraIndex) {
 			return;
 		}
-		const res = await fetch(
-			`http://127.0.0.1:8008/camera/snapshot?index=${index}`,
-		);
-		if (!res.ok) return;
-		const body = (await res.json()) as WatchBody;
-		if (
-			!pageAlive ||
-			loading ||
-			!feedOn ||
-			snapshot ||
-			testMode ||
-			index !== cameraIndex ||
-			!body.snapshot ||
-			!body.image
-		) {
+		if (testMode) {
+			await fetch(`http://127.0.0.1:8008/camera/snapshot?index=${index}`);
 			return;
 		}
-		await showSnapshot(body);
+		const frame = await readFrame(index);
+		if (!stillWatches(index) || !frame.image) return;
+		const decoded = await invoke<RustDecode>("decode_barcode", {
+			image: frame.image,
+		});
+		const code = decodedText(decoded);
+		if (!stillWatches(index) || !code) return;
+		const view = await lookupCode(code);
+		if (!stillWatches(index) || view.status !== "pass") return;
+		const kitCode = view.kitCode || code;
+		barcode = bomSource === "api" ? code : kitCode;
+		result = view;
+		storeBom(view);
+		const generation = holdStill(frame.image, kitCode);
+		await runDetect(generation, { image: frame.image });
 	} catch {
 		// A missed poll leaves the last still and the last BoM result.
 	} finally {
@@ -1418,30 +1442,54 @@ async function decodeAndInspect() {
 	}
 	loading = true;
 	try {
-		const res = await fetch(
-			`http://127.0.0.1:8008/camera/snapshot?index=${cameraIndex}`,
-		);
-		const body = (await res.json()) as WatchBody;
-		if (!res.ok) throw new Error(body.message || "Decode failed");
-		if (body.snapshot && body.image) {
-			await showSnapshot(body);
-			return;
-		}
-		if (body.barcode) {
-			barcode = body.barcode;
-			dropBom();
+		const frame = await readFrame(cameraIndex);
+		if (!pageAlive) return;
+		if (!frame.image) {
+			// A sidecar that does not know frame=1 still returns the code on a
+			// BoM miss, and no image. Keep that code. A new sidecar puts the
+			// JPEG here and leaves the barcode for Rust.
+			if (frame.barcode) {
+				barcode = frame.barcode;
+				dropBom();
+				result = {
+					status: "fail",
+					message: frame.message || "Barcode not found in BoM",
+				};
+				return;
+			}
 			result = {
 				status: "fail",
-				message: body.message || "Barcode not found in BoM",
+				message: frame.message || "No frame",
 			};
 			return;
 		}
-		result = {
-			status: "fail",
-			message: body.message || "No code detected",
-		};
+		const decoded = await invoke<RustDecode>("decode_barcode", {
+			image: frame.image,
+		});
+		if (!pageAlive) return;
+		const code = decodedText(decoded);
+		if (!code) {
+			result = {
+				status: "fail",
+				message: decoded.message || "No code detected",
+			};
+			return;
+		}
+		const view = await lookupCode(code);
+		if (!pageAlive) return;
+		result = view;
+		if (view.status === "pass") {
+			const kitCode = view.kitCode || code;
+			barcode = bomSource === "api" ? code : kitCode;
+			storeBom(view);
+			const generation = holdStill(frame.image, kitCode);
+			await runDetect(generation, { image: frame.image });
+		} else {
+			barcode = code;
+			dropBom();
+		}
 	} catch (err: unknown) {
-		result = { status: "fail", message: errorMessage(err, "Decode failed") };
+		result = { status: "fail", message: invokeError(err, "Decode failed") };
 	} finally {
 		loading = false;
 	}
