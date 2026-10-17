@@ -67,6 +67,7 @@ fn default_config() -> Value {
         "scanSeconds": 8,
         "testMode": false,
         "detectRoi": null,
+        "barcodeRoi": null,
         "model": "",
         "camera": {
             "index": 0,

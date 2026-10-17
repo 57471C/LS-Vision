@@ -20,6 +20,7 @@
 	"scanSeconds": 8,
 	"testMode": false,
 	"detectRoi": null,
+	"barcodeRoi": null,
 	"model": "best.pt",
 	"camera": {
 		"index": 0,
