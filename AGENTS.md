@@ -4,7 +4,7 @@ Guidance for AI coding agents working on LS-Vision.
 
 ## Project context
 
-LS-Vision is a Tauri 2 + SvelteKit desktop app for bench-top kit verification using computer vision. The high-level plan lives in `plan.md`. Prefer small, incremental changes that move the core loop forward.
+LS-Vision is a Tauri 2 + SvelteKit desktop app for bench-top kit verification using computer vision. Version 0.3.1. The high-level plan lives in `plan.md`. Prefer small, incremental changes that move the core loop forward.
 
 ## Architecture notes
 
@@ -25,7 +25,7 @@ LS-Vision is a Tauri 2 + SvelteKit desktop app for bench-top kit verification us
 - Prefer explicit, readable code over clever abstractions at this stage.
 - When adding vision features, keep the Rust ONNX path. Do not add a Python runtime process or a call to port 8008.
 - The Windows installer targets Program Files (NSIS `perMachine`; the MSI already uses Program Files). Photos, snapshots, and logs go under LocalAppData, or Documents when LocalAppData is missing. Do not write them under Program Files.
-- ONNX models live in the Tauri app data `models` folder (`%APPDATA%\studio.lean.ls-vision\models` on Windows) for both `npm run tauri dev` and the installed app. The active filename stays in `vision/config.local.json`. Settings > Training > Update model copies an `.onnx` file there. The installer does not bundle `.onnx` files.
+- ONNX models live in the Tauri app data `models` folder (`%APPDATA%\studio.lean.ls-vision\models` on Windows) for both `npm run tauri dev` and the installed app. The active filename stays in `vision/config.local.json`. Settings > Training > Update model copies an `.onnx` file there and refuses a file that is not ONNX. The installer does not bundle `.onnx` files. A missing or failed model is reported on the operator page.
 
 ## Current behaviour
 
