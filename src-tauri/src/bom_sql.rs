@@ -128,10 +128,10 @@ fn query_rows(
                 let text = batch
                     .at(column, row_index)
                     .map(|bytes| String::from_utf8_lossy(bytes).trim().to_string());
-                if let Some(text) = text {
-                    if !text.is_empty() {
-                        row.insert(name.clone(), Value::String(text));
-                    }
+                if let Some(text) = text
+                    && !text.is_empty()
+                {
+                    row.insert(name.clone(), Value::String(text));
                 }
             }
             rows.push(row);

@@ -202,12 +202,14 @@ fn decode_bytes(chars: usize, bytes: &[u8]) -> Result<Value, String> {
     }
 
     let image = loaded.map_err(|_| READ_ERROR.to_string())?;
-    let mut hints = DecodeHints::default();
-    hints.PossibleFormats = Some(HashSet::from([
-        BarcodeFormat::CODE_39,
-        BarcodeFormat::QR_CODE,
-    ]));
-    hints.TryHarder = Some(true);
+    let mut hints = DecodeHints {
+        PossibleFormats: Some(HashSet::from([
+            BarcodeFormat::CODE_39,
+            BarcodeFormat::QR_CODE,
+        ])),
+        TryHarder: Some(true),
+        ..DecodeHints::default()
+    };
     let value = match detect_in_image_with_hints(image, None, &mut hints) {
         Ok(found) => match format_name(found.getBarcodeFormat()) {
             Some(kind) => {

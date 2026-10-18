@@ -753,10 +753,10 @@ fn scale_nv12(
         || src_height < 2
         || dst_width < 2
         || dst_height < 2
-        || src_width % 2 != 0
-        || src_height % 2 != 0
-        || dst_width % 2 != 0
-        || dst_height % 2 != 0
+        || !src_width.is_multiple_of(2)
+        || !src_height.is_multiple_of(2)
+        || !dst_width.is_multiple_of(2)
+        || !dst_height.is_multiple_of(2)
     {
         return Err("Could not encode the frame.".to_string());
     }
@@ -887,7 +887,7 @@ fn compress_rgb(rgb: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> 
 fn yuy2_to_rgb(bytes: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
     let row = (width as usize).saturating_mul(2);
     let need = row.saturating_mul(height as usize);
-    if width < 2 || height == 0 || width % 2 != 0 || bytes.len() < need {
+    if width < 2 || height == 0 || !width.is_multiple_of(2) || bytes.len() < need {
         return Err("Could not decode the camera frame.".to_string());
     }
     let mut rgb = vec![0_u8; (width as usize) * (height as usize) * 3];
@@ -910,7 +910,7 @@ fn yuy2_to_rgb(bytes: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String>
 }
 
 fn nv12_to_jpeg(bytes: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
-    if width < 2 || height < 2 || width % 2 != 0 || height % 2 != 0 {
+    if width < 2 || height < 2 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
         return Err("Could not encode the frame.".to_string());
     }
     let width = width as usize;
