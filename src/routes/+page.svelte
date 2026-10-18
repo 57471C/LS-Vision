@@ -10,6 +10,12 @@ import {
 } from "@zxing/library";
 import { onDestroy, onMount, tick } from "svelte";
 import { activateCamera, readDisplayFps } from "$lib/camera-settings";
+// biome-ignore lint/correctness/noUnusedImports: the operator template uses this component
+import CameraView from "$lib/operator/CameraView.svelte";
+// biome-ignore lint/correctness/noUnusedImports: the operator template uses this component
+import OperatorToolbar from "$lib/operator/OperatorToolbar.svelte";
+// biome-ignore lint/correctness/noUnusedImports: the operator template uses this component
+import ResultsPanel from "$lib/operator/ResultsPanel.svelte";
 
 type Part = { ic: string; des: string; qty: number };
 type InspectView = {
@@ -60,45 +66,10 @@ type Detection = {
 	bbox: number[];
 };
 
-type DetectionMark = {
-	key: string;
-	ic: string;
-	color: string;
-	x: number;
-	y: number;
-	w: number;
-	h: number;
-	labelX: number;
-	labelY: number;
-	labelW: number;
-	labelH: number;
-};
-
-// OpenCV stored these as BGR.
-const PART_COLORS = [
-	"rgb(60, 180, 0)",
-	"rgb(255, 165, 0)",
-	"rgb(0, 140, 255)",
-	"rgb(230, 60, 60)",
-	"rgb(200, 60, 200)",
-	"rgb(200, 200, 0)",
-	"rgb(0, 180, 180)",
-	"rgb(255, 100, 0)",
-];
-const BOX_STROKE = 2;
-const LABEL_FONT = 12;
-const LABEL_PAD_X = 4;
-const LABEL_PAD_Y = 3;
-
 type BomView = {
 	kitCode: string;
 	des?: string;
 	parts: Part[];
-};
-
-type DetectedCount = {
-	ic: string;
-	count: number;
 };
 
 const DEFAULT_SCAN_SECONDS = 8;
@@ -275,15 +246,6 @@ function holdStill(image: string, kitCode: string) {
 	return detectGeneration;
 }
 
-function detectionCounts(items: Detection[]): Record<string, number> {
-	const counts: Record<string, number> = {};
-	for (const item of items) {
-		if (!item.ic) continue;
-		counts[item.ic] = (counts[item.ic] ?? 0) + 1;
-	}
-	return counts;
-}
-
 function storeBom(view: InspectView) {
 	// Only a passing barcode lookup loads a kit. Model class names do not.
 	if (view.status !== "pass" || !view.kitCode || !view.parts?.length) return;
@@ -296,32 +258,6 @@ function storeBom(view: InspectView) {
 
 function dropBom() {
 	bom = null;
-}
-
-function isLoadedBom(view: InspectView | null): boolean {
-	return !!bom && !!view?.parts?.length && view.kitCode === bom.kitCode;
-}
-
-function partsOutsideBom(
-	items: Detection[],
-	parts: Part[] | null,
-): DetectedCount[] {
-	const counts = detectionCounts(items);
-	const known = new Set((parts ?? []).map((part) => part.ic));
-	return Object.entries(counts)
-		.filter(([ic]) => !known.has(ic))
-		.sort((a, b) => a[0].localeCompare(b[0]))
-		.map(([ic, count]) => ({ ic, count }));
-}
-
-function matchSummary(parts: Part[], items: Detection[]): string {
-	const counts = detectionCounts(items);
-	let matched = 0;
-	for (const part of parts) {
-		if ((counts[part.ic] ?? 0) === part.qty) matched += 1;
-	}
-	const lines = parts.length === 1 ? "line" : "lines";
-	return `${matched} of ${parts.length} BoM ${lines} match`;
 }
 
 function asDetections(value: unknown): Detection[] {
@@ -344,87 +280,6 @@ function detectedImageSrc(encoded: string): string {
 	const text = encoded.trim();
 	if (text.startsWith("data:")) return text;
 	return `data:image/jpeg;base64,${text.replace(/\s+/g, "")}`;
-}
-
-function colorForIc(ic: string): string {
-	const bytes = new TextEncoder().encode(ic);
-	let total = 0;
-	for (const byte of bytes) total += byte;
-	return PART_COLORS[total % PART_COLORS.length];
-}
-
-function detectionMarks(
-	zoom: {
-		width: number;
-		height: number;
-	} | null,
-): DetectionMark[] {
-	// Positions are CSS pixels of the still. The viewBox matches that size,
-	// so the stroke and the label font do not grow when the still is scaled.
-	if (!snapshot || paneWidth < 1 || paneHeight < 1 || detections.length === 0)
-		return [];
-	let scale = 1;
-	let originX = 0;
-	let originY = 0;
-	if (zoom) {
-		scale = zoom.width / paneWidth;
-	} else if (frameWidth > 0 && frameHeight > 0) {
-		scale = Math.min(frameWidth / paneWidth, frameHeight / paneHeight);
-		originX = (frameWidth - paneWidth * scale) / 2;
-		originY = (frameHeight - paneHeight * scale) / 2;
-	} else {
-		return [];
-	}
-	if (!Number.isFinite(scale) || scale <= 0) return [];
-	const imageRight = originX + paneWidth * scale;
-	const imageBottom = originY + paneHeight * scale;
-	const marks: DetectionMark[] = [];
-	const ordered = [...detections].sort((a, b) => a.confidence - b.confidence);
-	for (const [index, item] of ordered.entries()) {
-		const box = item.bbox;
-		if (box.length < 4) continue;
-		const [rawX1, rawY1, rawX2, rawY2] = box;
-		if (
-			![rawX1, rawY1, rawX2, rawY2].every(
-				(value) => typeof value === "number" && Number.isFinite(value),
-			)
-		) {
-			continue;
-		}
-		const x1 = Math.max(0, Math.min(paneWidth, rawX1));
-		const y1 = Math.max(0, Math.min(paneHeight, rawY1));
-		const x2 = Math.max(0, Math.min(paneWidth, rawX2));
-		const y2 = Math.max(0, Math.min(paneHeight, rawY2));
-		if (x2 <= x1 || y2 <= y1) continue;
-		const x = originX + x1 * scale;
-		const y = originY + y1 * scale;
-		const w = (x2 - x1) * scale;
-		const h = (y2 - y1) * scale;
-		const labelW =
-			Math.ceil(item.ic.length * LABEL_FONT * 0.62) + LABEL_PAD_X * 2;
-		const labelH = LABEL_FONT + LABEL_PAD_Y * 2;
-		let labelX = x;
-		let labelY = y - labelH;
-		if (labelY < originY) labelY = y;
-		if (labelX + labelW > imageRight)
-			labelX = Math.max(originX, imageRight - labelW);
-		if (labelY + labelH > imageBottom)
-			labelY = Math.max(originY, imageBottom - labelH);
-		marks.push({
-			key: `${index}:${item.ic}:${x1}:${y1}`,
-			ic: item.ic,
-			color: colorForIc(item.ic),
-			x,
-			y,
-			w,
-			h,
-			labelX,
-			labelY,
-			labelW,
-			labelH,
-		});
-	}
-	return marks;
 }
 
 async function requestDetections(body: { image?: string }): Promise<{
@@ -1051,9 +906,9 @@ async function applySavedCamera() {
 	}
 }
 
-async function saveCameraIndex() {
+async function saveCameraIndex(next: number) {
 	skippedSavedIndex = null;
-	const index = Number(cameraIndex);
+	const index = Number(next);
 	cameraIndex = index;
 	if (!Number.isInteger(index) || index < 0 || index > 32) return;
 	const generation = ++cameraSaveGeneration;
@@ -1183,9 +1038,12 @@ async function chooseModel(filename: string) {
 	}
 }
 
-function rememberPaneSize() {
-	paneWidth = paneImage?.naturalWidth ?? 0;
-	paneHeight = paneImage?.naturalHeight ?? 0;
+function rememberPaneSize(image?: HTMLImageElement | null) {
+	// The snapshot load can finish before the child bind reaches this page.
+	if (image) paneImage = image;
+	const still = image ?? paneImage;
+	paneWidth = still?.naturalWidth ?? 0;
+	paneHeight = still?.naturalHeight ?? 0;
 	measureFrame();
 }
 
@@ -1235,6 +1093,7 @@ $: zoom = zoomFrame(
 	frameWidth,
 	frameHeight,
 );
+$: barcodeOverlay = pixelBarcodeRoi(barcodeRoi, paneWidth, paneHeight);
 
 function showDraft(box: DetectRoi) {
 	const surface = frameSurface();
@@ -1943,459 +1802,79 @@ async function decodeAndInspect() {
 		</div>
 	</header>
 
-	<form
-		class="flex shrink-0 flex-wrap items-end gap-2 border-b border-neutral-800 bg-neutral-900 px-4 py-2"
-		on:submit|preventDefault={runInspect}
-	>
-		<label class="flex min-w-56 flex-1 flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
-			{bomSource === "api" ? "Job card number" : "Barcode"}
-			<input
-				class="w-full border border-neutral-600 bg-neutral-950 px-3 py-2 font-mono text-lg font-medium normal-case tracking-normal text-neutral-100"
-				inputmode={bomSource === "api" ? "numeric" : undefined}
-				bind:value={barcode}
-			/>
-		</label>
-		{#if admin}
-			<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
-				Camera
-				<select
-					class="min-h-11 border border-neutral-600 bg-neutral-950 px-3 font-mono text-base normal-case tracking-normal text-neutral-100"
-					bind:value={cameraIndex}
-					on:change={saveCameraIndex}
-				>
-					{#if camerasMissing}
-						<option value={cameraIndex}>No cameras found</option>
-					{:else if cameraIndexes.length > 0}
-						{#each cameraIndexes as index (index)}
-							<option value={index}>{index}</option>
-						{/each}
-					{:else}
-						<option value={cameraIndex}>{cameraIndex}</option>
-					{/if}
-				</select>
-			</label>
-		{/if}
-		<button
-			type="button"
-			class="inline-flex min-h-11 items-center border border-blue-500 bg-blue-600 px-4 text-sm font-semibold text-white disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
-			on:click={decodeAndInspect}
-			disabled={loading}
-		>
-			{testMode ? "Use typed code" : "Decode QR / Barcode"}
-		</button>
-		<button
-			type="button"
-			class="inline-flex min-h-11 items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100 disabled:cursor-not-allowed disabled:opacity-50"
-			on:click={toggleFeed}
-			disabled={feedBusy}
-			aria-busy={feedBusy}
-		>
-			{feedBusy ? "Please wait" : feedOn ? "Stop feed" : "Start feed"}
-		</button>
-		{#if admin}
-			<button
-				type="button"
-				class="inline-flex min-h-11 items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100 disabled:text-neutral-500"
-				on:click={beginSetRoi}
-				disabled={savingRoi}
-			>
-				{drawing ? "Cancel" : "Set ROI"}
-			</button>
-			<button
-				type="button"
-				class="inline-flex min-h-11 items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100 disabled:text-neutral-500"
-				on:click={clearDetectRoi}
-				disabled={savingRoi || !detectRoi}
-			>
-				Clear ROI
-			</button>
-			{#if !snapshot}
-				<button
-					type="button"
-					class="inline-flex min-h-11 items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100 disabled:text-neutral-500"
-					on:click={beginSetBarcodeRoi}
-					disabled={savingBarcodeRoi}
-				>
-					{barcodeDrawing ? "Cancel" : "Set barcode ROI"}
-				</button>
-				<button
-					type="button"
-					class="inline-flex min-h-11 items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100 disabled:text-neutral-500"
-					on:click={clearBarcodeRoi}
-					disabled={savingBarcodeRoi || !barcodeRoi}
-				>
-					Clear barcode ROI
-				</button>
-			{/if}
-		{/if}
-		{#if erpUrl}
-			<button
-				type="button"
-				class="inline-flex min-h-11 items-center border border-amber-300 bg-amber-400 px-4 text-sm font-semibold text-neutral-950"
-				on:click={openErp}
-			>
-				{erpName || "ERP"}
-			</button>
-		{/if}
-	</form>
+	<OperatorToolbar
+		bind:barcode
+		bind:cameraIndex
+		bomSource={bomSource}
+		admin={admin}
+		camerasMissing={camerasMissing}
+		cameraIndexes={cameraIndexes}
+		loading={loading}
+		testMode={testMode}
+		feedBusy={feedBusy}
+		feedOn={feedOn}
+		drawing={drawing}
+		savingRoi={savingRoi}
+		detectRoi={detectRoi}
+		snapshot={snapshot}
+		barcodeDrawing={barcodeDrawing}
+		savingBarcodeRoi={savingBarcodeRoi}
+		barcodeRoi={barcodeRoi}
+		erpUrl={erpUrl}
+		erpName={erpName}
+		onInspect={runInspect}
+		onCameraChange={saveCameraIndex}
+		onDecode={decodeAndInspect}
+		onToggleFeed={toggleFeed}
+		onBeginSetRoi={beginSetRoi}
+		onClearDetectRoi={clearDetectRoi}
+		onBeginSetBarcodeRoi={beginSetBarcodeRoi}
+		onClearBarcodeRoi={clearBarcodeRoi}
+		onOpenErp={openErp}
+	/>
 
 	<div class="grid min-h-0 flex-1 gap-3 overflow-hidden p-3 lg:grid-cols-[minmax(0,1.7fr)_minmax(22rem,28rem)]">
-		<section class="flex min-h-0 min-w-0 flex-col overflow-hidden border border-neutral-700 bg-black">
-			<div class="flex shrink-0 items-center justify-between border-b border-neutral-800 px-3 py-1.5">
-				<h2 class="text-[11px] font-semibold uppercase tracking-widest text-neutral-500">
-					{snapshot ? "Snapshot" : "Camera"}
-				</h2>
-				{#if roiMessage}
-					<p class="text-xs text-amber-200">{roiMessage}</p>
-				{:else if snapshot}
-					<p class="text-xs text-amber-200">Automatic stream is stopped</p>
-				{/if}
-			</div>
-			<div bind:this={paneFrame} class="relative min-h-0 flex-1 overflow-hidden">
-				{#if snapshot || (feedOn && cameraFeedOn)}
-					<div
-						class="absolute {zoom ? '' : 'inset-0'}"
-						style={zoom
-							? `left:${zoom.left}px;top:${zoom.top}px;width:${zoom.width}px;height:${zoom.height}px;`
-							: ""}
-					>
-						{#if feedOn && cameraFeedOn}
-							<canvas
-								bind:this={liveCanvas}
-								class="h-full w-full {zoom ? 'object-fill' : 'object-contain'}"
-								class:invisible={Boolean(snapshot) || !livePainted}
-								aria-label="Camera feed"
-							></canvas>
-							{#if !snapshot && (liveMessage || !livePainted)}
-								<p class="absolute inset-0 flex items-center justify-center px-6 text-center text-sm text-neutral-300">
-									{liveMessage || "Opening camera…"}
-								</p>
-							{/if}
-						{/if}
-						{#if snapshot}
-							<img
-								bind:this={paneImage}
-								src={snapshot.image}
-								alt={snapshot.detected
-									? `Detected parts for kit ${snapshot.kitCode}`
-									: `Snapshot of kit ${snapshot.kitCode}`}
-								class="{feedOn && cameraFeedOn
-									? 'absolute inset-0'
-									: ''} h-full w-full {zoom ? 'object-fill' : 'object-contain'}"
-								on:load={rememberPaneSize}
-							/>
-						{/if}
-						{#if (snapshot || cameraFeedOn) && paneWidth > 0 && paneHeight > 0 && !drawing && detectRoi}
-							{@const x = detectRoi.x * paneWidth}
-							{@const y = detectRoi.y * paneHeight}
-							{@const w = detectRoi.w * paneWidth}
-							{@const h = detectRoi.h * paneHeight}
-							<svg
-								class="pointer-events-none absolute inset-0 z-10 h-full w-full"
-								viewBox="0 0 {paneWidth} {paneHeight}"
-								preserveAspectRatio={zoom ? "none" : "xMidYMid meet"}
-							>
-								<rect x="0" y="0" width={paneWidth} height={y} fill="black" fill-opacity="0.45" />
-								<rect
-									x="0"
-									y={y + h}
-									width={paneWidth}
-									height={paneHeight - (y + h)}
-									fill="black"
-									fill-opacity="0.45"
-								/>
-								<rect x="0" y={y} width={x} height={h} fill="black" fill-opacity="0.45" />
-								<rect
-									x={x + w}
-									y={y}
-									width={paneWidth - (x + w)}
-									height={h}
-									fill="black"
-									fill-opacity="0.45"
-								/>
-								<rect
-									x={x}
-									y={y}
-									width={w}
-									height={h}
-									fill="none"
-									stroke="#fde68a"
-									stroke-opacity="0.75"
-									stroke-width="2"
-									vector-effect="non-scaling-stroke"
-								/>
-							</svg>
-						{/if}
-						{#if !snapshot && !drawing && !barcodeDrawing && cameraFeedOn && paneWidth > 0 && paneHeight > 0}
-							{@const box = pixelBarcodeRoi(barcodeRoi, paneWidth, paneHeight)}
-							{#if box}
-								<svg
-									class="pointer-events-none absolute inset-0 z-10 h-full w-full"
-									viewBox="0 0 {paneWidth} {paneHeight}"
-									preserveAspectRatio="xMidYMid meet"
-								>
-									<rect
-										x={box.x}
-										y={box.y}
-										width={box.width}
-										height={box.height}
-										fill="none"
-										stroke="#67e8f9"
-										stroke-width="2"
-										vector-effect="non-scaling-stroke"
-									/>
-								</svg>
-							{/if}
-						{/if}
-						{#if snapshot && paneWidth > 0 && paneHeight > 0 && detections.length > 0}
-							{@const marks = detectionMarks(zoom)}
-							{@const viewW = zoom ? zoom.width : frameWidth}
-							{@const viewH = zoom ? zoom.height : frameHeight}
-							{#if marks.length > 0 && viewW > 0 && viewH > 0}
-								<svg
-									class="pointer-events-none absolute left-0 top-0 z-10"
-									width={viewW}
-									height={viewH}
-									viewBox="0 0 {viewW} {viewH}"
-									preserveAspectRatio="none"
-									aria-hidden="true"
-								>
-									{#each marks as mark (mark.key)}
-										<rect
-											x={mark.x}
-											y={mark.y}
-											width={mark.w}
-											height={mark.h}
-											fill="none"
-											stroke={mark.color}
-											stroke-width={BOX_STROKE}
-										/>
-										<rect
-											x={mark.labelX}
-											y={mark.labelY}
-											width={mark.labelW}
-											height={mark.labelH}
-											fill={mark.color}
-										/>
-										<text
-											x={mark.labelX + LABEL_PAD_X}
-											y={mark.labelY + mark.labelH / 2}
-											fill="#ffffff"
-											font-size={LABEL_FONT}
-											font-family="ui-monospace, monospace"
-											font-weight="600"
-											dominant-baseline="central"
-										>
-											{mark.ic}
-										</text>
-									{/each}
-								</svg>
-							{/if}
-						{/if}
-					</div>
-				{:else if feedOn && camerasMissing}
-					<div
-						class="absolute inset-0 flex items-center justify-center px-6 text-center text-lg font-semibold text-amber-200"
-						role="status"
-					>
-						No cameras found
-					</div>
-				{:else if feedOn && !camerasReady}
-					<div class="absolute inset-0 flex items-center justify-center text-lg text-neutral-400">
-						Looking for cameras...
-					</div>
-				{:else if !feedOn}
-					<div class="absolute inset-0 flex items-center justify-center text-lg text-neutral-500">
-						Feed stopped
-					</div>
-				{/if}
-				{#if snapshot}
-					<div
-						class="pointer-events-none absolute left-3 top-3 z-20 bg-neutral-950/80 {detectRoi &&
-						!drawing
-							? 'px-2 py-1'
-							: 'px-3 py-2'}"
-					>
-						<p
-							class="font-mono font-semibold leading-none text-white {detectRoi && !drawing
-								? 'text-sm'
-								: 'text-3xl'}"
-						>
-							{snapshot.kitCode}
-						</p>
-						<p
-							class="mt-1 text-neutral-300 {detectRoi && !drawing ? 'text-[11px]' : 'text-sm'}"
-						>
-							Taken {snapshot.takenAt}
-						</p>
-					</div>
-					{#if detectState === "running"}
-						<p class="pointer-events-none absolute bottom-3 left-3 z-40 bg-neutral-950/80 px-3 py-2 text-sm font-semibold text-amber-200">
-							Detecting parts...
-						</p>
-					{/if}
-					<button
-						type="button"
-						class="absolute bottom-3 right-3 z-40 inline-flex min-h-11 items-center border border-yellow-300 bg-yellow-400 px-4 text-sm font-semibold text-neutral-950"
-						on:click={resumeLiveFeed}
-					>
-						{feedOn ? "Resume live feed" : "Back to feed"}
-					</button>
-				{/if}
-				{#if (drawing && snapshot) || (barcodeDrawing && !snapshot)}
-					<div
-						class="absolute inset-0 z-30 cursor-crosshair"
-						on:pointerdown={onRoiPointerDown}
-						on:pointermove={onRoiPointerMove}
-						on:pointerup={onRoiPointerUp}
-						on:pointercancel={onRoiPointerUp}
-					></div>
-					<p class="pointer-events-none absolute left-3 top-3 z-40 bg-neutral-950/80 px-3 py-2 text-sm text-amber-200">
-						{barcodeDrawing
-							? "Drag a rectangle on the camera."
-							: "Drag a rectangle on the snapshot."}
-					</p>
-					{#if draftMark}
-						<div
-							class="pointer-events-none absolute z-50"
-							style="left:{draftMark.left}px;top:{draftMark.top}px;width:{draftMark.width}px;height:{draftMark.height}px;box-sizing:border-box;border:3px dotted #fde68a;background:rgba(253,230,138,0.2);box-shadow:0 0 0 1px #0a0a0a;"
-						></div>
-					{/if}
-				{/if}
-			</div>
-		</section>
+		<CameraView
+			bind:paneFrame
+			bind:liveCanvas
+			bind:paneImage
+			snapshot={snapshot}
+			feedOn={feedOn}
+			cameraFeedOn={cameraFeedOn}
+			camerasMissing={camerasMissing}
+			camerasReady={camerasReady}
+			liveMessage={liveMessage}
+			livePainted={livePainted}
+			zoom={zoom}
+			paneWidth={paneWidth}
+			paneHeight={paneHeight}
+			frameWidth={frameWidth}
+			frameHeight={frameHeight}
+			detectRoi={detectRoi}
+			drawing={drawing}
+			barcodeDrawing={barcodeDrawing}
+			barcodeOverlay={barcodeOverlay}
+			detections={detections}
+			detectState={detectState}
+			draftMark={draftMark}
+			roiMessage={roiMessage}
+			onImageLoad={rememberPaneSize}
+			onResume={resumeLiveFeed}
+			onPointerDown={onRoiPointerDown}
+			onPointerMove={onRoiPointerMove}
+			onPointerUp={onRoiPointerUp}
+		/>
 
-		<section class="flex min-h-0 min-w-0 flex-col overflow-hidden border border-neutral-700 bg-neutral-900">
-			<h2 class="shrink-0 border-b border-neutral-800 px-3 py-1.5 text-[11px] font-semibold uppercase tracking-widest text-neutral-500">
-				Result
-			</h2>
-			{#if result}
-				<p
-					class="shrink-0 px-4 py-4 text-4xl font-black uppercase leading-none tracking-widest {result.status ===
-					'pass'
-						? 'bg-green-500 text-neutral-950'
-						: 'bg-red-600 text-white'}"
-				>
-					{result.status}
-				</p>
-				<div class="result-scroll flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4">
-					{#if result.kitCode}
-						<p class="font-mono text-2xl font-semibold tracking-tight">{result.kitCode}</p>
-					{/if}
-					{#if testMode && isLoadedBom(result)}
-						<button
-							type="button"
-							class="inline-flex min-h-11 w-fit items-center border border-blue-500 bg-blue-600 px-4 text-sm font-semibold text-white"
-							on:click={chooseAndDetect}
-						>
-							Choose image
-						</button>
-						<p class="text-sm text-neutral-400">
-							Test mode is on. Choose an image file to detect parts for this kit.
-						</p>
-					{/if}
-					{#if result.des}
-						<p class="text-base text-neutral-300">{result.des}</p>
-					{/if}
-					{#if result.message}
-						<p class="text-base text-neutral-200">{result.message}</p>
-					{/if}
-					{#if result.parts?.length}
-						{@const detectFailed =
-							detectState === "done" && !!detectMessage && detections.length === 0}
-						{@const showSeen =
-							detectState !== "idle" && isLoadedBom(result) && !detectFailed}
-						{@const counts = detectionCounts(detections)}
-						<table class="w-full border-collapse text-left text-sm">
-							<thead>
-								<tr class="border-b border-neutral-600 text-[11px] uppercase tracking-widest text-neutral-400">
-									<th class="py-2 pr-3 font-semibold">IC</th>
-									<th class="py-2 pr-3 font-semibold">Description</th>
-									<th class="py-2 text-right font-semibold">Qty</th>
-									{#if showSeen}
-										<th class="py-2 text-right font-semibold">Seen</th>
-									{/if}
-								</tr>
-							</thead>
-							<tbody>
-								{#each result.parts as part, i (i)}
-									<tr class="border-b border-neutral-800">
-										<td class="py-2 pr-3 font-mono font-medium">{part.ic}</td>
-										<td class="py-2 pr-3 text-neutral-200">{part.des}</td>
-										<td class="py-2 text-right font-semibold">{part.qty}</td>
-										{#if showSeen}
-											<td
-												class="py-2 text-right font-semibold {detectState === 'running'
-													? 'text-neutral-500'
-													: (counts[part.ic] ?? 0) === part.qty
-														? 'text-green-400'
-														: 'text-red-400'}"
-											>
-												{detectState === "running" ? "…" : (counts[part.ic] ?? 0)}
-											</td>
-										{/if}
-									</tr>
-								{/each}
-							</tbody>
-						</table>
-						{#if showSeen && detectState === "done"}
-							<p class="text-sm text-neutral-300">{matchSummary(result.parts, detections)}</p>
-						{/if}
-					{/if}
-					{#if detectState === "running"}
-						<p class="text-sm text-neutral-400">Detecting parts...</p>
-					{/if}
-					{#if detectState === "done"}
-						{@const extras = partsOutsideBom(detections, bom?.parts ?? null)}
-						{#if extras.length}
-							<h3 class="text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
-								{bom ? "Not in BoM" : "Detected parts"}
-							</h3>
-							<table class="w-full border-collapse text-left text-sm">
-								<thead>
-									<tr class="border-b border-neutral-600 text-[11px] uppercase tracking-widest text-neutral-400">
-										<th class="py-2 pr-3 font-semibold">IC</th>
-										<th class="py-2 text-right font-semibold">Count</th>
-									</tr>
-								</thead>
-								<tbody>
-									{#each extras as row (row.ic)}
-										<tr class="border-b border-neutral-800">
-											<td class="py-2 pr-3 font-mono font-medium">{row.ic}</td>
-											<td class="py-2 text-right font-semibold">{row.count}</td>
-										</tr>
-									{/each}
-								</tbody>
-							</table>
-						{/if}
-					{/if}
-					{#if detectMessage}
-						<p class="text-sm text-red-300">{detectMessage}</p>
-					{/if}
-					{#if result.info}
-						<p class="text-sm text-neutral-400">{result.info}</p>
-					{/if}
-					{#if result.kitsFound != null || result.expectedKitCount != null}
-						<p class="text-sm text-neutral-400">
-							Info only: {result.kitsFound ?? "—"} kit(s) found, {result.expectedKitCount ?? "—"} expected
-						</p>
-					{/if}
-				</div>
-			{:else}
-				<div class="px-4 py-8">
-					<p class="text-lg font-medium text-neutral-300">No result yet</p>
-					<p class="mt-1 text-sm text-neutral-500">
-						{testMode
-							? bomSource === "api"
-								? "Type a job card number, then choose an image."
-								: "Type a barcode, then choose an image."
-							: bomSource === "api"
-								? "A decoded barcode is used as the job card number."
-								: "Decode a barcode or press Enter."}
-					</p>
-				</div>
-			{/if}
-		</section>
+		<ResultsPanel
+			result={result}
+			testMode={testMode}
+			bomSource={bomSource}
+			bom={bom}
+			detectState={detectState}
+			detectMessage={detectMessage}
+			detections={detections}
+			onChooseImage={chooseAndDetect}
+		/>
 	</div>
 
 	<footer class="flex shrink-0 items-center border-t border-neutral-800 bg-neutral-900 px-4 py-1.5">
@@ -2525,33 +2004,3 @@ async function decodeAndInspect() {
 		{/if}
 	</div>
 </div>
-
-<style>
-	.result-scroll {
-		color-scheme: dark;
-		scrollbar-color: #a3a3a3 #171717;
-		scrollbar-width: auto;
-	}
-
-	.result-scroll::-webkit-scrollbar {
-		width: 12px;
-		height: 12px;
-	}
-
-	.result-scroll::-webkit-scrollbar-track {
-		background: #171717;
-	}
-
-	.result-scroll::-webkit-scrollbar-thumb {
-		background: #a3a3a3;
-		border: 2px solid #171717;
-	}
-
-	.result-scroll::-webkit-scrollbar-thumb:hover {
-		background: #d4d4d4;
-	}
-
-	.result-scroll::-webkit-scrollbar-corner {
-		background: #171717;
-	}
-</style>
