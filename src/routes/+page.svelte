@@ -9,7 +9,7 @@ import {
 	DecodeHintType,
 } from "@zxing/library";
 import { onDestroy, onMount, tick } from "svelte";
-import { activateCamera } from "$lib/camera-settings";
+import { activateCamera, readDisplayFps } from "$lib/camera-settings";
 
 type Part = { ic: string; des: string; qty: number };
 type InspectView = {
@@ -162,10 +162,12 @@ let imagePick: ((file: File | null) => void) | null = null;
 let streamMs = DEFAULT_SCAN_SECONDS * 1000;
 let streamLeft = DEFAULT_SCAN_SECONDS;
 let streamTimer: ReturnType<typeof setInterval> | null = null;
-let liveImage = "";
 let liveMessage = "";
-let liveTimer: ReturnType<typeof setInterval> | null = null;
-let liveBusy = false;
+let liveCanvas: HTMLCanvasElement | undefined;
+let livePainted = false;
+let liveGeneration = 0;
+let liveRunning = false;
+let displayFps = 15;
 let watchInFlight = false;
 let pageAlive = true;
 let erpName = "";
@@ -207,10 +209,9 @@ function startWatch() {
 }
 
 function stopLive() {
-	if (liveTimer !== null) {
-		clearInterval(liveTimer);
-		liveTimer = null;
-	}
+	liveGeneration += 1;
+	liveRunning = false;
+	livePainted = false;
 }
 
 function showLiveFeed() {
@@ -632,34 +633,109 @@ async function readFrame(index: number): Promise<WatchBody> {
 	return body;
 }
 
-async function refreshLive() {
-	if (!pageAlive || !feedOn || snapshot || liveBusy || !cameraFeedOn) return;
-	liveBusy = true;
-	const index = cameraIndex;
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => {
+		setTimeout(resolve, ms);
+	});
+}
+
+function frameSurface(): {
+	node: HTMLElement;
+	width: number;
+	height: number;
+} | null {
+	if (snapshot) {
+		const image = paneImage;
+		if (!image || image.naturalWidth < 1 || image.naturalHeight < 1)
+			return null;
+		return {
+			node: image,
+			width: image.naturalWidth,
+			height: image.naturalHeight,
+		};
+	}
+	const canvas = liveCanvas;
+	if (!canvas || canvas.width < 1 || canvas.height < 1) return null;
+	return { node: canvas, width: canvas.width, height: canvas.height };
+}
+
+function rememberLiveSize() {
+	const canvas = liveCanvas;
+	if (!canvas || snapshot) return;
+	if (canvas.width === paneWidth && canvas.height === paneHeight) return;
+	paneWidth = canvas.width;
+	paneHeight = canvas.height;
+	measureFrame();
+}
+
+async function drawLiveFrame(url: string): Promise<boolean> {
+	const bitmap = await createImageBitmap(await (await fetch(url)).blob());
 	try {
-		const frame = await invoke<WatchBody>("capture_snapshot", { index });
-		if (!pageAlive || !feedOn || snapshot || index !== cameraIndex) return;
-		if (frame.status === "fail" || !frame.image) {
-			liveMessage = frame.message || "Camera did not open.";
-			return;
+		const node = liveCanvas;
+		if (!node) return false;
+		if (node.width !== bitmap.width || node.height !== bitmap.height) {
+			node.width = bitmap.width;
+			node.height = bitmap.height;
 		}
-		liveImage = frame.image;
-		liveMessage = "";
-	} catch (err: unknown) {
-		if (!pageAlive || index !== cameraIndex) return;
-		liveMessage = invokeError(err, "Camera did not open.");
+		const context = node.getContext("2d", { alpha: false });
+		if (!context) return false;
+		context.drawImage(bitmap, 0, 0);
+		livePainted = true;
+		return true;
 	} finally {
-		liveBusy = false;
+		bitmap.close();
+	}
+}
+
+// The live view uses the same latest-frame preview as Settings. Decode and
+// detection still call capture_snapshot for a full-resolution frame.
+async function runLive(gen: number) {
+	try {
+		while (gen === liveGeneration && pageAlive) {
+			if (!feedOn || snapshot || !cameraFeedOn) return;
+			const started = performance.now();
+			const index = Number(cameraIndex);
+			try {
+				const body = await invoke<WatchBody>("capture_preview", { index });
+				if (gen !== liveGeneration || !pageAlive) return;
+				if (!feedOn || snapshot || index !== Number(cameraIndex)) continue;
+				if (body.status === "fail" || !body.image) {
+					liveMessage = body.message || "Camera did not open.";
+					await sleep(400);
+					continue;
+				}
+				if (!liveCanvas) await tick();
+				const drew = await drawLiveFrame(body.image);
+				if (gen !== liveGeneration || !pageAlive) {
+					livePainted = false;
+					return;
+				}
+				if (!drew) {
+					await sleep(30);
+					continue;
+				}
+				liveMessage = "";
+				rememberLiveSize();
+			} catch (err: unknown) {
+				if (gen !== liveGeneration || !pageAlive) return;
+				liveMessage = invokeError(err, "Camera did not open.");
+				await sleep(400);
+				continue;
+			}
+			const remain = 1000 / displayFps - (performance.now() - started);
+			if (gen === liveGeneration && remain > 0) await sleep(remain);
+		}
+	} finally {
+		if (liveGeneration === gen) liveRunning = false;
 	}
 }
 
 function startLive() {
 	if (snapshot || !feedOn || !cameraFeedOn) return;
-	stopLive();
-	void refreshLive();
-	liveTimer = setInterval(() => {
-		void refreshLive();
-	}, 400);
+	if (liveRunning) return;
+	const gen = liveGeneration;
+	liveRunning = true;
+	void runLive(gen);
 }
 
 async function lookupCode(code: string): Promise<InspectView> {
@@ -727,7 +803,7 @@ type LocalConfig = {
 	scanSeconds?: unknown;
 	testMode?: unknown;
 	detectRoi?: unknown;
-	camera?: { index?: unknown } | null;
+	camera?: { index?: unknown; displayFps?: unknown } | null;
 	erp?: { name?: unknown; url?: unknown } | null;
 };
 
@@ -918,6 +994,7 @@ async function loadCamera() {
 			return;
 		const camera =
 			data.camera && typeof data.camera === "object" ? data.camera : {};
+		displayFps = readDisplayFps(camera.displayFps);
 		const index = Number(camera.index);
 		if (!Number.isInteger(index) || index < 0 || index > 32) return;
 		if (index === skippedSavedIndex) return;
@@ -949,7 +1026,8 @@ async function saveCameraIndex() {
 			if (!pageAlive || generation !== cameraSaveGeneration) return;
 			const config = await invoke<Record<string, unknown>>("load_local_config");
 			if (!pageAlive || generation !== cameraSaveGeneration) return;
-			activateCamera(config, index);
+			const chosen = activateCamera(config, index);
+			displayFps = chosen.displayFps;
 			await invoke("save_local_config", { config });
 			if (!pageAlive || generation !== cameraSaveGeneration) return;
 			if (feedOn && !snapshot) showLiveFeed();
@@ -1151,19 +1229,19 @@ $: zoom = zoomFrame(
 );
 
 function showDraft(box: DetectRoi) {
-	const img = paneImage;
+	const surface = frameSurface();
 	const frame = paneFrame;
-	if (!img || !frame || (box.w <= 0 && box.h <= 0)) {
+	if (!surface || !frame || (box.w <= 0 && box.h <= 0)) {
 		draftMark = null;
 		return;
 	}
-	const nw = img.naturalWidth;
-	const nh = img.naturalHeight;
+	const nw = surface.width;
+	const nh = surface.height;
 	if (nw < 1 || nh < 1) {
 		draftMark = null;
 		return;
 	}
-	const rect = img.getBoundingClientRect();
+	const rect = surface.node.getBoundingClientRect();
 	const frameRect = frame.getBoundingClientRect();
 	if (rect.width < 1 || rect.height < 1) {
 		draftMark = null;
@@ -1216,11 +1294,11 @@ function beginSetRoi() {
 }
 
 function pointInImage(event: PointerEvent): { x: number; y: number } | null {
-	const img = paneImage;
-	if (!img) return null;
-	const rect = img.getBoundingClientRect();
-	const nw = img.naturalWidth;
-	const nh = img.naturalHeight;
+	const surface = frameSurface();
+	if (!surface) return null;
+	const rect = surface.node.getBoundingClientRect();
+	const nw = surface.width;
+	const nh = surface.height;
 	if (!nw || !nh || rect.width < 1 || rect.height < 1) return null;
 	const scale = Math.min(rect.width / nw, rect.height / nh);
 	const drawnW = nw * scale;
@@ -1975,18 +2053,18 @@ async function decodeAndInspect() {
 								class="h-full w-full {zoom ? 'object-fill' : 'object-contain'}"
 								on:load={rememberPaneSize}
 							/>
-						{:else if cameraFeedOn && liveImage}
-							<img
-								bind:this={paneImage}
-								src={liveImage}
-								alt="Camera feed"
-								class="h-full w-full {zoom ? 'object-fill' : 'object-contain'}"
-								on:load={rememberPaneSize}
-							/>
 						{:else if cameraFeedOn}
-							<p class="absolute inset-0 flex items-center justify-center px-6 text-center text-sm text-neutral-300">
-								{liveMessage || "Opening camera…"}
-							</p>
+							<canvas
+								bind:this={liveCanvas}
+								class="h-full w-full {zoom ? 'object-fill' : 'object-contain'}"
+								class:invisible={!livePainted}
+								aria-label="Camera feed"
+							></canvas>
+							{#if liveMessage || !livePainted}
+								<p class="absolute inset-0 flex items-center justify-center px-6 text-center text-sm text-neutral-300">
+									{liveMessage || "Opening camera…"}
+								</p>
+							{/if}
 						{/if}
 						{#if (snapshot || cameraFeedOn) && paneWidth > 0 && paneHeight > 0 && !drawing && detectRoi}
 							{@const x = detectRoi.x * paneWidth}
