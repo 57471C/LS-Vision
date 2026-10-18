@@ -2,17 +2,17 @@
 
 ## Preview path
 
-- One latest-frame slot. The reader overwrites it on every sample.
-- JPEG is encoded only when the canvas asks for a frame.
-- Preview is scaled to fit 1280×720.
-- Full-resolution snapshot remains available for detection and the operator snapshot button.
-- Canvas paces itself: next frame is requested only after `drawImage` finishes, and the interval follows the Display FPS setting.
+- One Windows camera stays open on a single thread.
+- Each sample is stored twice: a preview handle and a still handle.
+- `capture_preview` takes the preview handle and encodes a JPEG that fits in 1280×720. The next preview waits for a new sample.
+- `capture_snapshot` copies the still handle and does not empty the preview slot. The JPEG keeps the selected camera mode. Encoding does not run on the camera thread.
+- The canvas paces itself. The next frame is requested only after `drawImage` finishes, and the interval follows Display FPS (15, 20, 25, or 30).
+- A barcode snapshot therefore does not freeze the preview. After a kit is held, the still image covers the canvas.
 
 ## Modes
 
-Camera modes are enumerated from the device (MediaFoundation). Plugging in a new camera (4K, 12 MP, etc.) should list its supported modes automatically. No separate discovery script is required unless a device fails to enumerate.
+Camera modes come from the device (Media Foundation). A newly attached camera lists the modes that device reports. Focus, brightness, and contrast are stored by Settings. This camera path does not apply those levels to the device.
 
-## Troubleshooting
+## Settings preview
 
-- If the Operator view is janky but Settings preview is smooth, the Operator page is still on the old path and needs to reuse `capture_preview`.
-- Capture fps should stay near the camera's native rate (~30 fps for typical USB cameras). Canvas fps is limited by the Display FPS setting and encode/draw time.
+Settings can open a separate preview window for the selected camera. It uses the same paced `capture_preview` path and the same Display FPS.

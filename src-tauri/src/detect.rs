@@ -7,7 +7,7 @@
 //! Boxes are checked against Ultralytics `YOLO(best.onnx)`, not `YOLO(best.pt)`.
 //! Those two already disagree on the same photo. JPEG bytes are decoded with
 //! TurboJPEG so the pixels match `cv2.imdecode`. The resize matches the OpenCV
-//! 8-bit `INTER_LINEAR` path used by the installed sidecar.
+//! 8-bit `INTER_LINEAR` path.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -217,7 +217,7 @@ fn crop_rgb(
     (out, rw, rh, x as i32, y as i32)
 }
 
-/// OpenCV 4.10 / this sidecar's `cv2.resize(..., INTER_LINEAR)` for 8-bit pixels.
+/// OpenCV 4.10 `cv2.resize(..., INTER_LINEAR)` for 8-bit pixels.
 ///
 /// Horizontal sums stay in `i32` (`pixel * 11-bit coeff`). The 8-bit vertical
 /// step is the specialized form, not `(sum + bias) >> 22`:
@@ -744,7 +744,7 @@ fn reject_size(width: u32, height: u32) -> Result<(), String> {
     Ok(())
 }
 
-/// libjpeg-turbo, same family as the sidecar's `cv2.imdecode`.
+/// libjpeg-turbo, same family as OpenCV `cv2.imdecode`.
 fn decode_jpeg(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
     let image = turbojpeg::decompress(bytes, turbojpeg::PixelFormat::RGB)
         .map_err(|_| "Could not read the image".to_string())?;

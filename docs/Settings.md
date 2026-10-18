@@ -1,21 +1,36 @@
 # Settings
 
-Settings are stored in `config.local.json` (gitignored).
+Settings are stored in `vision/config.local.json` (gitignored). The unlock password is `admin` and is not saved. Unlock is per browser tab.
 
 ## Camera
 
-- Select camera and mode.
-- **Display FPS**: 15, 20, 25, 30. Controls how often the preview canvas asks for a new JPEG. Capture stays at the camera's native rate.
-- Preview is scaled (typically 1280×720) for smooth display. Snapshots used for detection stay full resolution.
+- Select the camera and its mode.
+- **Display FPS**: 15, 20, 25, or 30. This is how often the preview canvas asks for a new JPEG. Capture stays at the camera's selected mode.
+- Preview JPEGs fit in 1280×720. Snapshots used for barcode decode and detection stay full resolution.
+- Focus, brightness, and contrast are stored as 0–100. Reset and Cancel restore the last loaded values. Save writes the camera block.
+- Preview opens a window for the selected camera.
+
+## Capture
+
+- **Test mode**: after a kit IC loads, the operator page asks for an image file instead of reading the camera.
+- **Barcode scan**: whole seconds from 1 to 60. The default is 8. This is the operator countdown.
+- **Part detection**: a region of the frame (`detectRoi`: `x`, `y`, `w`, `h` as fractions from 0 to 1). Detection crops to it. Clear removes it.
+- **Barcode**: a region of the frame (`barcodeRoi`: `x`, `y`, `width`, `height` as fractions from 0 to 1). The operator crop uses the same object. With no region, decode uses the full frame. The operator page can also draw this region on the live feed when Settings is unlocked.
 
 ## Inference EP
 
-- Dropdown lists only providers this PC can run (CPU always; DirectML if a Direct3D 12 adapter is present; CUDA if an NVIDIA adapter and the CUDA EP libraries are available).
-- Choice is saved as `inferenceEp`.
-- If the selected provider fails, the session falls back to CPU and the header updates.
+- The dropdown lists only providers this PC can run. CPU is always listed. DirectML is listed when a Direct3D 12 adapter is present. CUDA is listed when an NVIDIA adapter and the CUDA execution provider libraries load.
+- The choice is saved as `inferenceEp`.
+- If the selected provider fails, the session falls back to CPU and the header updates. The saved choice is kept.
+- Benchmark times the active provider on a fixed image.
 
-## Other
+## Models
 
-- BoM source (JSON / CSV / MSSQL).
-- Admin flag (unlocks extra controls such as ROI marquee when implemented).
-- Model selection (when multiple models are present).
+Training lists `.pt` and `.onnx` files in `vision/models`. The selected basename is `model`. Detection runs only for `.onnx`.
+
+## Database
+
+- BoM source: JSON (`vision/sample-bom.json`), API (base URL, path, and API key; the barcode is the job card number), or MSSQL (Windows Authentication by default, SQL authentication optional).
+- ERP button name and URL. Empty name and URL hides the operator button.
+
+The operator page reloads the barcode ROI, Test mode, scan interval, BoM source, and ERP button when the window focuses.

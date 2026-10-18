@@ -2,22 +2,30 @@
 
 ## Preview is janky
 
-- Check Settings preview first. If that is smooth, the Operator page may still be on the old frame path.
-- Confirm Display FPS is set and the canvas is pacing (request next frame only after draw).
-- Capture fps should stay high; only canvas fps is throttled.
+- Confirm Display FPS is 15, 20, 25, or 30 and that the canvas asks for the next frame only after the draw finishes.
+- Capture stays at the camera mode. Canvas rate is limited by Display FPS and by encode and draw time.
+- A barcode snapshot uses a separate still handle. The preview slot stays available, so the canvas should drop at most one frame when the countdown reaches 0.
+
+## Start/Stop Feed feels stuck
+
+The button ignores extra clicks for 1.52 seconds. It reads Please wait, stays disabled, and draws at half opacity until that window ends.
 
 ## Inference EP missing
 
 - DirectML requires a Direct3D 12 adapter and DirectML.dll.
-- CUDA requires an NVIDIA adapter plus the CUDA execution provider libraries (not shipped in the static build).
-- CPU is always available and is the fallback.
+- CUDA requires an NVIDIA adapter plus the CUDA execution provider libraries. This build does not ship those libraries.
+- CPU is always available and is the fallback. The saved provider is kept when fallback happens, so the next launch tries it again.
+
+## A .pt model does not detect
+
+Detection runs `.onnx` only. Export the checkpoint with `yolo export model=best.pt format=onnx`, put the file in `vision/models/`, and select it.
 
 ## BoM not found
 
-- Confirm the barcode reads the expected kit IC.
-- Check the BoM source setting and connection (MSSQL Windows Auth, JSON path, etc.).
-- Verify the SQL excludes the correct prefixes (`3%`, `2P%`).
+- Confirm the barcode reads the expected kit IC. A saved barcode ROI that misses the label will read nothing.
+- Check the BoM source: JSON uses `vision/sample-bom.json`, the API uses the saved URL and key, and MSSQL uses the saved server and `vision/bom_queries.sql`.
+- Verify the SQL excludes the intended prefixes (`3%`, `2P%`).
 
-## Sidecar / port errors
+## Test mode
 
-The Python sidecar (`vision/main.py` on port 8008) is no longer used for detection. If you still see connection refused messages, an old code path is being called.
+With Test mode on, the countdown does not open the camera. Type the kit IC and use the image prompt. Turn Test mode off to read the bench camera again.

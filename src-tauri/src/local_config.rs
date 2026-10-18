@@ -1,5 +1,5 @@
 //! Read and write `vision/config.local.json`, and list the weight files in `vision/models`.
-//! These commands do not load a model or open a camera. The Python sidecar keeps those routes.
+//! These commands do not load a model or open a camera. Detection loads the saved `.onnx` file in Rust.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -26,6 +26,67 @@ pub(crate) fn project_root() -> Result<PathBuf, String> {
         .parent()
         .map(Path::to_path_buf)
         .ok_or_else(|| "Could not find the project root.".to_string())
+}
+
+/// Folder for photos, snapshots, and logs.
+/// LocalAppData is used when it is set. Otherwise the folder is under Documents.
+/// The result is never inside Program Files.
+pub(crate) fn user_save_dir() -> Result<PathBuf, String> {
+    let dir = user_save_dir_path()?;
+    fs::create_dir_all(&dir)
+        .map_err(|err| format!("Could not create the save folder {}: {err}", dir.display()))?;
+    Ok(dir)
+}
+
+fn user_save_dir_path() -> Result<PathBuf, String> {
+    let dir = if let Some(local) = env_path("LOCALAPPDATA") {
+        local.join("studio.lean.ls-vision")
+    } else if let Some(home) = env_path("USERPROFILE").or_else(|| env_path("HOME")) {
+        home.join("Documents").join("ls-vision")
+    } else {
+        return Err("Could not find LocalAppData or Documents.".to_string());
+    };
+    if is_program_files(&dir) {
+        return Err(
+            "Saved photos, snapshots, and logs cannot be written under Program Files.".to_string(),
+        );
+    }
+    Ok(dir)
+}
+
+fn env_path(key: &str) -> Option<PathBuf> {
+    let value = std::env::var_os(key)?;
+    if value.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(value))
+}
+
+fn is_program_files(path: &Path) -> bool {
+    let text = normalize_path(path);
+    if text.ends_with("\\program files") || text.ends_with("\\program files (x86)") {
+        return true;
+    }
+    if text.contains("\\program files\\") || text.contains("\\program files (x86)\\") {
+        return true;
+    }
+    for key in ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"] {
+        let Some(root) = env_path(key) else {
+            continue;
+        };
+        let root = normalize_path(&root);
+        if text == root || text.starts_with(&(root + "\\")) {
+            return true;
+        }
+    }
+    false
+}
+
+fn normalize_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
 }
 
 fn vision_dir(root: &Path) -> PathBuf {
@@ -101,7 +162,7 @@ pub(crate) fn load_document(root: &Path) -> Result<Value, String> {
     if let Some(value) = read_json_object(&config_path, "vision/config.local.json")? {
         return Ok(value);
     }
-    // Same fallback as the sidecar: bom-source.json is used only when the local file is absent.
+    // bom-source.json is used only when config.local.json is absent.
     if let Some(value) = read_json_object(&legacy_file(root), "vision/bom-source.json")? {
         return Ok(value);
     }
@@ -347,6 +408,26 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn saved_files_stay_out_of_program_files() {
+        let dir = super::user_save_dir_path().unwrap();
+        let text = super::normalize_path(&dir);
+        assert!(
+            text.contains("\\appdata\\local\\") || text.contains("\\documents\\"),
+            "{text}"
+        );
+        assert!(!super::is_program_files(&dir), "{text}");
+        assert!(super::is_program_files(Path::new(
+            r"C:\Program Files\ls-vision\debug-barcode.jpg"
+        )));
+        assert!(super::is_program_files(Path::new(
+            r"C:\Program Files (x86)\ls-vision\barcode-debug.log"
+        )));
+        assert!(!super::is_program_files(Path::new(
+            r"C:\Users\operator\AppData\Local\studio.lean.ls-vision\debug-barcode.jpg"
+        )));
     }
 
     #[test]

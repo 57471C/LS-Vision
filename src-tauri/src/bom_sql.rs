@@ -1,4 +1,4 @@
-//! MSSQL BoM lookup through the same ODBC settings and query file as the sidecar.
+//! MSSQL BoM lookup through ODBC, using the saved settings and `vision/bom_queries.sql`.
 //! JSON and the job-card API stay in `bom.rs`.
 
 use odbc_api::{ConnectionOptions, Cursor, IntoParameter, ResultSetMetadata, environment};
