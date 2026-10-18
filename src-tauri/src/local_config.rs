@@ -3,6 +3,7 @@
 //! The active filename stays in `vision/config.local.json`. The weight file lives under the Tauri app data directory.
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::SystemTime;
@@ -433,10 +434,34 @@ fn is_onnx_file(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("onnx"))
 }
 
+/// ModelProto starts with `ir_version` (field 1, one-byte varint), then another
+/// model field. Text and image files renamed to `.onnx` do not.
+fn onnx_model_header(header: &[u8]) -> bool {
+    header.len() >= 3
+        && header[0] == 0x08
+        && (1..0x80).contains(&header[1])
+        && matches!(header[2], 0x12 | 0x1A | 0x22 | 0x28 | 0x32 | 0x3A)
+}
+
+fn looks_like_onnx_model(path: &Path) -> Result<(), String> {
+    let mut file =
+        fs::File::open(path).map_err(|_| "Could not read the selected file.".to_string())?;
+    let mut header = [0u8; 8];
+    let read = file
+        .read(&mut header)
+        .map_err(|_| "Could not read the selected file.".to_string())?;
+    if onnx_model_header(&header[..read]) {
+        Ok(())
+    } else {
+        Err("The selected file is not an ONNX model.".to_string())
+    }
+}
+
 fn copy_model_file(dir: &Path, source: &Path, dest_name: &str) -> Result<(), String> {
     if !source.is_file() || !is_onnx_file(source) {
         return Err("Choose an .onnx file.".to_string());
     }
+    looks_like_onnx_model(source)?;
     let dest_name = clean_model_name(dest_name)
         .filter(|name| name.to_ascii_lowercase().ends_with(".onnx"))
         .ok_or_else(|| "Choose an .onnx file.".to_string())?;
@@ -448,10 +473,10 @@ fn copy_model_file(dir: &Path, source: &Path, dest_name: &str) -> Result<(), Str
     if dest.parent() != Some(root.as_path()) {
         return Err("Choose an .onnx file.".to_string());
     }
-    if let Ok(resolved) = dest.canonicalize() {
-        if !resolved.starts_with(&root) {
-            return Err("Could not replace the model.".to_string());
-        }
+    if let Ok(resolved) = dest.canonicalize()
+        && !resolved.starts_with(&root)
+    {
+        return Err("Could not replace the model.".to_string());
     }
     let partial = root.join(format!(".{dest_name}.partial"));
     if let Err(err) = fs::copy(source, &partial) {
@@ -849,12 +874,27 @@ mod tests {
         assert!(!text.to_ascii_lowercase().contains(".onnx"));
     }
 
+    fn onnx_bytes(payload: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0x08, 0x08, 0x12, 0x00];
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    #[test]
+    fn onnx_header_accepts_a_model_and_rejects_other_bytes() {
+        assert!(onnx_model_header(&[0x08, 0x08, 0x12, 0x07]));
+        assert!(!onnx_model_header(b"this is not a model"));
+        assert!(!onnx_model_header(&[0x89, 0x50, 0x4E, 0x47]));
+        assert!(!onnx_model_header(&[0x08, 0x08]));
+    }
+
     #[test]
     fn update_overwrites_the_selected_onnx_name() {
         let project = TempProject::new("install");
         let models = models_dir(project.root());
         let source = project.root().join("fresh.onnx");
-        fs::write(&source, b"new-bytes").unwrap();
+        let body = onnx_bytes(b"new-bytes");
+        fs::write(&source, &body).unwrap();
         fs::write(models.join("kit.onnx"), b"old").unwrap();
         fs::write(models.join("best.pt"), b"pt").unwrap();
 
@@ -862,7 +902,7 @@ mod tests {
         assert_eq!(saved.model, "kit.onnx");
         assert_eq!(saved.active, "kit.onnx");
         assert_eq!(saved.message, "Updated kit.onnx.");
-        assert_eq!(fs::read(models.join("kit.onnx")).unwrap(), b"new-bytes");
+        assert_eq!(fs::read(models.join("kit.onnx")).unwrap(), body);
         assert_eq!(fs::read(models.join("best.pt")).unwrap(), b"pt");
         assert_eq!(load_document(project.root()).unwrap()["model"], "kit.onnx");
         assert!(fs::read_dir(&models).unwrap().all(|entry| {
@@ -877,7 +917,8 @@ mod tests {
         let project = TempProject::new("install-best");
         let models = models_dir(project.root());
         let source = project.root().join("export.ONNX");
-        fs::write(&source, b"onnx-body").unwrap();
+        let body = onnx_bytes(b"onnx-body");
+        fs::write(&source, &body).unwrap();
         fs::write(models.join("best.pt"), b"pt").unwrap();
         fs::write(models.join("best.onnx"), b"previous").unwrap();
 
@@ -885,7 +926,7 @@ mod tests {
         assert_eq!(saved.model, "best.onnx");
         assert_eq!(saved.active, "best.onnx");
         assert_eq!(saved.message, "Updated best.onnx.");
-        assert_eq!(fs::read(models.join("best.onnx")).unwrap(), b"onnx-body");
+        assert_eq!(fs::read(models.join("best.onnx")).unwrap(), body);
         assert_eq!(fs::read(models.join("best.pt")).unwrap(), b"pt");
     }
 
@@ -894,22 +935,24 @@ mod tests {
         let project = TempProject::new("install-empty");
         let models = models_dir(project.root());
         let source = project.root().join("weights.onnx");
-        fs::write(&source, b"first").unwrap();
+        let body = onnx_bytes(b"first");
+        fs::write(&source, &body).unwrap();
         let saved = install_model_at(project.root(), &models, &source, "").unwrap();
         assert_eq!(saved.model, "best.onnx");
         assert_eq!(saved.message, "Updated best.onnx.");
-        assert_eq!(fs::read(models.join("best.onnx")).unwrap(), b"first");
+        assert_eq!(fs::read(models.join("best.onnx")).unwrap(), body);
     }
 
     #[test]
     fn update_replaces_bytes_when_the_size_matches() {
         let project = TempProject::new("install-same-size");
         let models = models_dir(project.root());
-        fs::write(models.join("best.onnx"), b"aaaa").unwrap();
+        fs::write(models.join("best.onnx"), onnx_bytes(b"aaaa")).unwrap();
         let source = project.root().join("next.onnx");
-        fs::write(&source, b"bbbb").unwrap();
+        let body = onnx_bytes(b"bbbb");
+        fs::write(&source, &body).unwrap();
         install_model_at(project.root(), &models, &source, "best.onnx").unwrap();
-        assert_eq!(fs::read(models.join("best.onnx")).unwrap(), b"bbbb");
+        assert_eq!(fs::read(models.join("best.onnx")).unwrap(), body);
     }
 
     #[test]
@@ -922,5 +965,18 @@ mod tests {
         let err = install_model_at(project.root(), &models, &source, "best.onnx").unwrap_err();
         assert!(err.contains(".onnx"), "{err}");
         assert_eq!(fs::read(models.join("best.onnx")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn update_rejects_an_onnx_name_that_is_not_a_model() {
+        let project = TempProject::new("install-header");
+        let models = models_dir(project.root());
+        let source = project.root().join("notes.onnx");
+        fs::write(&source, b"this is not a model").unwrap();
+        let kept = onnx_bytes(b"keep");
+        fs::write(models.join("best.onnx"), &kept).unwrap();
+        let err = install_model_at(project.root(), &models, &source, "best.onnx").unwrap_err();
+        assert!(err.contains("not an ONNX model"), "{err}");
+        assert_eq!(fs::read(models.join("best.onnx")).unwrap(), kept);
     }
 }

@@ -32,6 +32,8 @@ const PAD_VALUE: u8 = 114;
 const INTER_RESIZE_COEF_SCALE: i32 = 2048;
 const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_PIXELS: usize = 40_000_000;
+const MODEL_MISSING: &str = "Model is missing.";
+const MODEL_FAILED: &str = "Model failed to load.";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Detection {
@@ -46,6 +48,14 @@ struct Roi {
     y: f64,
     w: f64,
     h: f64,
+}
+
+struct OutputFrame {
+    view_w: i32,
+    view_h: i32,
+    image_size: i32,
+    origin_x: i32,
+    origin_y: i32,
 }
 
 struct Candidate {
@@ -138,10 +148,9 @@ fn cv_round_f32(value: f32) -> i32 {
         floor + 1.0
     } else if diff < 0.5 {
         floor
-    } else if (floor as i32) % 2 == 0 {
-        floor
     } else {
-        floor + 1.0
+        let base = floor as i32;
+        if base % 2 == 0 { floor } else { floor + 1.0 }
     };
     rounded as i32
 }
@@ -601,7 +610,7 @@ fn candidates_from_output(
                 best_class = class_id;
             }
         }
-        if !(best_score > CONF_THRESHOLD) || !best_score.is_finite() {
+        if !best_score.is_finite() || best_score <= CONF_THRESHOLD {
             continue;
         }
         let half_w = w * 0.5;
@@ -623,11 +632,7 @@ fn detections_from_output(
     shape: &[i64],
     names: &[String],
     end_to_end: bool,
-    view_w: i32,
-    view_h: i32,
-    image_size: i32,
-    origin_x: i32,
-    origin_y: i32,
+    frame: OutputFrame,
 ) -> Result<Vec<Detection>, String> {
     if shape.len() != 3 || shape[0] < 1 {
         return Err("Detect failed: unexpected output shape".to_string());
@@ -656,16 +661,22 @@ fn detections_from_output(
     let mut detections = Vec::with_capacity(chosen.len());
     for item in chosen {
         let scaled = scale_box(
-            item.x1, item.y1, item.x2, item.y2, view_h, view_w, image_size,
+            item.x1,
+            item.y1,
+            item.x2,
+            item.y2,
+            frame.view_h,
+            frame.view_w,
+            frame.image_size,
         );
         detections.push(Detection {
             ic: class_name(names, item.class_id),
             confidence: round_places(f64::from(item.score), 4),
             bbox: [
-                scaled[0] + origin_x,
-                scaled[1] + origin_y,
-                scaled[2] + origin_x,
-                scaled[3] + origin_y,
+                scaled[0] + frame.origin_x,
+                scaled[1] + frame.origin_y,
+                scaled[2] + frame.origin_x,
+                scaled[3] + frame.origin_y,
             ],
         });
     }
@@ -689,7 +700,7 @@ fn end_to_end_candidates(
         let y2 = score_at(values, bcn, channels, boxes, 3, box_index);
         let score = score_at(values, bcn, channels, boxes, 4, box_index);
         let class_id = score_at(values, bcn, channels, boxes, 5, box_index);
-        if !(score > CONF_THRESHOLD) || !score.is_finite() || class_id < 0.0 {
+        if !score.is_finite() || score <= CONF_THRESHOLD || class_id < 0.0 {
             continue;
         }
         found.push(Candidate {
@@ -1035,6 +1046,34 @@ pub(crate) fn forget_session() {
     *guard = None;
 }
 
+fn model_status_message(err: &str) -> String {
+    if err == MODEL_MISSING {
+        return MODEL_MISSING.to_string();
+    }
+    if err.contains("failed to load") || err.contains("not loaded") {
+        return MODEL_FAILED.to_string();
+    }
+    err.to_string()
+}
+
+/// The active filename from `config.local.json`, joined to the app data models folder.
+/// A missing file is reported before any session is opened.
+fn resolved_onnx_model(models: &Path, name: &str) -> Result<PathBuf, String> {
+    if !name.to_ascii_lowercase().ends_with(".onnx") {
+        return Err(format!("{name} is not an ONNX file."));
+    }
+    let path = models.join(name);
+    if !path.is_file() {
+        return Err(MODEL_MISSING.to_string());
+    }
+    Ok(path)
+}
+
+fn active_onnx_path(root: &Path) -> Result<PathBuf, String> {
+    let name = local_config::configured_model_name(root)?;
+    resolved_onnx_model(&local_config::app_models_dir()?, &name)
+}
+
 /// Drop the cached session and load the active `.onnx` model with the saved provider.
 pub(crate) fn reload_session() -> Result<(), String> {
     forget_session();
@@ -1043,29 +1082,24 @@ pub(crate) fn reload_session() -> Result<(), String> {
         inference_ep::remember(requested, requested, "");
         return Ok(());
     };
-    let name = match local_config::configured_model_name(&root) {
-        Ok(name) => name,
+    match active_onnx_path(&root) {
+        Ok(path) => match with_model(&path, |_| Ok(())) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                let message = model_status_message(&err);
+                inference_ep::remember(requested, requested, message.clone());
+                Err(message)
+            }
+        },
+        Err(err) if err == MODEL_MISSING => {
+            inference_ep::remember(requested, requested, MODEL_MISSING);
+            Ok(())
+        }
         Err(_) => {
             inference_ep::remember(requested, requested, "");
-            return Ok(());
+            Ok(())
         }
-    };
-    if !name.to_ascii_lowercase().ends_with(".onnx") {
-        inference_ep::remember(requested, requested, "");
-        return Ok(());
     }
-    let path = match local_config::app_models_dir() {
-        Ok(dir) => dir.join(&name),
-        Err(_) => {
-            inference_ep::remember(requested, requested, "");
-            return Ok(());
-        }
-    };
-    if !path.is_file() {
-        inference_ep::remember(requested, requested, "");
-        return Ok(());
-    }
-    with_model(&path, |_| Ok(()))
 }
 
 fn detect_view(
@@ -1115,11 +1149,13 @@ fn infer_detections(
         shape,
         &model.names,
         model.end_to_end,
-        view_w,
-        view_h,
-        image_size as i32,
-        origin_x,
-        origin_y,
+        OutputFrame {
+            view_w,
+            view_h,
+            image_size: image_size as i32,
+            origin_x,
+            origin_y,
+        },
     )
 }
 
@@ -1131,8 +1167,16 @@ fn run_model(
     roi: Option<&Roi>,
 ) -> Result<Vec<Detection>, String> {
     let image_size = with_model(path, |model| Ok(model.image_size))?;
-    let (data, view_w, view_h, origin_x, origin_y) =
-        detect_view(rgb, width, height, roi, image_size)?;
+    let prepared = detect_view(rgb, width, height, roi, image_size)?;
+    infer_prepared(path, image_size, prepared)
+}
+
+fn infer_prepared(
+    path: &Path,
+    image_size: usize,
+    prepared: (Vec<f32>, i32, i32, i32, i32),
+) -> Result<Vec<Detection>, String> {
+    let (data, view_w, view_h, origin_x, origin_y) = prepared;
     with_model(path, |model| {
         let retry = if model.provider == Provider::Cpu {
             None
@@ -1179,10 +1223,9 @@ fn detect_on_model(bytes: &[u8], path: &Path, roi: Option<&Roi>) -> Result<Value
 
 #[tauri::command]
 pub async fn detect_image(image: Option<String>) -> Result<Value, String> {
-    let result = tauri::async_runtime::spawn_blocking(move || detect_image_now(image))
+    tauri::async_runtime::spawn_blocking(move || detect_image_now(image))
         .await
-        .map_err(|_| "Detect failed".to_string())?;
-    result
+        .map_err(|_| "Detect failed".to_string())?
 }
 
 fn detect_image_now(image: Option<String>) -> Result<Value, String> {
@@ -1190,22 +1233,10 @@ fn detect_image_now(image: Option<String>) -> Result<Value, String> {
         Ok(root) => root,
         Err(message) => return Ok(failure(&message)),
     };
-    let name = match local_config::configured_model_name(&root) {
-        Ok(name) => name,
-        Err(message) => return Ok(failure(&message)),
+    let path = match active_onnx_path(&root) {
+        Ok(path) => path,
+        Err(message) => return Ok(failure(&model_status_message(&message))),
     };
-    if !name.to_ascii_lowercase().ends_with(".onnx") {
-        return Ok(failure(&format!("{name} is not an ONNX file.")));
-    }
-    let path = match local_config::app_models_dir() {
-        Ok(dir) => dir.join(&name),
-        Err(message) => return Ok(failure(&message)),
-    };
-    if !path.is_file() {
-        return Ok(failure(&format!(
-            "{name} was not found in the models folder."
-        )));
-    }
     let Some(text) = image.filter(|value| !value.trim().is_empty()) else {
         return Ok(failure("No image and no snapshot"));
     };
@@ -1216,7 +1247,7 @@ fn detect_image_now(image: Option<String>) -> Result<Value, String> {
     let roi = configured_roi(&root);
     match detect_on_model(&bytes, &path, roi.as_ref()) {
         Ok(payload) => Ok(payload),
-        Err(message) => Ok(failure(&message)),
+        Err(message) => Ok(failure(&model_status_message(&message))),
     }
 }
 
@@ -1238,23 +1269,16 @@ pub struct DetectBenchmark {
 /// that finished the runs, including a CPU fallback.
 #[tauri::command]
 pub async fn benchmark_detect() -> Result<DetectBenchmark, String> {
-    let result = tauri::async_runtime::spawn_blocking(run_benchmark)
+    tauri::async_runtime::spawn_blocking(run_benchmark)
         .await
-        .map_err(|_| "Benchmark failed.".to_string())?;
-    result
+        .map_err(|_| "Benchmark failed.".to_string())?
 }
 
 fn run_benchmark() -> Result<DetectBenchmark, String> {
     let root = local_config::project_root()?;
-    let name = local_config::configured_model_name(&root)?;
-    if !name.to_ascii_lowercase().ends_with(".onnx") {
-        return Err(format!("{name} is not an ONNX file."));
-    }
-    let model_path = local_config::app_models_dir()?.join(&name);
-    if !model_path.is_file() {
-        return Err(format!("{name} was not found in the models folder."));
-    }
+    let model_path = active_onnx_path(&root)?;
     benchmark_files(&model_path, &benchmark_image(&root)?)
+        .map_err(|err| model_status_message(&err))
 }
 
 fn benchmark_image(root: &Path) -> Result<PathBuf, String> {
@@ -1585,13 +1609,13 @@ mod tests {
         let mut mismatches = Vec::new();
         for (index, (left, right)) in got.iter().zip(expected.iter()).enumerate() {
             let conf_delta = (left.confidence - right.confidence).abs();
-            if left.ic != right.ic || left.bbox != right.bbox || conf_delta > 0.001 {
-                if mismatches.len() < 8 {
-                    mismatches.push(format!(
-                        "{index}: rust {} {:?} {} python {} {:?} {}",
-                        left.ic, left.bbox, left.confidence, right.ic, right.bbox, right.confidence
-                    ));
-                }
+            if (left.ic != right.ic || left.bbox != right.bbox || conf_delta > 0.001)
+                && mismatches.len() < 8
+            {
+                mismatches.push(format!(
+                    "{index}: rust {} {:?} {} python {} {:?} {}",
+                    left.ic, left.bbox, left.confidence, right.ic, right.bbox, right.confidence
+                ));
             }
         }
         assert!(
@@ -1625,6 +1649,74 @@ mod tests {
         assert_eq!(average, 20.0);
         assert_eq!(min_ms, 10.0);
         assert_eq!(max_ms, 30.0);
+    }
+
+    #[test]
+    fn model_path_is_resolved_before_a_missing_file_can_run() {
+        let dir = std::env::temp_dir().join(format!(
+            "ls-vision-model-path-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = resolved_onnx_model(&dir, "best.onnx").unwrap_err();
+        assert_eq!(missing, MODEL_MISSING);
+        std::fs::write(dir.join("best.onnx"), [0x08, 0x08, 0x12]).unwrap();
+        let path = resolved_onnx_model(&dir, "best.onnx").unwrap();
+        assert_eq!(path, dir.join("best.onnx"));
+        let pt = resolved_onnx_model(&dir, "best.pt").unwrap_err();
+        assert!(pt.contains("not an ONNX"), "{pt}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn model_status_message_stays_short() {
+        assert_eq!(model_status_message(MODEL_MISSING), MODEL_MISSING);
+        assert_eq!(
+            model_status_message("best.onnx failed to load: bad protobuf"),
+            MODEL_FAILED
+        );
+        assert_eq!(
+            model_status_message("YOLO model is not loaded"),
+            MODEL_FAILED
+        );
+        assert_eq!(
+            model_status_message("Detect failed: unexpected output shape"),
+            "Detect failed: unexpected output shape"
+        );
+    }
+
+    #[test]
+    fn roi_crop_is_applied_before_the_inference_tensor() {
+        let width = 4usize;
+        let height = 2usize;
+        let mut rgb = vec![0u8; width * height * 3];
+        for y in 0..height {
+            for x in 2..width {
+                let index = (y * width + x) * 3;
+                rgb[index] = 255;
+                rgb[index + 1] = 255;
+                rgb[index + 2] = 255;
+            }
+        }
+        let roi = Roi {
+            x: 0.0,
+            y: 0.0,
+            w: 0.5,
+            h: 1.0,
+        };
+        let (data, view_w, view_h, origin_x, origin_y) =
+            detect_view(&rgb, width as u32, height as u32, Some(&roi), 8).unwrap();
+        assert_eq!((view_w, view_h, origin_x, origin_y), (2, 2, 0, 0));
+        assert_eq!(data.len(), 8 * 8 * 3);
+        assert!(
+            data.iter().all(|value| *value < 0.5),
+            "the tensor still contains the uncropped half"
+        );
     }
 
     #[test]

@@ -239,10 +239,10 @@ fn map_io(err: std::io::Error, key: &str) -> String {
 fn map_tls(err: &native_tls::Error, key: &str) -> String {
     let mut source = err.source();
     while let Some(item) = source {
-        if let Some(io_err) = item.downcast_ref::<std::io::Error>() {
-            if is_timeout(io_err) {
-                return TIMEOUT_MESSAGE.to_string();
-            }
+        if let Some(io_err) = item.downcast_ref::<std::io::Error>()
+            && is_timeout(io_err)
+        {
+            return TIMEOUT_MESSAGE.to_string();
         }
         source = item.source();
     }

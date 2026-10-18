@@ -455,6 +455,18 @@ async function runDetect(generation: number, body: { image?: string }) {
 		if (generation !== detectGeneration || !pageAlive) return;
 		detections = asDetections(payload.detections);
 		detectMessage = typeof payload.message === "string" ? payload.message : "";
+		if (
+			detectMessage === "Model is missing." ||
+			detectMessage === "Model failed to load."
+		) {
+			modelNotice = detectMessage;
+		} else if (
+			!detectMessage &&
+			(modelNotice === "Model is missing." ||
+				modelNotice === "Model failed to load.")
+		) {
+			modelNotice = "";
+		}
 		const encoded = payload.image_base64;
 		if (snapshot) {
 			snapshot = {
@@ -1116,6 +1128,14 @@ async function loadModel() {
 		const stored = typeof config.model === "string" ? config.model : "";
 		const match = matchModelName(stored, files);
 		modelName = match || preferredModel(files);
+		const present = files.some(
+			(item) => item.toLowerCase() === modelName.toLowerCase(),
+		);
+		if (!present) {
+			modelNotice = "Model is missing.";
+		} else if (modelNotice === "Model is missing.") {
+			modelNotice = "";
+		}
 	} catch {
 		// A missed read keeps the last model name.
 	}
@@ -2424,17 +2444,17 @@ async function decodeAndInspect() {
 									No .pt or .onnx files in the app data models folder.
 								</span>
 							{/each}
-							{#if modelNotice}
-								<span class="block px-3 py-2 text-sm font-medium normal-case tracking-normal text-red-300">
-									{modelNotice}
-								</span>
-							{/if}
 						</span>
 					{/if}
 				</span>
 			{:else}
 				<span class="ml-2 font-mono text-xs font-medium normal-case tracking-normal text-neutral-300">
 					{modelName}
+				</span>
+			{/if}
+			{#if modelNotice}
+				<span class="ml-3 font-medium normal-case tracking-normal text-red-300">
+					{modelNotice}
 				</span>
 			{/if}
 			{#if admin}
