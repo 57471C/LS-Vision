@@ -1199,6 +1199,174 @@ pub fn detect_image(image: Option<String>) -> Result<Value, String> {
     }
 }
 
+const BENCHMARK_RUNS: usize = 5;
+
+#[derive(Serialize)]
+pub struct DetectBenchmark {
+    pub provider: String,
+    pub average_ms: f64,
+    pub min_ms: f64,
+    pub max_ms: f64,
+    pub width: u32,
+    pub height: u32,
+    pub image: String,
+}
+
+/// Five timed runs of the active ONNX session on a fixed test image.
+/// Letterbox and drawing are outside the timer. The active provider is the one
+/// that finished the runs, including a CPU fallback.
+#[tauri::command]
+pub async fn benchmark_detect() -> Result<DetectBenchmark, String> {
+    let result = tauri::async_runtime::spawn_blocking(run_benchmark)
+        .await
+        .map_err(|_| "Benchmark failed.".to_string())?;
+    result
+}
+
+fn run_benchmark() -> Result<DetectBenchmark, String> {
+    let root = local_config::project_root()?;
+    let name = local_config::configured_model_name(&root)?;
+    if !name.to_ascii_lowercase().ends_with(".onnx") {
+        return Err(format!("{name} is not an ONNX file."));
+    }
+    let model_path = local_config::vision_models_dir(&root).join(&name);
+    if !model_path.is_file() {
+        return Err(format!("{name} was not found in vision/models."));
+    }
+    benchmark_files(&model_path, &benchmark_image(&root)?)
+}
+
+fn benchmark_image(root: &Path) -> Result<PathBuf, String> {
+    pick_benchmark_image(&root.join("vision").join("test-images"))
+}
+
+fn benchmark_image_ext(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .as_deref(),
+        Some("jpg" | "jpeg" | "png")
+    )
+}
+
+fn pick_benchmark_image(dir: &Path) -> Result<PathBuf, String> {
+    let preferred = dir.join("Example3.jpg");
+    if preferred.is_file() {
+        return Ok(preferred);
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Err("No test image in vision/test-images.".to_string());
+    };
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() && benchmark_image_ext(&path) {
+            found.push(path);
+        }
+    }
+    found.sort_by(|left, right| {
+        let left_name = left
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        let right_name = right
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        left_name
+            .to_ascii_lowercase()
+            .cmp(&right_name.to_ascii_lowercase())
+    });
+    found
+        .into_iter()
+        .next()
+        .ok_or_else(|| "No test image in vision/test-images.".to_string())
+}
+
+fn summarize_times(times: &[f64]) -> Result<(f64, f64, f64), String> {
+    let Some(first) = times.first().copied() else {
+        return Err("Benchmark failed.".to_string());
+    };
+    if times.iter().any(|time| !time.is_finite() || *time < 0.0) {
+        return Err("Benchmark failed.".to_string());
+    }
+    let mut min_ms = first;
+    let mut max_ms = first;
+    let mut sum = 0.0;
+    for time in times {
+        min_ms = min_ms.min(*time);
+        max_ms = max_ms.max(*time);
+        sum += time;
+    }
+    Ok((sum / times.len() as f64, min_ms, max_ms))
+}
+
+/// Session run plus the copy back to CPU. Tensor build is outside the timer.
+fn timed_session(model: &mut LoadedModel, data: &[f32], image_size: usize) -> Result<f64, String> {
+    let tensor =
+        ort::value::Tensor::from_array(([1usize, 3, image_size, image_size], data.to_vec()))
+            .map_err(|err| format!("Detect failed: {}", short_error(&err.to_string())))?;
+    let started = std::time::Instant::now();
+    let outputs = model
+        .session
+        .run(ort::inputs![tensor])
+        .map_err(|err| format!("Detect failed: {}", short_error(&err.to_string())))?;
+    let _values = outputs[0]
+        .try_extract_tensor::<f32>()
+        .map_err(|err| format!("Detect failed: {}", short_error(&err.to_string())))?;
+    Ok(started.elapsed().as_secs_f64() * 1000.0)
+}
+
+fn benchmark_files(model_path: &Path, image_path: &Path) -> Result<DetectBenchmark, String> {
+    let bytes = std::fs::read(image_path)
+        .map_err(|_| format!("Could not read {}.", file_name(image_path)))?;
+    let (rgb, width, height) = decode_rgb(&bytes)?;
+    let image_size = with_model(model_path, |model| Ok(model.image_size))?;
+    let (data, _view_w, _view_h, _origin_x, _origin_y) =
+        detect_view(&rgb, width, height, None, image_size)?;
+    let (provider, times) = with_model(model_path, |model| {
+        let mut times = Vec::with_capacity(BENCHMARK_RUNS);
+        while times.len() < BENCHMARK_RUNS {
+            match timed_session(model, &data, image_size) {
+                Ok(ms) => times.push(ms),
+                Err(message) if model.provider != Provider::Cpu => {
+                    let failed = model.provider;
+                    let env = runtime()?;
+                    model.session = open_session(&env, model_path, Provider::Cpu)
+                        .map_err(|cpu_err| format!("{message} {cpu_err}"))?;
+                    model.provider = Provider::Cpu;
+                    let detail = message
+                        .strip_prefix("Detect failed: ")
+                        .unwrap_or(message.as_str());
+                    inference_ep::remember(
+                        model.requested,
+                        Provider::Cpu,
+                        format!(
+                            "{} failed while detecting ({detail}). Using CPU.",
+                            failed.label()
+                        ),
+                    );
+                    times.clear();
+                    times.push(timed_session(model, &data, image_size)?);
+                }
+                Err(message) => return Err(message),
+            }
+        }
+        Ok((model.provider, times))
+    })?;
+    let (average_ms, min_ms, max_ms) = summarize_times(&times)?;
+    Ok(DetectBenchmark {
+        provider: provider.id().to_string(),
+        average_ms,
+        min_ms,
+        max_ms,
+        width,
+        height,
+        image: file_name(image_path),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1402,6 +1570,62 @@ mod tests {
             mismatches.is_empty(),
             "{} boxes differ, first: {mismatches:?}",
             mismatches.len().min(8)
+        );
+    }
+
+    #[test]
+    fn benchmark_image_prefers_example3_then_sorted_name() {
+        let dir = std::env::temp_dir().join(format!("ls-vision-bench-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = pick_benchmark_image(&dir).unwrap_err();
+        assert_eq!(missing, "No test image in vision/test-images.");
+        std::fs::write(dir.join("notes.txt"), b"x").unwrap();
+        std::fs::write(dir.join("b.png"), b"x").unwrap();
+        std::fs::write(dir.join("a.jpg"), b"x").unwrap();
+        let picked = pick_benchmark_image(&dir).unwrap();
+        assert_eq!(picked.file_name().unwrap(), "a.jpg");
+        std::fs::write(dir.join("Example3.jpg"), b"x").unwrap();
+        let picked = pick_benchmark_image(&dir).unwrap();
+        assert_eq!(picked.file_name().unwrap(), "Example3.jpg");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn benchmark_summary_is_average_min_and_max() {
+        let (average, min_ms, max_ms) = summarize_times(&[10.0, 30.0, 20.0]).unwrap();
+        assert_eq!(average, 20.0);
+        assert_eq!(min_ms, 10.0);
+        assert_eq!(max_ms, 30.0);
+    }
+
+    #[test]
+    fn benchmark_example3_reports_resolution_and_times() {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let root = manifest.parent().expect("project root");
+        let model = root.join("vision").join("models").join("best.onnx");
+        let image = root.join("vision").join("test-images").join("Example3.jpg");
+        if !model.is_file() || !image.is_file() {
+            eprintln!("skip: best.onnx or Example3.jpg is not in the checkout");
+            return;
+        }
+        let report = benchmark_files(&model, &image).unwrap();
+        assert_eq!(report.image, "Example3.jpg");
+        assert_eq!((report.width, report.height), (2016, 1512));
+        assert!(report.min_ms <= report.average_ms && report.average_ms <= report.max_ms);
+        assert!(report.average_ms > 0.0);
+        assert!(matches!(
+            report.provider.as_str(),
+            "cpu" | "directml" | "cuda"
+        ));
+        eprintln!(
+            "benchmark provider={} average_ms={:.1} min_ms={:.1} max_ms={:.1} {}x{}",
+            report.provider,
+            report.average_ms,
+            report.min_ms,
+            report.max_ms,
+            report.width,
+            report.height
         );
     }
 }

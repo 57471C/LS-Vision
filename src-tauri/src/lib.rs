@@ -33,6 +33,7 @@ pub fn run() {
             camera::capture_snapshot,
             camera::capture_preview,
             detect::detect_image,
+            detect::benchmark_detect,
             inference_ep::inference_status,
             inference_ep::set_inference_ep
         ])

@@ -71,6 +71,8 @@ let inferenceReady = false;
 let savingInference = false;
 let inferenceGeneration = 0;
 let inferenceChain: Promise<void> = Promise.resolve();
+let benchmarking = false;
+let benchmarkText = "";
 type CameraMode = {
 	id: string;
 	width: number;
@@ -487,6 +489,67 @@ async function persistInference(choice: string, generation: number) {
 		inferenceNotice = message;
 	} finally {
 		if (generation === inferenceGeneration) savingInference = false;
+	}
+}
+
+function formatMs(value: number): string {
+	if (!Number.isFinite(value)) return "0.0";
+	return value.toFixed(1);
+}
+
+function formatBenchmark(data: {
+	provider?: unknown;
+	average_ms?: unknown;
+	min_ms?: unknown;
+	max_ms?: unknown;
+	width?: unknown;
+	height?: unknown;
+	image?: unknown;
+}): string {
+	const provider = typeof data.provider === "string" ? data.provider : "cpu";
+	const average = typeof data.average_ms === "number" ? data.average_ms : 0;
+	const min = typeof data.min_ms === "number" ? data.min_ms : 0;
+	const max = typeof data.max_ms === "number" ? data.max_ms : 0;
+	const width = typeof data.width === "number" ? data.width : 0;
+	const height = typeof data.height === "number" ? data.height : 0;
+	const image = typeof data.image === "string" ? data.image : "";
+	const resolution = image ? `${width}×${height} ${image}` : `${width}×${height}`;
+	return [
+		`Active EP: ${inferenceLabel(provider)}`,
+		`Average: ${formatMs(average)} ms`,
+		`Min / max: ${formatMs(min)} / ${formatMs(max)} ms`,
+		`Image: ${resolution}`,
+	].join("\n");
+}
+
+async function runBenchmark() {
+	const generation = inferenceGeneration;
+	benchmarking = true;
+	benchmarkText = "Running 5 detects...";
+	try {
+		const data = await invokeRust<{
+			provider?: unknown;
+			average_ms?: unknown;
+			min_ms?: unknown;
+			max_ms?: unknown;
+			width?: unknown;
+			height?: unknown;
+			image?: unknown;
+		}>("benchmark_detect");
+		if (generation !== inferenceGeneration) {
+			benchmarkText = "";
+			return;
+		}
+		benchmarkText = formatBenchmark(data);
+		await loadInference();
+	} catch (err: unknown) {
+		if (generation !== inferenceGeneration) {
+			benchmarkText = "";
+			return;
+		}
+		benchmarkText = invokeError(err, "Benchmark failed.");
+	} finally {
+		benchmarking = false;
 	}
 }
 
@@ -2083,6 +2146,20 @@ onDestroy(() => {
 								<p class="text-sm text-neutral-400">
 									CPU is always listed. DirectML and CUDA are listed only when this PC can run them.
 								</p>
+								<button
+									type="button"
+									class="inline-flex min-h-11 w-fit items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100 disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
+									on:click={runBenchmark}
+									disabled={benchmarking || savingInference || !inferenceReady}
+								>
+									{benchmarking ? "Benchmarking..." : "Benchmark detect"}
+								</button>
+								{#if benchmarkText}
+									<pre
+										class="select-all whitespace-pre-wrap font-mono text-sm leading-6 text-neutral-100"
+										title="Click to select"
+									>{benchmarkText}</pre>
+								{/if}
 							</fieldset>
 							{#if inferenceNotice}
 								<p class="text-sm text-neutral-200">{inferenceNotice}</p>
