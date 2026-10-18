@@ -128,6 +128,9 @@ $: cameraFeedOn =
 	(camerasReady && cameraIndexes.includes(Number(cameraIndex))) ||
 	(cameraLookupFailed && !camerasReady);
 let feedOn = true;
+const FEED_DEBOUNCE_MS = 1520;
+let feedBusy = false;
+let feedBusyTimer: ReturnType<typeof setTimeout> | null = null;
 let snapshot: SnapshotView | null = null;
 let detections: Detection[] = [];
 let detectMessage = "";
@@ -220,13 +223,25 @@ function showLiveFeed() {
 	startWatch();
 }
 
+function releaseFeedButton() {
+	feedBusyTimer = null;
+	feedBusy = false;
+}
+
 function toggleFeed() {
+	if (feedBusy) return;
+	feedBusy = true;
 	feedOn = !feedOn;
 	if (feedOn) showLiveFeed();
 	else {
 		stopLive();
 		stopWatch();
 	}
+	if (feedBusyTimer !== null) clearTimeout(feedBusyTimer);
+	feedBusyTimer = setTimeout(() => {
+		if (!pageAlive) return;
+		releaseFeedButton();
+	}, FEED_DEBOUNCE_MS);
 }
 
 function resumeLiveFeed() {
@@ -1602,6 +1617,10 @@ onMount(() => {
 
 onDestroy(() => {
 	pageAlive = false;
+	if (feedBusyTimer !== null) {
+		clearTimeout(feedBusyTimer);
+		feedBusyTimer = null;
+	}
 	window.removeEventListener("focus", readAdminFlag);
 	frameObserver?.disconnect();
 	frameObserver = null;
@@ -1972,10 +1991,12 @@ async function decodeAndInspect() {
 		</button>
 		<button
 			type="button"
-			class="inline-flex min-h-11 items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100"
+			class="inline-flex min-h-11 items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100 disabled:cursor-not-allowed disabled:opacity-50"
 			on:click={toggleFeed}
+			disabled={feedBusy}
+			aria-busy={feedBusy}
 		>
-			{feedOn ? "Stop feed" : "Start feed"}
+			{feedBusy ? "Please wait" : feedOn ? "Stop feed" : "Start feed"}
 		</button>
 		{#if admin}
 			<button
