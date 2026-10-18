@@ -10,7 +10,7 @@ Inference is ONNX Runtime in the Rust backend. The app does not start a Python p
 
 1. Launch the desktop app, or run `npm run tauri dev` during development.
 2. Open Settings and choose the camera, Display FPS, and Inference EP.
-3. Put an `.onnx` model in `vision/models/` and select it. A `.pt` file does not detect.
+3. In Settings > Training, use Update model to copy an `.onnx` file into the app data models folder. A `.pt` file does not detect.
 
 ## First-time checks
 

@@ -31,7 +31,7 @@ npm install
 npm run tauri dev
 ```
 
-Place `*.pt` and `*.onnx` files from the matching Forgejo release in `vision/models/`. They are not stored in git. Select an `.onnx` model in Settings. See [vision/README.md](vision/README.md) for the offline training and export steps.
+In Settings > Training, use Update model to copy an `.onnx` file into the app data models folder. Dev and the installed app share that folder. Weight files are not stored in git and are not bundled in the installer. See [vision/README.md](vision/README.md) for the offline training and export steps.
 
 ## Project status
 

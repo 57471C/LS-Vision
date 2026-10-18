@@ -2421,7 +2421,7 @@ async function decodeAndInspect() {
 								</button>
 							{:else}
 								<span class="block px-3 py-2 text-sm font-medium normal-case tracking-normal text-neutral-400">
-									No .pt or .onnx files in vision/models.
+									No .pt or .onnx files in the app data models folder.
 								</span>
 							{/each}
 							{#if modelNotice}

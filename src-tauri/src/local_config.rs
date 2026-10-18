@@ -1,17 +1,26 @@
-//! Read and write `vision/config.local.json`, and list the weight files in `vision/models`.
+//! Read and write `vision/config.local.json`, and list weight files in the app data models folder.
 //! These commands do not load a model or open a camera. Detection loads the saved `.onnx` file in Rust.
+//! The active filename stays in `vision/config.local.json`. The weight file lives under the Tauri app data directory.
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::time::SystemTime;
 
 use serde::Serialize;
 use serde_json::Value;
+use tauri::AppHandle;
+use tauri_plugin_dialog::DialogExt;
 
 const CONFIG_FILE: &str = "config.local.json";
 const LEGACY_FILE: &str = "bom-source.json";
 const DEFAULT_MODEL_NAME: &str = "best.pt";
+const DEFAULT_ONNX_NAME: &str = "best.onnx";
 const DEFAULT_SQL_DRIVER: &str = "ODBC Driver 18 for SQL Server";
 const MAX_MODEL_NAME: usize = 180;
+const APP_IDENTIFIER: &str = "studio.lean.ls-vision";
+
+static APP_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 #[derive(Debug, Serialize)]
 pub struct ActiveModel {
@@ -89,6 +98,46 @@ fn normalize_path(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
+/// Record `app.path().app_data_dir()` so dev and the installed app share one folder.
+pub(crate) fn set_app_data_dir(dir: PathBuf) {
+    let _ = APP_DATA_DIR.set(dir);
+}
+
+pub(crate) fn app_data_dir() -> Result<PathBuf, String> {
+    if let Some(dir) = APP_DATA_DIR.get() {
+        return Ok(dir.clone());
+    }
+    fallback_app_data_dir()
+}
+
+fn fallback_app_data_dir() -> Result<PathBuf, String> {
+    if let Some(roaming) = env_path("APPDATA") {
+        return Ok(roaming.join(APP_IDENTIFIER));
+    }
+    if let Some(xdg) = env_path("XDG_DATA_HOME") {
+        return Ok(xdg.join(APP_IDENTIFIER));
+    }
+    if let Some(home) = env_path("HOME").or_else(|| env_path("USERPROFILE")) {
+        return Ok(home.join(".local").join("share").join(APP_IDENTIFIER));
+    }
+    Err("Could not find the app data folder.".to_string())
+}
+
+/// `models` under the Tauri app data directory. The folder is created when it is missing.
+pub(crate) fn app_models_dir() -> Result<PathBuf, String> {
+    let dir = app_data_dir()?.join("models");
+    if is_program_files(&dir) {
+        return Err("Models cannot be stored under Program Files.".to_string());
+    }
+    fs::create_dir_all(&dir).map_err(|err| {
+        format!(
+            "Could not create the models folder {}: {err}",
+            dir.display()
+        )
+    })?;
+    Ok(dir)
+}
+
 fn vision_dir(root: &Path) -> PathBuf {
     root.join("vision")
 }
@@ -101,6 +150,7 @@ fn legacy_file(root: &Path) -> PathBuf {
     vision_dir(root).join(LEGACY_FILE)
 }
 
+#[cfg(test)]
 fn models_dir(root: &Path) -> PathBuf {
     vision_dir(root).join("models")
 }
@@ -245,12 +295,12 @@ fn list_model_files(dir: &Path) -> Result<Vec<String>, String> {
     }
     let root = dir
         .canonicalize()
-        .map_err(|err| format!("Could not read vision/models: {err}"))?;
+        .map_err(|err| format!("Could not read the models folder: {err}"))?;
     let entries =
-        fs::read_dir(&root).map_err(|err| format!("Could not read vision/models: {err}"))?;
+        fs::read_dir(&root).map_err(|err| format!("Could not read the models folder: {err}"))?;
     let mut names = Vec::new();
     for entry in entries {
-        let entry = entry.map_err(|err| format!("Could not read vision/models: {err}"))?;
+        let entry = entry.map_err(|err| format!("Could not read the models folder: {err}"))?;
         let path = entry.path();
         if !path.is_file() {
             continue;
@@ -277,17 +327,14 @@ fn list_model_files(dir: &Path) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
-fn list_models(root: &Path) -> Result<Vec<String>, String> {
-    list_model_files(&models_dir(root))
-}
-
 fn select_model_name(raw: &str, files: &[String]) -> Result<String, String> {
     if raw.trim().is_empty() {
         return Ok(String::new());
     }
     let cleaned = clean_model_name(raw)
-        .ok_or_else(|| "Choose a .pt or .onnx file in vision/models.".to_string())?;
-    match_model(&cleaned, files).ok_or_else(|| format!("{cleaned} was not found in vision/models."))
+        .ok_or_else(|| "Choose a .pt or .onnx file in the models folder.".to_string())?;
+    match_model(&cleaned, files)
+        .ok_or_else(|| format!("{cleaned} was not found in the models folder."))
 }
 
 fn assign_model(document: &mut Value, model: &str) -> Result<(), String> {
@@ -331,16 +378,12 @@ pub(crate) fn configured_model_name(root: &Path) -> Result<String, String> {
         .get("model")
         .and_then(|value| value.as_str())
         .unwrap_or("");
-    let files = list_models(root)?;
+    let files = list_model_files(&app_models_dir()?)?;
     Ok(active_name(stored, &files))
 }
 
-pub(crate) fn vision_models_dir(root: &Path) -> PathBuf {
-    models_dir(root)
-}
-
-fn store_active_model(root: &Path, filename: &str) -> Result<ActiveModel, String> {
-    let files = list_models(root)?;
+fn store_active_model(root: &Path, models: &Path, filename: &str) -> Result<ActiveModel, String> {
+    let files = list_model_files(models)?;
     let model = select_model_name(filename, &files)?;
     let mut document = load_document(root)?;
     assign_model(&mut document, &model)?;
@@ -353,6 +396,110 @@ fn store_active_model(root: &Path, filename: &str) -> Result<ActiveModel, String
         files,
         message,
     })
+}
+
+fn model_state(root: &Path, models: &Path, message: String) -> Result<ActiveModel, String> {
+    let files = list_model_files(models)?;
+    let document = load_document(root)?;
+    let stored = document
+        .get("model")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    let active = active_name(&stored, &files);
+    let model = if stored.trim().is_empty() {
+        String::new()
+    } else {
+        match_model(&stored, &files).unwrap_or(stored)
+    };
+    Ok(ActiveModel {
+        model,
+        active,
+        files,
+        message,
+    })
+}
+
+fn onnx_destination_name(preferred: &str) -> String {
+    match clean_model_name(preferred) {
+        Some(name) if name.to_ascii_lowercase().ends_with(".onnx") => name,
+        _ => DEFAULT_ONNX_NAME.to_string(),
+    }
+}
+
+fn is_onnx_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("onnx"))
+}
+
+fn copy_model_file(dir: &Path, source: &Path, dest_name: &str) -> Result<(), String> {
+    if !source.is_file() || !is_onnx_file(source) {
+        return Err("Choose an .onnx file.".to_string());
+    }
+    let dest_name = clean_model_name(dest_name)
+        .filter(|name| name.to_ascii_lowercase().ends_with(".onnx"))
+        .ok_or_else(|| "Choose an .onnx file.".to_string())?;
+    fs::create_dir_all(dir).map_err(|err| format!("Could not create the models folder: {err}"))?;
+    let root = dir
+        .canonicalize()
+        .map_err(|err| format!("Could not read the models folder: {err}"))?;
+    let dest = root.join(&dest_name);
+    if dest.parent() != Some(root.as_path()) {
+        return Err("Choose an .onnx file.".to_string());
+    }
+    if let Ok(resolved) = dest.canonicalize() {
+        if !resolved.starts_with(&root) {
+            return Err("Could not replace the model.".to_string());
+        }
+    }
+    let partial = root.join(format!(".{dest_name}.partial"));
+    if let Err(err) = fs::copy(source, &partial) {
+        let _ = fs::remove_file(&partial);
+        return Err(format!("Could not copy the model: {err}"));
+    }
+    if let Err(err) = replace_model_file(&partial, &dest) {
+        let _ = fs::remove_file(&partial);
+        return Err(err);
+    }
+    if let Ok(file) = fs::File::options().write(true).open(&dest) {
+        let _ = file.set_modified(SystemTime::now());
+    }
+    Ok(())
+}
+
+fn replace_model_file(partial: &Path, dest: &Path) -> Result<(), String> {
+    let backup_name = dest
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(DEFAULT_ONNX_NAME);
+    let backup = dest.with_file_name(format!(".{backup_name}.bak"));
+    let _ = fs::remove_file(&backup);
+    let had_dest = dest.is_file();
+    if had_dest && fs::rename(dest, &backup).is_err() {
+        fs::remove_file(dest).map_err(|err| format!("Could not replace the model: {err}"))?;
+    }
+    if let Err(err) = fs::rename(partial, dest) {
+        if had_dest {
+            let _ = fs::rename(&backup, dest);
+        }
+        return Err(format!("Could not replace the model: {err}"));
+    }
+    let _ = fs::remove_file(&backup);
+    Ok(())
+}
+
+fn install_model_at(
+    root: &Path,
+    models: &Path,
+    source: &Path,
+    preferred: &str,
+) -> Result<ActiveModel, String> {
+    let dest_name = onnx_destination_name(preferred);
+    copy_model_file(models, source, &dest_name)?;
+    let mut saved = store_active_model(root, models, &dest_name)?;
+    saved.message = format!("Updated {dest_name}.");
+    Ok(saved)
 }
 
 #[tauri::command]
@@ -369,12 +516,36 @@ pub fn save_local_config(config: Value) -> Result<Value, String> {
 
 #[tauri::command]
 pub fn list_vision_models() -> Result<Vec<String>, String> {
-    list_models(&project_root()?)
+    list_model_files(&app_models_dir()?)
 }
 
 #[tauri::command]
 pub fn set_active_model(filename: String) -> Result<ActiveModel, String> {
-    store_active_model(&project_root()?, &filename)
+    store_active_model(&project_root()?, &app_models_dir()?, &filename)
+}
+
+/// Copy a chosen `.onnx` file into the app data models folder and make it active.
+/// The next detection loads that file. Cancel returns a short notice.
+#[tauri::command]
+pub fn update_model(app: AppHandle, filename: String) -> Result<ActiveModel, String> {
+    let root = project_root()?;
+    let models = app_models_dir()?;
+    let picked = app
+        .dialog()
+        .file()
+        .add_filter("ONNX model", &["onnx"])
+        .set_title("Update model")
+        .blocking_pick_file();
+    let Some(picked) = picked else {
+        return model_state(&root, &models, "No file selected.".to_string());
+    };
+    let source = picked
+        .into_path()
+        .map_err(|_| "Could not read the selected file.".to_string())?;
+    crate::detect::forget_session();
+    let saved = install_model_at(&root, &models, &source, &filename);
+    crate::detect::forget_session();
+    saved
 }
 
 #[cfg(test)]
@@ -470,7 +641,7 @@ mod tests {
         fs::write(vision_dir(project.root()).join("other.pt"), b"x").unwrap();
 
         assert_eq!(
-            list_models(project.root()).unwrap(),
+            list_model_files(&models_dir(project.root())).unwrap(),
             vec!["A.pt".to_string(), "b.onnx".to_string()]
         );
     }
@@ -479,7 +650,11 @@ mod tests {
     fn missing_models_directory_is_an_empty_list() {
         let project = TempProject::new("nomodels");
         fs::remove_dir_all(models_dir(project.root())).unwrap();
-        assert!(list_models(project.root()).unwrap().is_empty());
+        assert!(
+            list_model_files(&models_dir(project.root()))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -523,7 +698,9 @@ mod tests {
                 .unwrap_err()
                 .contains("not valid JSON")
         );
-        assert!(store_active_model(project.root(), "best.pt").is_err());
+        assert!(
+            store_active_model(project.root(), &models_dir(project.root()), "best.pt").is_err()
+        );
         assert_eq!(fs::read(&path).unwrap(), before);
     }
 
@@ -557,7 +734,8 @@ mod tests {
         fs::write(models_dir(project.root()).join("Best.pt"), b"x").unwrap();
         fs::write(models_dir(project.root()).join("other.onnx"), b"x").unwrap();
 
-        let saved = store_active_model(project.root(), "best.pt").unwrap();
+        let saved =
+            store_active_model(project.root(), &models_dir(project.root()), "best.pt").unwrap();
         assert_eq!(saved.model, "Best.pt");
         assert_eq!(saved.active, "Best.pt");
         assert_eq!(
@@ -581,9 +759,15 @@ mod tests {
         fs::write(config_file(project.root()), "{\"source\":\"json\"}\n").unwrap();
         let before = fs::read_to_string(config_file(project.root())).unwrap();
 
-        let missing = store_active_model(project.root(), "nope.onnx").unwrap_err();
+        let missing = store_active_model(project.root(), &models_dir(project.root()), "nope.onnx")
+            .unwrap_err();
         assert!(missing.contains("was not found"));
-        let path = store_active_model(project.root(), r"vision/models/best.pt").unwrap_err();
+        let path = store_active_model(
+            project.root(),
+            &models_dir(project.root()),
+            r"vision/models/best.pt",
+        )
+        .unwrap_err();
         assert!(path.contains("Choose a .pt or .onnx"));
         assert_eq!(
             fs::read_to_string(config_file(project.root())).unwrap(),
@@ -595,7 +779,7 @@ mod tests {
     fn clearing_the_model_uses_best_pt_when_that_file_exists() {
         let project = TempProject::new("clear");
         fs::write(models_dir(project.root()).join("best.pt"), b"x").unwrap();
-        let saved = store_active_model(project.root(), "  ").unwrap();
+        let saved = store_active_model(project.root(), &models_dir(project.root()), "  ").unwrap();
         assert_eq!(saved.model, "");
         assert_eq!(saved.active, "best.pt");
         assert_eq!(saved.message, "Saved. Active model is best.pt.");
@@ -608,7 +792,7 @@ mod tests {
         let project = TempProject::new("clear-onnx");
         fs::write(models_dir(project.root()).join("best.pt"), b"x").unwrap();
         fs::write(models_dir(project.root()).join("best.onnx"), b"x").unwrap();
-        let saved = store_active_model(project.root(), "").unwrap();
+        let saved = store_active_model(project.root(), &models_dir(project.root()), "").unwrap();
         assert_eq!(saved.model, "");
         assert_eq!(saved.active, "best.onnx");
         assert_eq!(saved.message, "Saved. Active model is best.onnx.");
@@ -623,7 +807,8 @@ mod tests {
         )
         .unwrap();
         fs::write(models_dir(project.root()).join("kit.onnx"), b"x").unwrap();
-        let saved = store_active_model(project.root(), "kit.onnx").unwrap();
+        let saved =
+            store_active_model(project.root(), &models_dir(project.root()), "kit.onnx").unwrap();
         assert_eq!(saved.model, "kit.onnx");
         let document = load_document(project.root()).unwrap();
         assert_eq!(document["source"], "api");
@@ -631,5 +816,111 @@ mod tests {
         assert_eq!(document["model"], "kit.onnx");
         assert!(config_file(project.root()).is_file());
         assert!(legacy_file(project.root()).is_file());
+    }
+
+    #[test]
+    fn app_data_models_folder_is_roaming_appdata() {
+        let dir = fallback_app_data_dir().unwrap().join("models");
+        let text = normalize_path(&dir);
+        assert!(
+            text.contains("\\appdata\\roaming\\studio.lean.ls-vision\\models")
+                || text.contains("\\.local\\share\\studio.lean.ls-vision\\models"),
+            "{text}"
+        );
+        assert!(!text.contains("\\appdata\\local\\"), "{text}");
+        assert!(!is_program_files(&dir), "{text}");
+    }
+
+    #[test]
+    fn installer_config_does_not_bundle_onnx_models() {
+        let text = fs::read_to_string(
+            project_root()
+                .unwrap()
+                .join("src-tauri")
+                .join("tauri.conf.json"),
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&text).unwrap();
+        let resources = &value["bundle"]["resources"];
+        let empty = resources.is_null()
+            || resources.as_array().is_some_and(|items| items.is_empty())
+            || resources.as_object().is_some_and(|map| map.is_empty());
+        assert!(empty, "{resources}");
+        assert!(!text.to_ascii_lowercase().contains(".onnx"));
+    }
+
+    #[test]
+    fn update_overwrites_the_selected_onnx_name() {
+        let project = TempProject::new("install");
+        let models = models_dir(project.root());
+        let source = project.root().join("fresh.onnx");
+        fs::write(&source, b"new-bytes").unwrap();
+        fs::write(models.join("kit.onnx"), b"old").unwrap();
+        fs::write(models.join("best.pt"), b"pt").unwrap();
+
+        let saved = install_model_at(project.root(), &models, &source, "kit.onnx").unwrap();
+        assert_eq!(saved.model, "kit.onnx");
+        assert_eq!(saved.active, "kit.onnx");
+        assert_eq!(saved.message, "Updated kit.onnx.");
+        assert_eq!(fs::read(models.join("kit.onnx")).unwrap(), b"new-bytes");
+        assert_eq!(fs::read(models.join("best.pt")).unwrap(), b"pt");
+        assert_eq!(load_document(project.root()).unwrap()["model"], "kit.onnx");
+        assert!(fs::read_dir(&models).unwrap().all(|entry| {
+            let name = entry.unwrap().file_name();
+            let name = name.to_string_lossy();
+            !name.contains("partial") && !name.contains(".bak")
+        }));
+    }
+
+    #[test]
+    fn update_uses_best_onnx_when_the_selection_is_not_onnx() {
+        let project = TempProject::new("install-best");
+        let models = models_dir(project.root());
+        let source = project.root().join("export.ONNX");
+        fs::write(&source, b"onnx-body").unwrap();
+        fs::write(models.join("best.pt"), b"pt").unwrap();
+        fs::write(models.join("best.onnx"), b"previous").unwrap();
+
+        let saved = install_model_at(project.root(), &models, &source, "best.pt").unwrap();
+        assert_eq!(saved.model, "best.onnx");
+        assert_eq!(saved.active, "best.onnx");
+        assert_eq!(saved.message, "Updated best.onnx.");
+        assert_eq!(fs::read(models.join("best.onnx")).unwrap(), b"onnx-body");
+        assert_eq!(fs::read(models.join("best.pt")).unwrap(), b"pt");
+    }
+
+    #[test]
+    fn update_creates_best_onnx_when_the_folder_is_empty() {
+        let project = TempProject::new("install-empty");
+        let models = models_dir(project.root());
+        let source = project.root().join("weights.onnx");
+        fs::write(&source, b"first").unwrap();
+        let saved = install_model_at(project.root(), &models, &source, "").unwrap();
+        assert_eq!(saved.model, "best.onnx");
+        assert_eq!(saved.message, "Updated best.onnx.");
+        assert_eq!(fs::read(models.join("best.onnx")).unwrap(), b"first");
+    }
+
+    #[test]
+    fn update_replaces_bytes_when_the_size_matches() {
+        let project = TempProject::new("install-same-size");
+        let models = models_dir(project.root());
+        fs::write(models.join("best.onnx"), b"aaaa").unwrap();
+        let source = project.root().join("next.onnx");
+        fs::write(&source, b"bbbb").unwrap();
+        install_model_at(project.root(), &models, &source, "best.onnx").unwrap();
+        assert_eq!(fs::read(models.join("best.onnx")).unwrap(), b"bbbb");
+    }
+
+    #[test]
+    fn update_rejects_a_non_onnx_file_and_keeps_the_old_bytes() {
+        let project = TempProject::new("install-reject");
+        let models = models_dir(project.root());
+        let source = project.root().join("notes.txt");
+        fs::write(&source, b"nope").unwrap();
+        fs::write(models.join("best.onnx"), b"keep").unwrap();
+        let err = install_model_at(project.root(), &models, &source, "best.onnx").unwrap_err();
+        assert!(err.contains(".onnx"), "{err}");
+        assert_eq!(fs::read(models.join("best.onnx")).unwrap(), b"keep");
     }
 }

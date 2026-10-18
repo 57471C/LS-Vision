@@ -145,7 +145,7 @@ Train several options, compare on validation set (especially close variants), pi
 yolo export model=best.pt format=onnx
 ```
 
-Put the `.onnx` file in `vision/models/`. Weight files stay out of git.
+Copy the `.onnx` file into the app data models folder with Settings > Training > Update model. Weight files stay out of git and out of the installer.
 
 **Phase 1 (done on this branch).** `.onnx` detection runs in Rust through ONNX Runtime (`detect_image`). The operator page calls that command when the active model name ends in `.onnx`. An empty model selection uses `best.onnx` when that file is present, then `best.pt`. The detection JSON is unchanged: `{ detections: [{ ic, confidence, bbox }], image_base64 }`. The page still draws the boxes.
 

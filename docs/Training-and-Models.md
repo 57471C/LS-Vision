@@ -6,8 +6,8 @@
 2. Label in Label Studio (or a future built-in tool). Class names are part IC codes.
 3. Export YOLO format.
 4. Train with Ultralytics (or equivalent). Continue from an existing `best.pt` when adding classes.
-5. Export to ONNX (`best.onnx`) and place it in `vision/models/`. The desktop app does not run the Python training environment.
-6. Select the `.onnx` model and the Inference EP in Settings. A `.pt` selection warns and does not detect.
+5. Export to ONNX (`best.onnx`). The desktop app does not run the Python training environment.
+6. In Settings > Training, use Update model to copy that `.onnx` file into the app data models folder, then select the model and the Inference EP. A `.pt` selection warns and does not detect.
 
 ## Compounding
 
