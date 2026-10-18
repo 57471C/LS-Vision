@@ -2,7 +2,7 @@
 
 Python sidecar for LS-Vision (OpenCV + Ultralytics YOLO).
 
-This is the current vision engine. It is designed so inference can later move to ONNX-in-Rust without changing the contract with the Tauri app.
+The desktop app no longer starts this process. `.onnx` detection, the camera snapshot, barcode decode, and BoM lookup run in Rust. `main.py` remains so the sidecar can still be started by hand, and so the training notes stay next to the export command.
 
 ## Setup (first time)
 
@@ -14,6 +14,14 @@ pip install -r requirements.txt
 ```
 
 Place your best.pt in vision/models/. Weight files (`*.pt`, `*.onnx`) stay local and are not committed.
+
+`.pt` is the training file. The operator page runs `.onnx` in Rust. Export a model with:
+
+```powershell
+yolo export model=best.pt format=onnx
+```
+
+Put the `.onnx` file in `vision/models/` next to the `.pt` file.
 
 ## Activate the environment (every new terminal)
 
@@ -34,5 +42,5 @@ Health check: http://127.0.0.1:8008/health
 
 - Keep the API surface small and stable.
 - BoM lookup and inspection results should stay easy to call from Rust/Tauri.
-- Models will eventually be exported to ONNX for the Rust path.
+- `.onnx` detection, the camera snapshot, and BoM lookup run in Rust. This process is not started by the app. A hand-started sidecar still answers on port 8008, and Settings can stop it.
 - Sample BoM for testing: `sample-bom.json`

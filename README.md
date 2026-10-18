@@ -2,7 +2,7 @@
 
 Desktop application for verifying fastener kits on the bench using computer vision.
 
-Built with Tauri 2, SvelteKit, TypeScript, and Rust. Vision processing currently runs via a Python sidecar (OpenCV + YOLO), with a planned path to ONNX-in-Rust.
+Built with Tauri 2, SvelteKit, TypeScript, and Rust. `.onnx` detection, the camera snapshot, barcode decode, and BoM lookup run in Rust. The app does not start the Python sidecar. `vision/main.py` is still in the repo.
 
 ## What it does
 
@@ -20,8 +20,7 @@ See [plan.md](plan.md) for the full architecture, flow, and phased implementatio
 
 - **Frontend**: SvelteKit + TypeScript + Vite
 - **Desktop shell**: Tauri 2 (Rust)
-- **Vision (current)**: Python sidecar with OpenCV and Ultralytics YOLO
-- **Vision (target)**: ONNX inference in Rust
+- **Vision**: `.onnx` detection in Rust (ONNX Runtime). The camera snapshot is Rust (Media Foundation). A `.pt` file is training-only and does not detect.
 - **Data**: JSON/CSV for development; MSSQL for production BoM lookup
 
 ## Getting started
@@ -48,4 +47,4 @@ See [vision/README.md](vision/README.md) for full sidecar details.
 
 ## Project status
 
-Early scaffolding. Core loop (barcode → BoM → inspection → result) is the next focus. See `plan.md` for phases.
+`.onnx` detection, camera snapshots, barcode decode, and BoM lookup (JSON, API, and MSSQL) run in the Tauri process. The app does not spawn `vision/main.py`. That file remains for a manual run. A `.pt` model shows a warning instead of detecting. Settings can still stop a sidecar that was started by hand. See `plan.md` for Phase 3.

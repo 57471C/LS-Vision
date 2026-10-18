@@ -1,5 +1,6 @@
-//! JSON BoM file load and the job-card API POST.
-//! SQL lookup stays on the Python sidecar. These commands do not open a camera.
+//! JSON BoM file load, the job-card API POST, and MSSQL inspect.
+//! `inspect_bom` reads the saved source and runs the SQL file when that source is MSSQL.
+//! These commands do not open a camera.
 
 use std::error::Error;
 use std::fs;
@@ -22,6 +23,13 @@ const TIMEOUT_MESSAGE: &str = "The BoM API did not respond in time.";
 #[tauri::command]
 pub fn load_bom_json() -> Result<Value, String> {
     read_sample_bom(&local_config::project_root()?)
+}
+
+#[tauri::command]
+pub fn inspect_bom(barcode: String) -> Result<Value, String> {
+    let root = local_config::project_root()?;
+    let config = local_config::load_document(&root)?;
+    Ok(crate::bom_sql::inspect(&barcode, &config))
 }
 
 #[tauri::command]

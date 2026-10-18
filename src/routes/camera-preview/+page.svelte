@@ -1,13 +1,53 @@
 <script lang="ts">
 // biome-ignore-all lint/correctness/noUnusedVariables: Biome 2.4 does not treat Svelte template references as uses
-import { onMount } from "svelte";
+import { invoke } from "@tauri-apps/api/core";
+import { onDestroy, onMount } from "svelte";
 
 const PREVIEW_CHANNEL = "ls-vision-camera-preview";
+const DISPLAY_FPS = [15, 20, 25, 30];
+
+type PreviewBody = {
+	status?: string;
+	image?: string;
+	message?: string;
+	width?: number;
+	height?: number;
+	format?: string;
+	fps?: number | null;
+};
 
 let index = 0;
-let epoch = 0;
+let displayFps = 15;
+let message = "";
 let failed = false;
-let ignoreStreamErrorUntil = 0;
+let status = "";
+let painted = false;
+let canvasFps = "";
+let canvasEl: HTMLCanvasElement | undefined;
+let generation = 0;
+let displayFpsPinned = false;
+const paintStamps: number[] = [];
+
+function formatStatus(body: PreviewBody, canvasRate: string): string {
+	const width = body.width;
+	const height = body.height;
+	const format = body.format?.trim() ?? "";
+	const size =
+		typeof width === "number" &&
+		typeof height === "number" &&
+		width > 0 &&
+		height > 0
+			? `${width}×${height}`
+			: "";
+	const capture =
+		typeof body.fps === "number" && Number.isFinite(body.fps) && body.fps > 0
+			? `capture ${body.fps.toFixed(1)} fps`
+			: "";
+	const canvas = canvasRate ? `canvas ${canvasRate}` : "";
+	return [size, format, capture, canvas]
+		.filter((part) => part.length > 0)
+		.join(" · ");
+}
 
 function readIndex(value: unknown): number | null {
 	const next = Number(value);
@@ -15,13 +55,69 @@ function readIndex(value: unknown): number | null {
 	return next;
 }
 
+function readDisplayFps(value: unknown): number {
+	const next = Number(value);
+	return DISPLAY_FPS.includes(next) ? next : 15;
+}
+
+function frameMs(): number {
+	return 1000 / displayFps;
+}
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => {
+		setTimeout(resolve, ms);
+	});
+}
+
+function notePaint(now: number) {
+	paintStamps.push(now);
+	while (paintStamps.length > 0 && now - paintStamps[0] > 1000) {
+		paintStamps.shift();
+	}
+	if (paintStamps.length < 2) {
+		canvasFps = "";
+		return;
+	}
+	const span = paintStamps[paintStamps.length - 1] - paintStamps[0];
+	if (span < 200) {
+		canvasFps = "";
+		return;
+	}
+	canvasFps = `${(((paintStamps.length - 1) * 1000) / span).toFixed(1)} fps`;
+}
+
+async function drawFrame(url: string): Promise<boolean> {
+	const bitmap = await createImageBitmap(await (await fetch(url)).blob());
+	try {
+		const node = canvasEl;
+		if (!node) return false;
+		if (node.width !== bitmap.width || node.height !== bitmap.height) {
+			node.width = bitmap.width;
+			node.height = bitmap.height;
+		}
+		const context = node.getContext("2d", { alpha: false });
+		if (!context) return false;
+		context.drawImage(bitmap, 0, 0);
+		painted = true;
+		return true;
+	} finally {
+		bitmap.close();
+	}
+}
+
 function useIndex(next: number) {
 	if (next === index) return;
 	index = next;
-	epoch += 1;
+	message = "";
 	failed = false;
-	ignoreStreamErrorUntil = Date.now() + 1000;
+	status = "";
+	painted = false;
+	canvasFps = "";
+	paintStamps.length = 0;
 	void retitle(next);
+	generation += 1;
+	void runPreview(generation);
 }
 
 async function retitle(next: number) {
@@ -35,13 +131,55 @@ async function retitle(next: number) {
 	}
 }
 
-function onFrameError() {
-	if (Date.now() < ignoreStreamErrorUntil) return;
-	failed = true;
+async function runPreview(gen: number) {
+	while (gen === generation) {
+		const started = performance.now();
+		const current = index;
+		try {
+			const body = await invoke<PreviewBody>("capture_preview", {
+				index: current,
+			});
+			if (gen !== generation || current !== index) return;
+			if (body.status === "fail" || !body.image) {
+				failed = true;
+				status = "";
+				message = body.message || "The camera did not open.";
+				await sleep(400);
+				continue;
+			}
+			const drew = await drawFrame(body.image);
+			if (gen !== generation || current !== index) return;
+			if (drew) notePaint(performance.now());
+			status = formatStatus(body, canvasFps);
+			message = "";
+			failed = false;
+		} catch (err: unknown) {
+			if (gen !== generation || current !== index) return;
+			failed = true;
+			status = "";
+			message =
+				typeof err === "string" && err.trim()
+					? err
+					: "The camera did not open.";
+			await sleep(400);
+			continue;
+		}
+		const remain = frameMs() - (performance.now() - started);
+		if (gen === generation && remain > 0) await sleep(remain);
+	}
 }
 
-function onFrameLoad() {
-	failed = false;
+async function loadDisplayFps() {
+	try {
+		const config = await invoke<{ camera?: { displayFps?: unknown } }>(
+			"load_local_config",
+		);
+		if (!displayFpsPinned) {
+			displayFps = readDisplayFps(config.camera?.displayFps);
+		}
+	} catch {
+		if (!displayFpsPinned) displayFps = 15;
+	}
 }
 
 onMount(() => {
@@ -51,10 +189,29 @@ onMount(() => {
 	void retitle(index);
 	const channel = new BroadcastChannel(PREVIEW_CHANNEL);
 	channel.onmessage = (event) => {
+		if (event.data && "displayFps" in event.data) {
+			displayFpsPinned = true;
+			const next = readDisplayFps(event.data.displayFps);
+			if (next !== displayFps) {
+				displayFps = next;
+				paintStamps.length = 0;
+				canvasFps = "";
+			}
+		}
 		const next = readIndex(event.data?.index);
 		if (next !== null) useIndex(next);
 	};
-	return () => channel.close();
+	void loadDisplayFps().then(() => {
+		if (generation === 0) void runPreview(generation);
+	});
+	return () => {
+		generation += 1;
+		channel.close();
+	};
+});
+
+onDestroy(() => {
+	generation += 1;
 });
 </script>
 
@@ -70,19 +227,22 @@ onMount(() => {
 <div class="flex h-dvh flex-col overflow-hidden bg-neutral-950 text-neutral-100">
 	<header class="flex shrink-0 items-center justify-between border-b border-neutral-800 bg-neutral-900 px-4 py-2">
 		<h1 class="text-sm font-semibold tracking-tight">Camera {index}</h1>
-		<p class="text-[11px] font-semibold uppercase tracking-widest text-neutral-500">Preview</p>
+		{#if status}
+			<p class="min-w-0 truncate text-xs tabular-nums text-neutral-200">{status}</p>
+		{:else}
+			<p class="text-[11px] font-semibold uppercase tracking-widest text-neutral-500">Preview</p>
+		{/if}
 	</header>
 	<div class="relative min-h-0 flex-1 bg-black">
-		<img
+		<canvas
+			bind:this={canvasEl}
 			class="h-full w-full object-contain"
-			alt="Camera {index} preview"
-			src="http://127.0.0.1:8008/camera/stream?index={index}&feed={epoch}"
-			on:error={onFrameError}
-			on:load={onFrameLoad}
-		/>
-		{#if failed}
+			class:invisible={!painted}
+			aria-label="Camera {index} preview"
+		></canvas>
+		{#if failed || !painted}
 			<p class="absolute inset-0 flex items-center justify-center px-6 text-center text-sm text-neutral-300">
-				The camera stream is not available. Start the vision sidecar and check this camera index.
+				{message || "Opening camera…"}
 			</p>
 		{/if}
 	</div>

@@ -133,9 +133,33 @@ Train several options, compare on validation set (especially close variants), pi
 - Optional central logging/dashboard
 
 **Later**  
-- Move vision inference fully to ONNX-in-Rust  
+- Move vision inference fully to ONNX-in-Rust (see the migration notes below)  
 - Separate training app if labeling needs grow  
 - More advanced kit grouping if required
+
+### ONNX-in-Rust migration
+
+`.pt` stays the training file. Inference uses `.onnx`. Export with:
+
+```text
+yolo export model=best.pt format=onnx
+```
+
+Put the `.onnx` file in `vision/models/`. Weight files stay out of git.
+
+**Phase 1 (done on this branch).** `.onnx` detection runs in Rust through ONNX Runtime (`detect_image`). The operator page calls that command when the active model name ends in `.onnx`. An empty model selection uses `best.onnx` when that file is present, then `best.pt`. The detection JSON is unchanged: `{ detections: [{ ic, confidence, bbox }], image_base64 }`. The page still draws the boxes.
+
+Python `YOLO(best.pt)` and `YOLO(best.onnx)` already disagree on `vision/test-images/Example3.jpg` (172 boxes from the checkpoint, 181 from the ONNX graph). Rust is checked against the ONNX result.
+
+**Phase 2 (done on this branch).** The desktop app no longer starts `vision/main.py`, and the operator page no longer waits on port 8008.
+
+- Camera: `list_cameras`, `list_camera_modes`, and `capture_snapshot` use Media Foundation on one worker thread. Only one camera is open. The previous media source is shut down before the next camera opens. Settings lists that camera's modes as size and fps. The saved value is `WIDTHxHEIGHT@FPS` (a blank value, or a size the camera does not list, uses the highest 16:9 mode at 30 fps, or the closest listed rate). The reader reopens in that exact mode and prefers NV12. 640×480 is used only when it is the saved mode or the only listed one. The source-reader callback requests the next sample before copying the current one. It keeps one latest frame and replaces that frame on every sample; frames are not queued. JPEG encoding runs only when the frontend asks, off that callback. `capture_snapshot` returns a full-size JPEG of the selected mode plus `width`, `height`, `format`, and measured `fps`, for the operator page and for detection. `capture_preview` scales that same frame to fit in 1280×720 and returns a smaller JPEG. The Settings canvas asks for the next preview frame only after `drawImage` finishes. Display FPS is 15, 20, 25, or 30, default 15, and that choice is the target interval. The header shows the capture rate next to the canvas rate. The operator live view calls `capture_preview` and draws the next frame only after the previous `drawImage` finishes, at the saved Display FPS. Barcode reads and detection still call `capture_snapshot`. JPEG quality is 80. Media Foundation indexes can differ from the old DirectShow indexes, so a saved index may need to be chosen again. Focus, brightness, and contrast are stored in `vision/config.local.json` and are not applied to the device. A Settings slider change does not write the file; Save does. Choosing a resolution or a display rate writes it immediately. Switching cameras loads that camera's saved resolution, display rate, and levels. A camera with no saved record uses the defaults.
+- Barcode: the page decodes the Rust JPEG with the native detector, then ZXing, then `decode_barcode`. It does not call the sidecar for a frame.
+- BoM: JSON uses `load_bom_json`, the job-card API uses `post_bom_api`, and MSSQL uses `inspect_bom` (ODBC Driver 18, `Encrypt=optional;TrustServerCertificate=yes`). The SQL file is still `vision/bom_queries.sql`, with the example file as the fallback. The Rust path does not set the pyodbc `attrs_before` values. A missing kit is still `Barcode not found in BoM`.
+- A `.pt` model does not detect. The page returns no boxes and the message `{name} is a .pt file. Choose an .onnx model to detect parts.` The model switcher is unchanged, so choosing a `.pt` name still asks `GET /settings/model` and reports that the sidecar did not reload it.
+- `vision/main.py` is still in the repo. Settings can still stop a sidecar that was started by hand: the Kill button polls `/health` and is hidden while nothing answers.
+
+**Phase 3 (not started).** Leave `vision/main.py` off the runtime path. Training notes can stay. State in the README that inference is ONNX-in-Rust and the Python sidecar is gone. Confirm the model switcher, detect ROI, barcode ROI, and Settings still work. The Kill button and the `.pt` model reload still mention the sidecar.
 
 ### Immediate next steps
 2. Collect and label part and kit images in Label Studio.

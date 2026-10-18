@@ -1,6 +1,16 @@
 <script lang="ts">
 // biome-ignore-all lint/correctness/noUnusedVariables: Biome 2.4 does not treat Svelte template references as uses
+
 import { onDestroy, onMount } from "svelte";
+import {
+	activateCamera,
+	assignActiveCamera,
+	type CameraSettings,
+	readDisplayFps,
+	rememberActiveCamera,
+	retainCameraSettings,
+	settingsForCamera,
+} from "$lib/camera-settings";
 
 const DEV_PASSWORD = "admin";
 const UNLOCK_KEY = "ls-vision-settings-open";
@@ -50,18 +60,31 @@ let roiNotice = "";
 let savingRoi = false;
 let modelFiles: string[] = [];
 let modelName = "";
-let modelActive = "best.pt";
+let modelActive = "best.onnx";
 let modelNotice = "";
 let savingModel = false;
+type CameraMode = {
+	id: string;
+	width: number;
+	height: number;
+	fps: number;
+	format?: string;
+};
+
 let cameraIndex = 0;
 let cameraChoices: number[] = [0];
+let cameraModes: CameraMode[] = [];
+let cameraModeDefault = "";
 let cameraResolution = "";
+const DISPLAY_FPS = [15, 20, 25, 30];
+let cameraDisplayFps = 15;
 let cameraFocus = 50;
 let cameraBrightness = 50;
 let cameraContrast = 50;
 let savedCamera = {
 	index: 0,
 	resolution: "",
+	displayFps: 15,
 	focus: 50,
 	brightness: 50,
 	contrast: 50,
@@ -73,6 +96,10 @@ let cameraApplyTimer: ReturnType<typeof setTimeout> | null = null;
 let cameraPushId = 0;
 // Posts stay in order. A slow live update must not land after Reset or Cancel.
 let cameraPostChain: Promise<void> = Promise.resolve();
+// Last config used to fill the form. A camera change can paint before the file write.
+let cameraFile: Record<string, unknown> | null = null;
+// Bumped when the form changes. A finished file write paints only if it is still current.
+let cameraFileVersion = 0;
 let cameraNotice = "";
 let cameraListNotice = "";
 let previewNotice = "";
@@ -85,7 +112,17 @@ let configLoadId = 0;
 
 const PREVIEW_LABEL = "camera-preview";
 const PREVIEW_CHANNEL = "ls-vision-camera-preview";
-const CAMERA_RESOLUTIONS = ["640x480", "1280x720", "1920x1080"];
+
+function isModeId(value: string): boolean {
+	return /^\d+x\d+@\d+(\.\d{1,3})?$/.test(value);
+}
+
+function modeLabel(mode: CameraMode): string {
+	const fps = Number.isInteger(mode.fps)
+		? String(mode.fps)
+		: mode.fps.toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
+	return `${mode.width}×${mode.height} · ${fps} fps`;
+}
 
 function storedUnlocked(): boolean {
 	if (typeof sessionStorage === "undefined") return false;
@@ -229,6 +266,50 @@ async function invokeRust<T>(
 	return invoke<T>(command, args);
 }
 
+async function loadDocument(): Promise<Record<string, unknown>> {
+	return await invokeRust<Record<string, unknown>>("load_local_config");
+}
+
+async function storeDocument(
+	config: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+	return await invokeRust<Record<string, unknown>>("save_local_config", {
+		config,
+	});
+}
+
+function objectField(value: unknown): Record<string, unknown> {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+	return value as Record<string, unknown>;
+}
+
+function cleanErp(
+	nameRaw: string,
+	urlRaw: string,
+): { name: string; url: string } | string {
+	const name = nameRaw.trim().replace(/\s+/g, " ");
+	const url = urlRaw.trim();
+	if (name.length > 40) return "Button name must be 40 characters or fewer";
+	if (url.length > 2000) return "URL is too long";
+	if (!url) {
+		if (name) return "URL is required";
+		return { name: "", url: "" };
+	}
+	let parsed: URL;
+	try {
+		parsed = new URL(url);
+	} catch {
+		return "URL must start with http:// or https://";
+	}
+	if (
+		(parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
+		!parsed.hostname
+	) {
+		return "URL must start with http:// or https://";
+	}
+	return { name: name || "ERP", url };
+}
+
 async function loadSource() {
 	const id = ++configLoadId;
 	notice = "";
@@ -261,7 +342,7 @@ function applyModel(data: {
 }) {
 	modelFiles = readModelFiles(data.files);
 	const active = typeof data.active === "string" ? data.active.trim() : "";
-	modelActive = active || "best.pt";
+	modelActive = active || "best.onnx";
 	const selected = typeof data.model === "string" ? data.model : "";
 	if (modelFiles.includes(selected)) modelName = selected;
 	else if (modelFiles.includes(modelActive)) modelName = modelActive;
@@ -279,16 +360,20 @@ async function loadModelFromRust() {
 	const config = await invokeRust<BomDocument>("load_local_config");
 	const stored = stringField(config.model);
 	const match = matchFile(stored, files);
-	const fallback = matchFile("best.pt", files);
+	const fallback =
+		matchFile("best.onnx", files) ||
+		matchFile("best.pt", files) ||
+		files.find((item) => item.toLowerCase().endsWith(".onnx")) ||
+		"";
 	applyModel({
 		model: match,
-		active: match || fallback || "best.pt",
+		active: match || fallback || "best.onnx",
 		files,
 	});
 	if (stored.trim() && !match) {
 		modelNotice = fallback
 			? `${stored.trim()} was not found. Using ${fallback}.`
-			: `${stored.trim()} was not found. best.pt was not found.`;
+			: `${stored.trim()} was not found. best.onnx was not found.`;
 		return;
 	}
 	modelNotice = "";
@@ -324,35 +409,29 @@ async function saveModel() {
 
 async function loadScan() {
 	try {
-		const res = await fetch("http://127.0.0.1:8008/settings/scan");
-		if (!res.ok) throw new Error(await res.text());
-		const data = await res.json();
-		const seconds = Number(data.seconds);
+		const data = await loadDocument();
+		const seconds = Number(data.scanSeconds);
 		if (Number.isInteger(seconds)) scanSeconds = seconds;
 	} catch (err: unknown) {
-		scanNotice = errorMessage(err, "Could not load the scan interval");
+		scanNotice = invokeError(err, "Could not load the scan interval");
 	}
 }
 
 async function loadTestMode() {
 	try {
-		const res = await fetch("http://127.0.0.1:8008/settings/test-mode");
-		if (!res.ok) throw new Error(await res.text());
-		const data = await res.json();
-		testMode = data.enabled === true;
+		const data = await loadDocument();
+		testMode = data.testMode === true;
 	} catch (err: unknown) {
-		testNotice = errorMessage(err, "Could not load Test mode");
+		testNotice = invokeError(err, "Could not load Test mode");
 	}
 }
 
 async function loadRoi() {
 	try {
-		const res = await fetch("http://127.0.0.1:8008/settings/detect-roi");
-		if (!res.ok) throw new Error(await res.text());
-		const data = await res.json();
-		fillRoi(asRoi(data.roi));
+		const data = await loadDocument();
+		fillRoi(asRoi(data.detectRoi));
 	} catch (err: unknown) {
-		roiNotice = errorMessage(err, "Could not load the ROI");
+		roiNotice = invokeError(err, "Could not load the ROI");
 	}
 }
 
@@ -361,17 +440,11 @@ async function saveTestMode() {
 	testNotice = "";
 	const enabled = testMode;
 	try {
-		const res = await fetch("http://127.0.0.1:8008/settings/test-mode", {
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ enabled }),
-		});
-		const data = await res.json().catch(() => ({}));
-		if (!res.ok || data.status === "fail") {
-			throw new Error(data.message || "Save failed");
-		}
-		testMode = data.enabled === true;
-		testNotice = data.message || "Saved";
+		const current = await loadDocument();
+		current.testMode = enabled;
+		const saved = await storeDocument(current);
+		testMode = saved.testMode === true;
+		testNotice = "Saved";
 	} catch (err: unknown) {
 		testMode = !enabled;
 		testNotice = errorMessage(err, "Could not save Test mode");
@@ -382,13 +455,12 @@ async function saveTestMode() {
 
 async function loadErp() {
 	try {
-		const res = await fetch("http://127.0.0.1:8008/settings/erp");
-		if (!res.ok) throw new Error(await res.text());
-		const data = await res.json();
-		erpName = typeof data.name === "string" ? data.name : "";
-		erpUrl = typeof data.url === "string" ? data.url : "";
+		const data = await loadDocument();
+		const erp = objectField(data.erp);
+		erpName = typeof erp.name === "string" ? erp.name : "";
+		erpUrl = typeof erp.url === "string" ? erp.url : "";
 	} catch (err: unknown) {
-		erpNotice = errorMessage(err, "Could not load the ERP button");
+		erpNotice = invokeError(err, "Could not load the ERP button");
 	}
 }
 
@@ -433,20 +505,14 @@ async function saveScan() {
 		return;
 	}
 	try {
-		const res = await fetch("http://127.0.0.1:8008/settings/scan", {
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ seconds }),
-		});
-		const data = await res.json().catch(() => ({}));
-		if (!res.ok || data.status === "fail") {
-			throw new Error(data.message || "Save failed");
-		}
-		if (Number.isInteger(Number(data.seconds)))
-			scanSeconds = Number(data.seconds);
-		scanNotice = data.message || "Saved";
+		const current = await loadDocument();
+		current.scanSeconds = seconds;
+		const saved = await storeDocument(current);
+		const stored = Number(saved.scanSeconds);
+		if (Number.isInteger(stored)) scanSeconds = stored;
+		scanNotice = "Saved";
 	} catch (err: unknown) {
-		scanNotice = errorMessage(err, "Could not save the scan interval");
+		scanNotice = invokeError(err, "Could not save the scan interval");
 	} finally {
 		savingScan = false;
 	}
@@ -455,21 +521,21 @@ async function saveScan() {
 async function saveErp() {
 	savingErp = true;
 	erpNotice = "";
+	const cleaned = cleanErp(erpName, erpUrl);
+	if (typeof cleaned === "string") {
+		erpNotice = cleaned;
+		savingErp = false;
+		return;
+	}
 	try {
-		const res = await fetch("http://127.0.0.1:8008/settings/erp", {
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ name: erpName, url: erpUrl }),
-		});
-		const data = await res.json().catch(() => ({}));
-		if (!res.ok || data.status === "fail") {
-			throw new Error(data.message || (await res.text()) || "Save failed");
-		}
-		erpName = typeof data.name === "string" ? data.name : erpName;
-		erpUrl = typeof data.url === "string" ? data.url : erpUrl;
-		erpNotice = data.message || "Saved";
+		const current = await loadDocument();
+		current.erp = cleaned;
+		await storeDocument(current);
+		erpName = cleaned.name;
+		erpUrl = cleaned.url;
+		erpNotice = "Saved";
 	} catch (err: unknown) {
-		erpNotice = errorMessage(err, "Could not save the ERP button");
+		erpNotice = invokeError(err, "Could not save the ERP button");
 	} finally {
 		savingErp = false;
 	}
@@ -479,23 +545,13 @@ async function postRoi(next: DetectRoi | null) {
 	savingRoi = true;
 	roiNotice = "";
 	try {
-		const res = await fetch("http://127.0.0.1:8008/settings/detect-roi", {
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ roi: next }),
-		});
-		const data = (await res.json().catch(() => ({}))) as {
-			status?: string;
-			message?: string;
-			roi?: unknown;
-		};
-		if (!res.ok || data.status === "fail") {
-			throw new Error(data.message || "Could not save the ROI");
-		}
-		fillRoi(asRoi(data.roi));
-		roiNotice = data.message || "Saved";
+		const current = await loadDocument();
+		current.detectRoi = next;
+		await storeDocument(current);
+		fillRoi(asRoi(next));
+		roiNotice = "Saved";
 	} catch (err: unknown) {
-		roiNotice = errorMessage(err, "Could not save the ROI");
+		roiNotice = invokeError(err, "Could not save the ROI");
 	} finally {
 		savingRoi = false;
 	}
@@ -713,26 +769,52 @@ function cameraSettingsBody() {
 	return {
 		index: Number(cameraIndex),
 		resolution: cameraResolution,
+		displayFps: readDisplayFps(cameraDisplayFps),
 		focus: cameraFocus,
 		brightness: cameraBrightness,
 		contrast: cameraContrast,
 	};
 }
 
-async function postCameraSettings(applyOnly = false) {
-	const res = await fetch("http://127.0.0.1:8008/settings/camera", {
-		method: "POST",
-		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({
-			...cameraSettingsBody(),
-			...(applyOnly ? { applyOnly: true } : {}),
-		}),
-	});
-	const data = await res.json().catch(() => ({}));
-	if (!res.ok || data.status === "fail") {
-		throw new Error(data.message || "Save failed");
+async function postCameraSettings(applyOnly = false, preset?: CameraSettings) {
+	const body = preset ?? cameraSettingsBody();
+	// The Rust camera stores these fields. It does not apply focus, brightness,
+	// or contrast to the device, so a live slider change does not write config.
+	if (applyOnly) return { ...body, status: "pass", message: "" };
+	const index = Number(body.index);
+	if (!Number.isInteger(index) || index < 0 || index > 32) {
+		throw new Error("Camera index must be from 0 to 32.");
 	}
-	return data;
+	if (body.resolution !== "" && !isModeId(body.resolution)) {
+		throw new Error("Choose a resolution from the list.");
+	}
+	if (
+		cameraModes.length > 0 &&
+		body.resolution !== "" &&
+		!cameraModes.some((mode) => mode.id === body.resolution)
+	) {
+		throw new Error("Choose a resolution from the list.");
+	}
+	const version = cameraFileVersion;
+	const current = await loadDocument();
+	const settings = {
+		index,
+		resolution: body.resolution,
+		displayFps: body.displayFps,
+		focus: body.focus,
+		brightness: body.brightness,
+		contrast: body.contrast,
+	};
+	// Save belongs to the camera on the form when Save was clicked. A later
+	// camera change must not move that record onto the newly selected camera.
+	if (Number(cameraIndex) === index) assignActiveCamera(current, settings);
+	else {
+		rememberActiveCamera(current);
+		retainCameraSettings(current, settings);
+	}
+	await storeDocument(current);
+	if (cameraFileVersion === version) cameraFile = current;
+	return { ...settings, status: "pass", message: "Saved" };
 }
 
 function queueCameraPost(work: () => Promise<void>): Promise<void> {
@@ -760,6 +842,7 @@ function rememberSaved() {
 	savedCamera = {
 		index: Number(cameraIndex),
 		resolution: cameraResolution,
+		displayFps: readDisplayFps(cameraDisplayFps),
 		focus: cameraFocus,
 		brightness: cameraBrightness,
 		contrast: cameraContrast,
@@ -769,14 +852,14 @@ function rememberSaved() {
 function showCamera(next: {
 	index: number;
 	resolution: string;
+	displayFps: number;
 	focus: number;
 	brightness: number;
 	contrast: number;
 }) {
 	cameraIndex = next.index;
-	cameraResolution = CAMERA_RESOLUTIONS.includes(next.resolution)
-		? next.resolution
-		: "";
+	cameraResolution = isModeId(next.resolution) ? next.resolution : "";
+	cameraDisplayFps = readDisplayFps(next.displayFps);
 	cameraFocus = clampLevel(next.focus);
 	cameraBrightness = clampLevel(next.brightness);
 	cameraContrast = clampLevel(next.contrast);
@@ -808,11 +891,14 @@ async function applyShownCamera(notice: string) {
 function resetCamera() {
 	showCamera({
 		index: Number(cameraIndex),
-		resolution: "",
+		resolution: cameraModeDefault,
+		displayFps: 15,
 		focus: 50,
 		brightness: 50,
 		contrast: 50,
 	});
+	void persistResolution(cameraResolution);
+	void persistDisplayFps(cameraDisplayFps);
 	void applyShownCamera("Reset to defaults.");
 }
 
@@ -824,6 +910,7 @@ function cancelCameraEdits() {
 function applyCamera(data: {
 	index?: unknown;
 	resolution?: unknown;
+	displayFps?: unknown;
 	focus?: unknown;
 	brightness?: unknown;
 	contrast?: unknown;
@@ -831,7 +918,8 @@ function applyCamera(data: {
 	const index = Number(data.index);
 	if (Number.isInteger(index) && index >= 0 && index <= 32) cameraIndex = index;
 	const resolution = typeof data.resolution === "string" ? data.resolution : "";
-	cameraResolution = CAMERA_RESOLUTIONS.includes(resolution) ? resolution : "";
+	cameraResolution = isModeId(resolution) ? resolution : "";
+	cameraDisplayFps = readDisplayFps(data.displayFps);
 	cameraFocus = levelValue(data.focus) ?? 50;
 	cameraBrightness = levelValue(data.brightness) ?? 50;
 	cameraContrast = levelValue(data.contrast) ?? 50;
@@ -846,37 +934,161 @@ function applyCamera(data: {
 async function loadCameraDevices() {
 	cameraListNotice = "";
 	try {
-		const res = await fetch(
-			`http://127.0.0.1:8008/cameras?selected=${cameraIndex}`,
-		);
-		if (!res.ok) throw new Error(await res.text());
-		const data = await res.json();
+		const listed = await invokeRust<unknown>("list_cameras");
 		const selected = Number(cameraIndex);
-		const found = cameraList(data.cameras);
+		const found = cameraList(listed);
 		if (!found.includes(selected)) found.push(selected);
 		found.sort((left, right) => left - right);
 		cameraIndex = selected;
 		cameraChoices = found;
 	} catch (err: unknown) {
 		cameraChoices = [cameraIndex];
-		cameraListNotice = errorMessage(
-			err,
-			"Could not list cameras. Is the vision sidecar running?",
-		);
+		cameraListNotice = invokeError(err, "Could not list cameras.");
 	}
 }
 
 async function loadCameraSettings() {
 	cameraNotice = "";
+	const version = cameraFileVersion;
 	try {
-		const res = await fetch("http://127.0.0.1:8008/settings/camera");
-		if (!res.ok) throw new Error(await res.text());
-		applyCamera(await res.json());
-		rememberSaved();
+		const config = await loadDocument();
+		if (cameraFileVersion === version) {
+			cameraFile = config;
+			const camera = objectField(config.camera);
+			const index = Number(camera.index);
+			const selected =
+				Number.isInteger(index) && index >= 0 && index <= 32 ? index : 0;
+			showCamera(settingsForCamera(camera, selected));
+			rememberSaved();
+		}
 	} catch (err: unknown) {
-		cameraNotice = errorMessage(err, "Could not load the camera settings");
+		if (cameraFileVersion === version) {
+			cameraNotice = invokeError(err, "Could not load the camera settings");
+		}
 	}
 	await loadCameraDevices();
+	if (cameraFileVersion !== version) return;
+	await loadCameraModes();
+}
+
+function copyCameraFile(): Record<string, unknown> | null {
+	if (!cameraFile) return null;
+	return JSON.parse(JSON.stringify(cameraFile)) as Record<string, unknown>;
+}
+
+function cameraRecord(
+	document: Record<string, unknown>,
+	index: number,
+	patch: Partial<{
+		resolution: string;
+		displayFps: number;
+	}>,
+): CameraSettings {
+	rememberActiveCamera(document);
+	const record = settingsForCamera(objectField(document.camera), index);
+	if (patch.resolution !== undefined) {
+		record.resolution = isModeId(patch.resolution) ? patch.resolution : "";
+	}
+	if (patch.displayFps !== undefined) {
+		record.displayFps = readDisplayFps(patch.displayFps);
+	}
+	return record;
+}
+
+function stageCameraPatch(
+	index: number,
+	patch: Partial<{
+		resolution: string;
+		displayFps: number;
+	}>,
+) {
+	const draft = copyCameraFile();
+	if (!draft) return;
+	const record = cameraRecord(draft, index, patch);
+	if (Number(cameraIndex) === index) assignActiveCamera(draft, record);
+	else retainCameraSettings(draft, record);
+	cameraFile = draft;
+	cameraFileVersion += 1;
+}
+
+async function persistCamera(
+	index: number,
+	patch: Partial<{
+		resolution: string;
+		displayFps: number;
+	}>,
+) {
+	stageCameraPatch(index, patch);
+	const version = cameraFileVersion;
+	await queueCameraPost(async () => {
+		const current = await loadDocument();
+		const record = cameraRecord(current, index, patch);
+		// The dropdown may already show another camera. Keep the patch on this
+		// camera, and leave the selected camera's top-level fields alone.
+		const selected = Number(cameraIndex) === index;
+		if (selected) assignActiveCamera(current, record);
+		else retainCameraSettings(current, record);
+		await storeDocument(current);
+		if (cameraFileVersion !== version) return;
+		cameraFile = current;
+		if (!selected) return;
+		savedCamera = {
+			...savedCamera,
+			index,
+			resolution: record.resolution,
+			displayFps: record.displayFps,
+		};
+	});
+}
+
+async function persistResolution(resolution: string) {
+	await persistCamera(Number(cameraIndex), { resolution });
+}
+
+async function persistDisplayFps(displayFps: number) {
+	await persistCamera(Number(cameraIndex), { displayFps });
+}
+
+function onDisplayFpsChange() {
+	cameraDisplayFps = readDisplayFps(cameraDisplayFps);
+	postPreviewIndex(Number(cameraIndex));
+	void persistDisplayFps(cameraDisplayFps);
+}
+
+async function loadCameraModes() {
+	const index = Number(cameraIndex);
+	try {
+		const body = await invokeRust<{
+			modes?: CameraMode[];
+			default?: string;
+		}>("list_camera_modes", { index });
+		if (index !== Number(cameraIndex)) return;
+		const modes = Array.isArray(body.modes)
+			? body.modes.filter(
+					(mode) =>
+						typeof mode?.id === "string" &&
+						isModeId(mode.id) &&
+						typeof mode.width === "number" &&
+						typeof mode.height === "number" &&
+						typeof mode.fps === "number",
+				)
+			: [];
+		cameraModes = modes;
+		cameraModeDefault =
+			typeof body.default === "string" && isModeId(body.default)
+				? body.default
+				: (modes[0]?.id ?? "");
+		if (
+			cameraModeDefault &&
+			!modes.some((mode) => mode.id === cameraResolution)
+		) {
+			cameraResolution = cameraModeDefault;
+			await persistResolution(cameraResolution);
+		}
+	} catch (err: unknown) {
+		if (index !== Number(cameraIndex)) return;
+		cameraListNotice = invokeError(err, "Could not list camera modes.");
+	}
 }
 
 async function saveCamera() {
@@ -886,13 +1098,14 @@ async function saveCamera() {
 	}
 	rememberLevels();
 	const id = ++cameraPushId;
+	const body = cameraSettingsBody();
 	savingCamera = true;
 	cameraNotice = "";
 	try {
 		await queueCameraPost(async () => {
 			if (id !== cameraPushId) return;
-			const data = await postCameraSettings();
-			if (id !== cameraPushId) return;
+			const data = await postCameraSettings(false, body);
+			if (id !== cameraPushId || Number(cameraIndex) !== body.index) return;
 			applyCamera(data);
 			rememberSaved();
 			cameraIndex = Number(cameraIndex);
@@ -997,13 +1210,53 @@ async function killSidecar() {
 
 function postPreviewIndex(index: number) {
 	const channel = new BroadcastChannel(PREVIEW_CHANNEL);
-	channel.postMessage({ index });
+	channel.postMessage({
+		index,
+		displayFps: readDisplayFps(cameraDisplayFps),
+	});
 	channel.close();
 }
 
 function onCameraIndexChange() {
 	cameraIndex = Number(cameraIndex);
-	postPreviewIndex(cameraIndex);
+	const next = cameraIndex;
+	cameraFileVersion += 1;
+	const version = cameraFileVersion;
+	const draft = copyCameraFile();
+	if (draft) {
+		const record = activateCamera(draft, next);
+		cameraFile = draft;
+		cameraModes = [];
+		cameraModeDefault = "";
+		showCamera(record);
+		rememberSaved();
+	}
+	postPreviewIndex(next);
+	void switchToCamera(next, version);
+}
+
+async function switchToCamera(next: number, version: number) {
+	try {
+		await queueCameraPost(async () => {
+			if (Number(cameraIndex) !== next) return;
+			const current = await loadDocument();
+			if (Number(cameraIndex) !== next) return;
+			const record = activateCamera(current, next);
+			await storeDocument(current);
+			if (Number(cameraIndex) !== next || cameraFileVersion !== version) return;
+			cameraFile = current;
+			showCamera(record);
+			rememberSaved();
+		});
+	} catch (err: unknown) {
+		if (Number(cameraIndex) === next) {
+			cameraNotice = errorMessage(err, "Could not load the camera settings");
+		}
+		return;
+	}
+	if (Number(cameraIndex) !== next) return;
+	postPreviewIndex(next);
+	await loadCameraModes();
 }
 
 async function openPreview() {
@@ -1274,7 +1527,7 @@ onDestroy(() => {
 									</select>
 								</label>
 								<p class="text-sm text-neutral-400">
-									The operator page opens this camera. A camera that is unplugged at launch is tried again next time.
+									The operator page opens this camera. A camera that is unplugged at launch is tried again next time. Resolution, display rate, and levels are kept for each camera.
 								</p>
 								{#if cameraListNotice}
 									<p class="text-sm text-neutral-200">{cameraListNotice}</p>
@@ -1289,14 +1542,36 @@ onDestroy(() => {
 									<select
 										class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
 										bind:value={cameraResolution}
-										on:change={scheduleCameraApply}
+										on:change={() => {
+											void persistResolution(cameraResolution);
+										}}
 									>
-										<option value="">Not set</option>
-										<option value="640x480">640×480</option>
-										<option value="1280x720">1280×720</option>
-										<option value="1920x1080">1920×1080</option>
+										{#if cameraResolution && !cameraModes.some((mode) => mode.id === cameraResolution)}
+											<option value={cameraResolution}>{cameraResolution}</option>
+										{/if}
+										{#each cameraModes as mode (mode.id)}
+											<option value={mode.id}>{modeLabel(mode)}</option>
+										{/each}
 									</select>
 								</label>
+								<p class="text-sm text-neutral-400">
+									The preview reopens in this mode. NV12 is used when the camera lists it.
+								</p>
+								<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+									Display FPS
+									<select
+										class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
+										bind:value={cameraDisplayFps}
+										on:change={onDisplayFpsChange}
+									>
+										{#each DISPLAY_FPS as rate (rate)}
+											<option value={rate}>{rate}</option>
+										{/each}
+									</select>
+								</label>
+								<p class="text-sm text-neutral-400">
+									The preview canvas aims for this rate. The next frame is requested after the previous one is drawn.
+								</p>
 								<div class="divide-y divide-neutral-800 border-y border-neutral-800">
 									<div class="flex items-center gap-3 py-1">
 										<span class="flex w-36 shrink-0 items-center gap-2 text-sm font-medium normal-case tracking-normal text-neutral-100">
@@ -1649,9 +1924,9 @@ onDestroy(() => {
 								</label>
 								<p class="text-sm text-neutral-400">
 									{#if modelFiles.length === 0}
-										No .pt or .onnx files in vision/models. Detection uses best.pt when that file is present.
+										No .pt or .onnx files in vision/models. Detection uses best.onnx when that file is present, otherwise best.pt.
 									{:else}
-										Choose a .pt or .onnx file in vision/models. A missing file, or no selection, uses best.pt.
+										Choose a .pt or .onnx file in vision/models. A missing file, or no selection, uses best.onnx when that file is present, otherwise best.pt.
 									{/if}
 								</p>
 							</fieldset>
