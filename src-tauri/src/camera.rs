@@ -5,17 +5,18 @@
 //! keeps at most one session. Switching cameras shuts the media source
 //! down before the next device is activated, so the hardware encoder is
 //! free for the new open. Frames arrive through an async source-reader
-//! callback, which keeps a single latest frame and replaces it on every
-//! sample. JPEG encoding runs only when `capture_snapshot` or
-//! `capture_preview` asks for that frame, and it does not run on the
-//! callback. `capture_snapshot` keeps the selected mode.
-//! `capture_preview` scales the same frame to fit in 1280×720 for the
-//! settings canvas. Focus, brightness, and contrast are stored by
-//! Settings and are not applied here.
+//! callback. Each sample is stored twice: a preview handle and a still
+//! handle. `capture_preview` takes the preview handle, so the next preview
+//! waits for a new sample. `capture_snapshot` clones the still handle and
+//! does not empty the preview slot. JPEG encoding runs only when a command
+//! asks for a frame, and it does not run on the callback or on the camera
+//! thread. `capture_snapshot` keeps the selected mode. `capture_preview`
+//! scales that frame to fit in 1280×720. Focus, brightness, and contrast
+//! are stored by Settings and are not applied here.
 
 use std::collections::VecDeque;
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -35,11 +36,34 @@ const RELEASE_WAIT: Duration = Duration::from_millis(250);
 const RESOURCE_CODE: u32 = 0xC00D_3704;
 
 struct Frame {
-    bytes: Vec<u8>,
+    bytes: Arc<Vec<u8>>,
     width: u32,
     height: u32,
     format: PixelFormat,
     fps: Option<f32>,
+}
+
+/// Latest sample, as two handles. Taking the preview handle does not clear
+/// the still, and copying the still does not clear the preview.
+struct FrameSlots {
+    preview: Option<Arc<Vec<u8>>>,
+    still: Option<Arc<Vec<u8>>>,
+}
+
+impl FrameSlots {
+    fn publish(&mut self, bytes: Vec<u8>) {
+        let frame = Arc::new(bytes);
+        self.still = Some(Arc::clone(&frame));
+        self.preview = Some(frame);
+    }
+
+    fn take_preview(&mut self) -> Option<Arc<Vec<u8>>> {
+        self.preview.take()
+    }
+
+    fn copy_still(&self) -> Option<Arc<Vec<u8>>> {
+        self.still.as_ref().map(Arc::clone)
+    }
 }
 
 enum Job {
@@ -50,6 +74,7 @@ enum Job {
     },
     Grab {
         index: u32,
+        still: bool,
         reply: Sender<Result<Frame, String>>,
     },
 }
@@ -92,8 +117,12 @@ fn camera_loop(incoming: mpsc::Receiver<Job>) {
             Job::Modes { index, reply } => {
                 let _ = reply.send(modes_for(&mut open, index));
             }
-            Job::Grab { index, reply } => {
-                let _ = reply.send(grab(&mut open, index));
+            Job::Grab {
+                index,
+                still,
+                reply,
+            } => {
+                let _ = reply.send(grab(&mut open, index, still));
             }
         }
     }
@@ -149,7 +178,7 @@ pub fn list_camera_modes(index: Option<u32>) -> Result<Value, String> {
 
 #[tauri::command]
 pub fn capture_snapshot(index: Option<u32>) -> Result<Value, String> {
-    let frame = match command_frame(index) {
+    let frame = match command_frame(index, true) {
         Ok(frame) => frame,
         Err(response) => return response,
     };
@@ -166,7 +195,7 @@ pub fn capture_snapshot(index: Option<u32>) -> Result<Value, String> {
 /// so a later `capture_snapshot` is still the full selected resolution.
 #[tauri::command]
 pub fn capture_preview(index: Option<u32>) -> Result<Value, String> {
-    let frame = match command_frame(index) {
+    let frame = match command_frame(index, false) {
         Ok(frame) => frame,
         Err(response) => return response,
     };
@@ -184,22 +213,26 @@ pub fn capture_preview(index: Option<u32>) -> Result<Value, String> {
     }
 }
 
-fn command_frame(index: Option<u32>) -> Result<Frame, Result<Value, String>> {
+fn command_frame(index: Option<u32>, still: bool) -> Result<Frame, Result<Value, String>> {
     let index = index.unwrap_or_else(saved_index);
     if index > 32 {
         return Err(Ok(fail("Camera index must be from 0 to 32.")));
     }
-    match fetch_frame(index) {
+    match fetch_frame(index, still) {
         Ok(frame) => Ok(frame),
         Err(message) if message == "Camera thread stopped." => Err(Err(message)),
         Err(message) => Err(Ok(fail(&message))),
     }
 }
 
-fn fetch_frame(index: u32) -> Result<Frame, String> {
+fn fetch_frame(index: u32, still: bool) -> Result<Frame, String> {
     let (tx, rx) = mpsc::channel();
     jobs()
-        .send(Job::Grab { index, reply: tx })
+        .send(Job::Grab {
+            index,
+            still,
+            reply: tx,
+        })
         .map_err(|_| "Camera thread stopped.".to_string())?;
     match rx.recv() {
         Ok(frame) => frame,
@@ -245,7 +278,7 @@ fn modes_for(open: &mut Option<session::Device>, index: u32) -> Result<Vec<Mode>
     session::probe_modes(index)
 }
 
-fn grab(open: &mut Option<session::Device>, index: u32) -> Result<Frame, String> {
+fn grab(open: &mut Option<session::Device>, index: u32, still: bool) -> Result<Frame, String> {
     let wanted = saved_resolution();
     let keep = open
         .as_ref()
@@ -256,14 +289,14 @@ fn grab(open: &mut Option<session::Device>, index: u32) -> Result<Frame, String>
         }
         *open = Some(session::open_device(index, wanted)?);
     }
-    match take_frame(open.as_ref().expect("camera was opened")) {
+    match take_frame(open.as_ref().expect("camera was opened"), still) {
         Ok(frame) => Ok(frame),
         Err(message) if is_resource(&message) => {
             if let Some(mut previous) = open.take() {
                 previous.shutdown();
             }
             *open = Some(session::open_device(index, wanted)?);
-            take_frame(open.as_ref().expect("camera was reopened"))
+            take_frame(open.as_ref().expect("camera was reopened"), still)
         }
         Err(message) => {
             if let Some(mut previous) = open.take() {
@@ -274,8 +307,12 @@ fn grab(open: &mut Option<session::Device>, index: u32) -> Result<Frame, String>
     }
 }
 
-fn take_frame(device: &session::Device) -> Result<Frame, String> {
-    let bytes = device.wait_frame(FIRST_FRAME_WAIT)?;
+fn take_frame(device: &session::Device, still: bool) -> Result<Frame, String> {
+    let bytes = if still {
+        device.copy_still(FIRST_FRAME_WAIT)?
+    } else {
+        device.wait_frame(FIRST_FRAME_WAIT)?
+    };
     let mode = device.mode();
     Ok(Frame {
         bytes,
@@ -980,7 +1017,7 @@ mod session {
         stop: AtomicBool,
         flush_done: AtomicBool,
         reader: Mutex<Option<IMFSourceReader>>,
-        frame: Mutex<Option<Vec<u8>>>,
+        slots: Mutex<super::FrameSlots>,
         frame_cv: Condvar,
         fps: Mutex<FpsMeter>,
         error: Mutex<Option<String>>,
@@ -992,17 +1029,21 @@ mod session {
                 stop: AtomicBool::new(false),
                 flush_done: AtomicBool::new(false),
                 reader: Mutex::new(None),
-                frame: Mutex::new(None),
+                slots: Mutex::new(super::FrameSlots {
+                    preview: None,
+                    still: None,
+                }),
                 frame_cv: Condvar::new(),
                 fps: Mutex::new(FpsMeter::new()),
                 error: Mutex::new(None),
             }
         }
 
-        /// One slot. The next sample replaces it, so a slow preview cannot
-        /// build a queue of frames behind the reader.
+        /// Replace both handles. The next sample overwrites them, so a slow
+        /// preview cannot build a queue behind the reader. The still handle
+        /// stays when the preview handle is taken.
         fn publish(&self, bytes: Vec<u8>) {
-            *lock(&self.frame) = Some(bytes);
+            lock(&self.slots).publish(bytes);
             lock(&self.fps).note(Instant::now());
             *lock(&self.error) = None;
             self.frame_cv.notify_all();
@@ -1112,12 +1153,27 @@ mod session {
             lock(&self.shared.fps).measured(Instant::now())
         }
 
-        pub(super) fn wait_frame(&self, timeout: Duration) -> Result<Vec<u8>, String> {
+        pub(super) fn wait_frame(&self, timeout: Duration) -> Result<Arc<Vec<u8>>, String> {
+            self.wait_slot(timeout, true)
+        }
+
+        /// Clone the still handle. This does not take the preview handle, so
+        /// a snapshot does not make the paced preview wait for another sample.
+        pub(super) fn copy_still(&self, timeout: Duration) -> Result<Arc<Vec<u8>>, String> {
+            self.wait_slot(timeout, false)
+        }
+
+        fn wait_slot(&self, timeout: Duration, preview: bool) -> Result<Arc<Vec<u8>>, String> {
             let deadline = Instant::now() + timeout;
-            let mut frame = lock(&self.shared.frame);
+            let mut slots = lock(&self.shared.slots);
             loop {
-                if frame.is_some() {
-                    return Ok(frame.take().unwrap_or_default());
+                let ready = if preview {
+                    slots.take_preview()
+                } else {
+                    slots.copy_still()
+                };
+                if let Some(bytes) = ready {
+                    return Ok(bytes);
                 }
                 if let Some(message) = lock(&self.shared.error).clone() {
                     return Err(message);
@@ -1129,10 +1185,15 @@ mod session {
                 let (next, wait) = self
                     .shared
                     .frame_cv
-                    .wait_timeout(frame, deadline.saturating_duration_since(now))
+                    .wait_timeout(slots, deadline.saturating_duration_since(now))
                     .unwrap_or_else(|err| err.into_inner());
-                frame = next;
-                if wait.timed_out() && frame.is_none() {
+                slots = next;
+                let empty = if preview {
+                    slots.preview.is_none()
+                } else {
+                    slots.still.is_none()
+                };
+                if wait.timed_out() && empty {
                     if let Some(message) = lock(&self.shared.error).clone() {
                         return Err(message);
                     }
@@ -1423,7 +1484,7 @@ mod session {
     }
 
     fn confirm_started(device: &mut Device) -> Result<(), String> {
-        match device.wait_frame(Duration::from_secs(2)) {
+        match device.copy_still(Duration::from_secs(2)) {
             Ok(_) => Ok(()),
             Err(message) if super::is_resource(&message) => {
                 device.shutdown();
@@ -1812,6 +1873,7 @@ mod session {
 
 #[cfg(not(windows))]
 mod session {
+    use std::sync::Arc;
     use std::time::Duration;
 
     use super::{Mode, Requested};
@@ -1842,7 +1904,11 @@ mod session {
             None
         }
 
-        pub(super) fn wait_frame(&self, _timeout: Duration) -> Result<Vec<u8>, String> {
+        pub(super) fn wait_frame(&self, _timeout: Duration) -> Result<Arc<Vec<u8>>, String> {
+            Err("Camera capture is only available on Windows.".to_string())
+        }
+
+        pub(super) fn copy_still(&self, _timeout: Duration) -> Result<Arc<Vec<u8>>, String> {
             Err("Camera capture is only available on Windows.".to_string())
         }
 
@@ -1888,6 +1954,27 @@ mod tests {
             fps_den,
             format,
         }
+    }
+
+    #[test]
+    fn snapshot_copies_the_still_and_leaves_the_preview_slot() {
+        let mut slots = FrameSlots {
+            preview: None,
+            still: None,
+        };
+        assert!(slots.copy_still().is_none());
+        assert!(slots.take_preview().is_none());
+        slots.publish(vec![1, 2, 3]);
+        let still = slots.copy_still().expect("still");
+        assert_eq!(still.as_slice(), &[1, 2, 3]);
+        let preview = slots.take_preview().expect("preview");
+        assert_eq!(preview.as_slice(), &[1, 2, 3]);
+        assert!(slots.take_preview().is_none());
+        let again = slots.copy_still().expect("still remains");
+        assert_eq!(again.as_slice(), &[1, 2, 3]);
+        slots.publish(vec![4]);
+        assert_eq!(slots.copy_still().expect("new still").as_slice(), &[4]);
+        assert_eq!(slots.take_preview().expect("new preview").as_slice(), &[4]);
     }
 
     #[test]

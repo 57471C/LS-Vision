@@ -22,6 +22,7 @@ type AuthMode = "windows" | "sql";
 type MssqlFields = { server: string; database: string; user: string };
 type SettingsSection = "camera" | "capture" | "training" | "database";
 type DetectRoi = { x: number; y: number; w: number; h: number };
+type BarcodeRoi = { x: number; y: number; width: number; height: number };
 
 const sectionOn =
 	"flex w-full flex-col items-center gap-1 border border-blue-500 bg-neutral-800 px-1 py-2 text-[10px] font-semibold uppercase tracking-wide text-neutral-100";
@@ -58,6 +59,13 @@ let roiW: number | null = null;
 let roiH: number | null = null;
 let roiNotice = "";
 let savingRoi = false;
+let barcodeRoi: BarcodeRoi | null = null;
+let barcodeX: number | null = null;
+let barcodeY: number | null = null;
+let barcodeW: number | null = null;
+let barcodeH: number | null = null;
+let barcodeNotice = "";
+let savingBarcodeRoi = false;
 let modelFiles: string[] = [];
 let modelName = "";
 let modelActive = "best.onnx";
@@ -235,6 +243,49 @@ function readRoiFields(): DetectRoi | null {
 	if (next.x < 0 || next.y < 0 || next.w < 0.01 || next.h < 0.01) return null;
 	if (next.w > 1 || next.h > 1) return null;
 	if (next.x + next.w > 1.0001 || next.y + next.h > 1.0001) return null;
+	return next;
+}
+
+function asBarcodeRoi(value: unknown): BarcodeRoi | null {
+	if (!value || typeof value !== "object") return null;
+	const row = value as Record<string, unknown>;
+	const x = Number(row.x);
+	const y = Number(row.y);
+	const width = Number(row.width);
+	const height = Number(row.height);
+	if (![x, y, width, height].every((part) => Number.isFinite(part))) return null;
+	if (width <= 0 || height <= 0) return null;
+	return { x, y, width, height };
+}
+
+function fillBarcodeRoi(value: BarcodeRoi | null) {
+	barcodeRoi = value;
+	barcodeX = value ? value.x : null;
+	barcodeY = value ? value.y : null;
+	barcodeW = value ? value.width : null;
+	barcodeH = value ? value.height : null;
+}
+
+function readBarcodeFields(): BarcodeRoi | null {
+	if (
+		barcodeX === null ||
+		barcodeY === null ||
+		barcodeW === null ||
+		barcodeH === null
+	) {
+		return null;
+	}
+	const next = {
+		x: round4(barcodeX),
+		y: round4(barcodeY),
+		width: round4(barcodeW),
+		height: round4(barcodeH),
+	};
+	if (next.x < 0 || next.y < 0 || next.width < 0.01 || next.height < 0.01)
+		return null;
+	if (next.width > 1 || next.height > 1) return null;
+	if (next.x + next.width > 1.0001 || next.y + next.height > 1.0001)
+		return null;
 	return next;
 }
 
@@ -596,6 +647,7 @@ async function loadRoi() {
 	try {
 		const data = await loadDocument();
 		fillRoi(asRoi(data.detectRoi));
+		fillBarcodeRoi(asBarcodeRoi(data.barcodeRoi));
 	} catch (err: unknown) {
 		roiNotice = invokeError(err, "Could not load the ROI");
 	}
@@ -750,6 +802,50 @@ function clearRoi() {
 		return;
 	}
 	void postRoi(null);
+}
+
+async function postBarcodeRoi(next: BarcodeRoi | null) {
+	savingBarcodeRoi = true;
+	barcodeNotice = "";
+	try {
+		const current = await loadDocument();
+		current.barcodeRoi = next;
+		await storeDocument(current);
+		fillBarcodeRoi(asBarcodeRoi(next));
+		barcodeNotice = "Saved";
+	} catch (err: unknown) {
+		barcodeNotice = invokeError(err, "Could not save the barcode ROI");
+	} finally {
+		savingBarcodeRoi = false;
+	}
+}
+
+function saveBarcodeRoi() {
+	const next = readBarcodeFields();
+	if (!next) {
+		barcodeNotice =
+			"Enter left, top, width, and height as fractions from 0 to 1. The region must be at least 0.01 by 0.01 and stay inside the image.";
+		return;
+	}
+	void postBarcodeRoi(next);
+}
+
+function clearBarcodeRoi() {
+	if (
+		barcodeRoi === null &&
+		barcodeX === null &&
+		barcodeY === null &&
+		barcodeW === null &&
+		barcodeH === null
+	) {
+		return;
+	}
+	if (barcodeRoi === null) {
+		fillBarcodeRoi(null);
+		barcodeNotice = "";
+		return;
+	}
+	void postBarcodeRoi(null);
 }
 
 async function saveSource() {
@@ -1987,7 +2083,7 @@ onDestroy(() => {
 						>
 							<fieldset class="flex flex-col gap-3">
 								<legend class="text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
-									ROI
+									Part detection
 								</legend>
 								<p class="text-sm text-neutral-400">
 									{#if roi}
@@ -2068,6 +2164,98 @@ onDestroy(() => {
 							</div>
 							{#if roiNotice}
 								<p class="text-sm text-neutral-200">{roiNotice}</p>
+							{/if}
+						</form>
+
+						<form
+							class="flex flex-col gap-4 border border-neutral-700 bg-neutral-900 p-4"
+							method="dialog"
+							novalidate
+							on:submit|preventDefault={saveBarcodeRoi}
+						>
+							<fieldset class="flex flex-col gap-3">
+								<legend class="text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+									Barcode
+								</legend>
+								<p class="text-sm text-neutral-400">
+									{#if barcodeRoi}
+										Barcode decode uses this region of the image.
+									{:else}
+										No region saved. Barcode decode uses the full frame.
+									{/if}
+									On the operator page, use Set barcode ROI to draw it on the live feed.
+								</p>
+								<div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
+									<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+										Left
+										<input
+											type="number"
+											class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
+											bind:value={barcodeX}
+											min="0"
+											max="1"
+											step="any"
+										/>
+									</label>
+									<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+										Top
+										<input
+											type="number"
+											class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
+											bind:value={barcodeY}
+											min="0"
+											max="1"
+											step="any"
+										/>
+									</label>
+									<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+										Width
+										<input
+											type="number"
+											class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
+											bind:value={barcodeW}
+											min="0"
+											max="1"
+											step="any"
+										/>
+									</label>
+									<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+										Height
+										<input
+											type="number"
+											class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
+											bind:value={barcodeH}
+											min="0"
+											max="1"
+											step="any"
+										/>
+									</label>
+								</div>
+							</fieldset>
+							<div class="flex flex-wrap items-center gap-2">
+								<button
+									type="submit"
+									class="inline-flex min-h-11 items-center border border-blue-500 bg-blue-600 px-4 text-sm font-semibold text-white disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
+									disabled={savingBarcodeRoi}
+								>
+									{savingBarcodeRoi ? "Saving..." : "Save"}
+								</button>
+								<button
+									type="button"
+									class="inline-flex min-h-11 items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100 disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
+									on:click={clearBarcodeRoi}
+									disabled={savingBarcodeRoi ||
+										(barcodeRoi === null &&
+											barcodeX === null &&
+											barcodeY === null &&
+											barcodeW === null &&
+											barcodeH === null)}
+								>
+									Clear barcode ROI
+								</button>
+							</div>
+							{#if barcodeNotice}
+								<p class="text-sm text-neutral-200">{barcodeNotice}</p>
 							{/if}
 						</form>
 					{:else if section === "training"}

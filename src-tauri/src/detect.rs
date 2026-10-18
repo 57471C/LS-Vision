@@ -1169,7 +1169,14 @@ fn detect_on_model(bytes: &[u8], path: &Path, roi: Option<&Roi>) -> Result<Value
 }
 
 #[tauri::command]
-pub fn detect_image(image: Option<String>) -> Result<Value, String> {
+pub async fn detect_image(image: Option<String>) -> Result<Value, String> {
+    let result = tauri::async_runtime::spawn_blocking(move || detect_image_now(image))
+        .await
+        .map_err(|_| "Detect failed".to_string())?;
+    result
+}
+
+fn detect_image_now(image: Option<String>) -> Result<Value, String> {
     let root = match local_config::project_root() {
         Ok(root) => root,
         Err(message) => return Ok(failure(&message)),

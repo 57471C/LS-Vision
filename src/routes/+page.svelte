@@ -654,6 +654,12 @@ function sleep(ms: number): Promise<void> {
 	});
 }
 
+function yieldToPaint(): Promise<void> {
+	return new Promise((resolve) => {
+		requestAnimationFrame(() => resolve());
+	});
+}
+
 function frameSurface(): {
 	node: HTMLElement;
 	width: number;
@@ -702,18 +708,19 @@ async function drawLiveFrame(url: string): Promise<boolean> {
 	}
 }
 
-// The live view uses the same latest-frame preview as Settings. Decode and
-// detection still call capture_snapshot for a full-resolution frame.
+// The live view keeps calling capture_preview while a still is taken.
+// capture_snapshot reads a separate still handle, and detection does not
+// stop this loop.
 async function runLive(gen: number) {
 	try {
 		while (gen === liveGeneration && pageAlive) {
-			if (!feedOn || snapshot || !cameraFeedOn) return;
+			if (!feedOn || !cameraFeedOn) return;
 			const started = performance.now();
 			const index = Number(cameraIndex);
 			try {
 				const body = await invoke<WatchBody>("capture_preview", { index });
 				if (gen !== liveGeneration || !pageAlive) return;
-				if (!feedOn || snapshot || index !== Number(cameraIndex)) continue;
+				if (!feedOn || index !== Number(cameraIndex)) continue;
 				if (body.status === "fail" || !body.image) {
 					liveMessage = body.message || "Camera did not open.";
 					await sleep(400);
@@ -746,7 +753,7 @@ async function runLive(gen: number) {
 }
 
 function startLive() {
-	if (snapshot || !feedOn || !cameraFeedOn) return;
+	if (!feedOn || !cameraFeedOn) return;
 	if (liveRunning) return;
 	const gen = liveGeneration;
 	liveRunning = true;
@@ -795,6 +802,7 @@ async function watchFeed() {
 		if (testMode) return;
 		const frame = await readFrame(index);
 		if (!stillWatches(index) || !frame.image) return;
+		await yieldToPaint();
 		const decoded = await decodeCameraImage(frame.image);
 		const code = decodedText(decoded);
 		if (!stillWatches(index) || !code) return;
@@ -804,8 +812,9 @@ async function watchFeed() {
 		barcode = bomSource === "api" ? code : kitCode;
 		result = view;
 		storeBom(view);
+		await yieldToPaint();
 		const generation = holdStill(frame.image, kitCode);
-		await runDetect(generation, { image: frame.image });
+		void runDetect(generation, { image: frame.image });
 	} catch {
 		// A missed poll leaves the last still and the last BoM result.
 	} finally {
@@ -1853,6 +1862,7 @@ async function decodeAndInspect() {
 			};
 			return;
 		}
+		await yieldToPaint();
 		const decoded = await decodeCameraImage(frame.image);
 		if (!pageAlive) return;
 		const code = decodedText(decoded);
@@ -1870,8 +1880,9 @@ async function decodeAndInspect() {
 			const kitCode = view.kitCode || code;
 			barcode = bomSource === "api" ? code : kitCode;
 			storeBom(view);
+			await yieldToPaint();
 			const generation = holdStill(frame.image, kitCode);
-			await runDetect(generation, { image: frame.image });
+			void runDetect(generation, { image: frame.image });
 		} else {
 			barcode = code;
 			dropBom();
@@ -2065,6 +2076,19 @@ async function decodeAndInspect() {
 							? `left:${zoom.left}px;top:${zoom.top}px;width:${zoom.width}px;height:${zoom.height}px;`
 							: ""}
 					>
+						{#if feedOn && cameraFeedOn}
+							<canvas
+								bind:this={liveCanvas}
+								class="h-full w-full {zoom ? 'object-fill' : 'object-contain'}"
+								class:invisible={Boolean(snapshot) || !livePainted}
+								aria-label="Camera feed"
+							></canvas>
+							{#if !snapshot && (liveMessage || !livePainted)}
+								<p class="absolute inset-0 flex items-center justify-center px-6 text-center text-sm text-neutral-300">
+									{liveMessage || "Opening camera…"}
+								</p>
+							{/if}
+						{/if}
 						{#if snapshot}
 							<img
 								bind:this={paneImage}
@@ -2072,21 +2096,11 @@ async function decodeAndInspect() {
 								alt={snapshot.detected
 									? `Detected parts for kit ${snapshot.kitCode}`
 									: `Snapshot of kit ${snapshot.kitCode}`}
-								class="h-full w-full {zoom ? 'object-fill' : 'object-contain'}"
+								class="{feedOn && cameraFeedOn
+									? 'absolute inset-0'
+									: ''} h-full w-full {zoom ? 'object-fill' : 'object-contain'}"
 								on:load={rememberPaneSize}
 							/>
-						{:else if cameraFeedOn}
-							<canvas
-								bind:this={liveCanvas}
-								class="h-full w-full {zoom ? 'object-fill' : 'object-contain'}"
-								class:invisible={!livePainted}
-								aria-label="Camera feed"
-							></canvas>
-							{#if liveMessage || !livePainted}
-								<p class="absolute inset-0 flex items-center justify-center px-6 text-center text-sm text-neutral-300">
-									{liveMessage || "Opening camera…"}
-								</p>
-							{/if}
 						{/if}
 						{#if (snapshot || cameraFeedOn) && paneWidth > 0 && paneHeight > 0 && !drawing && detectRoi}
 							{@const x = detectRoi.x * paneWidth}
