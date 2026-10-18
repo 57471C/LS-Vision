@@ -69,6 +69,7 @@ fn default_config() -> Value {
         "detectRoi": null,
         "barcodeRoi": null,
         "model": "",
+        "inferenceEp": "directml",
         "camera": {
             "index": 0,
             "resolution": "",
@@ -145,7 +146,7 @@ fn replace_file(tmp: &Path, path: &Path) -> Result<(), String> {
     })
 }
 
-fn save_document(root: &Path, config: &Value) -> Result<(), String> {
+pub(crate) fn save_document(root: &Path, config: &Value) -> Result<(), String> {
     write_json_file(&config_file(root), config)
 }
 
@@ -406,6 +407,7 @@ mod tests {
         let document = load_document(project.root()).unwrap();
         assert_eq!(document["source"], "json");
         assert_eq!(document["model"], "");
+        assert_eq!(document["inferenceEp"], "directml");
         assert_eq!(document["scanSeconds"], 8);
         assert!(!config_file(project.root()).exists());
     }

@@ -3,6 +3,7 @@ mod bom;
 mod bom_sql;
 mod camera;
 mod detect;
+mod inference_ep;
 mod local_config;
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
@@ -31,7 +32,9 @@ pub fn run() {
             camera::list_camera_modes,
             camera::capture_snapshot,
             camera::capture_preview,
-            detect::detect_image
+            detect::detect_image,
+            inference_ep::inference_status,
+            inference_ep::set_inference_ep
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

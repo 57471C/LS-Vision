@@ -10,7 +10,7 @@ LS-Vision is an early-stage Tauri 2 + SvelteKit desktop app for bench-top kit ve
 
 - Frontend: SvelteKit routes under `src/routes/`. Operator UI starts at `src/routes/+page.svelte`.
 - Rust/Tauri backend: `src-tauri/`.
-- Vision: `.onnx` detection runs in Rust (`detect_image`) and keeps the same JSON the page already draws. Camera snapshots (`capture_snapshot`), barcode decode, and BoM lookup (JSON, API, and MSSQL) also run in Rust. The app does not spawn `vision/main.py`. That file remains; Phase 3 in `plan.md` is the leftover cleanup. A `.pt` model warns instead of detecting.
+- Vision: `.onnx` detection runs in Rust (`detect_image`) and keeps the same JSON the page already draws. Settings lists the ONNX execution providers this PC can run (CPU, and DirectML or CUDA when that runtime and GPU are present). The saved `inferenceEp` is used when the session is created. A provider that fails to start falls back to CPU. Camera snapshots (`capture_snapshot`), barcode decode, and BoM lookup (JSON, API, and MSSQL) also run in Rust. The app does not spawn `vision/main.py`. That file remains; Phase 3 in `plan.md` is the leftover cleanup. A `.pt` model warns instead of detecting.
 - BoM lookup should stay behind a simple interface so the source (JSON/CSV vs MSSQL) can be swapped via settings.
 
 ## Conventions

@@ -920,6 +920,7 @@ async function connectCameras() {
 
 async function boot() {
 	if (!pageAlive) return;
+	void invoke("inference_status").catch(() => undefined);
 	void loadErp();
 	void loadScan();
 	void loadTestMode();

@@ -22,6 +22,7 @@
 	"detectRoi": null,
 	"barcodeRoi": null,
 	"model": "best.pt",
+	"inferenceEp": "directml",
 	"camera": {
 		"index": 0,
 		"resolution": "",

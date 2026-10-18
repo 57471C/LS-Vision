@@ -63,6 +63,14 @@ let modelName = "";
 let modelActive = "best.onnx";
 let modelNotice = "";
 let savingModel = false;
+let inferenceProviders: string[] = ["cpu"];
+let inferenceEp = "cpu";
+let inferenceActive = "cpu";
+let inferenceNotice = "";
+let inferenceReady = false;
+let savingInference = false;
+let inferenceGeneration = 0;
+let inferenceChain: Promise<void> = Promise.resolve();
 type CameraMode = {
 	id: string;
 	width: number;
@@ -387,6 +395,101 @@ async function loadModel() {
 	}
 }
 
+function inferenceLabel(id: string): string {
+	if (id === "directml") return "DirectML";
+	if (id === "cuda") return "CUDA";
+	return "CPU";
+}
+
+function applyInference(data: {
+	providers?: unknown;
+	selected?: unknown;
+	active?: unknown;
+	message?: unknown;
+}) {
+	const providers = Array.isArray(data.providers)
+		? data.providers.filter(
+				(item): item is string =>
+					item === "cpu" || item === "directml" || item === "cuda",
+			)
+		: [];
+	inferenceProviders = providers.length > 0 ? providers : ["cpu"];
+	const selected = typeof data.selected === "string" ? data.selected : "";
+	inferenceEp = inferenceProviders.includes(selected)
+		? selected
+		: inferenceProviders[0];
+	const active = typeof data.active === "string" ? data.active : "";
+	inferenceActive = inferenceProviders.includes(active)
+		? active
+		: inferenceEp;
+	inferenceNotice = typeof data.message === "string" ? data.message : "";
+	inferenceReady = true;
+}
+
+async function loadInference() {
+	const generation = inferenceGeneration;
+	try {
+		const data = await invokeRust<{
+			providers?: unknown;
+			selected?: unknown;
+			active?: unknown;
+			message?: unknown;
+		}>("inference_status");
+		if (generation !== inferenceGeneration || savingInference) return;
+		applyInference(data);
+	} catch (err: unknown) {
+		if (generation !== inferenceGeneration || savingInference) return;
+		inferenceProviders = ["cpu"];
+		inferenceEp = "cpu";
+		inferenceActive = "cpu";
+		inferenceNotice = invokeError(err, "Could not list inference providers.");
+		inferenceReady = true;
+	}
+}
+
+function onInferenceChange() {
+	const choice = inferenceEp;
+	const generation = ++inferenceGeneration;
+	inferenceChain = inferenceChain
+		.catch(() => undefined)
+		.then(() => persistInference(choice, generation));
+}
+
+async function persistInference(choice: string, generation: number) {
+	savingInference = true;
+	inferenceNotice = "Starting the session...";
+	try {
+		const data = await invokeRust<{
+			providers?: unknown;
+			selected?: unknown;
+			active?: unknown;
+			message?: unknown;
+		}>("set_inference_ep", { provider: choice });
+		if (generation !== inferenceGeneration) return;
+		applyInference(data);
+	} catch (err: unknown) {
+		if (generation !== inferenceGeneration) return;
+		const message = invokeError(err, "Could not save the inference provider.");
+		try {
+			const data = await invokeRust<{
+				providers?: unknown;
+				selected?: unknown;
+				active?: unknown;
+				message?: unknown;
+			}>("inference_status");
+			if (generation !== inferenceGeneration) return;
+			applyInference(data);
+		} catch {
+			inferenceProviders = inferenceProviders.includes(choice)
+				? inferenceProviders
+				: ["cpu"];
+		}
+		inferenceNotice = message;
+	} finally {
+		if (generation === inferenceGeneration) savingInference = false;
+	}
+}
+
 async function saveModel() {
 	savingModel = true;
 	modelNotice = "";
@@ -474,6 +577,7 @@ function unlock() {
 	unlocked = true;
 	sessionStorage.setItem(UNLOCK_KEY, "1");
 	loadSource();
+	void loadInference();
 	if (section === "camera") void loadCameraSettings();
 	watchSidecar();
 }
@@ -1312,6 +1416,7 @@ async function openPreview() {
 }
 
 onMount(() => {
+	void loadInference();
 	if (!unlocked) {
 		void loadModel();
 		return;
@@ -1337,9 +1442,17 @@ onDestroy(() => {
 
 <div class="settings-root flex h-dvh max-h-dvh flex-col overflow-hidden overscroll-none bg-neutral-950 text-neutral-100">
 	<header class="flex shrink-0 items-center justify-between gap-3 border-b border-neutral-800 bg-neutral-900 px-4 py-2">
-		<div class="flex items-baseline gap-3">
+		<div class="flex min-w-0 items-baseline gap-3">
 			<h1 class="text-lg font-semibold tracking-tight">Settings</h1>
 			<p class="text-xs font-medium uppercase tracking-widest text-neutral-500">Admin</p>
+			{#if unlocked && inferenceReady}
+				<p
+					class="truncate text-xs font-medium uppercase tracking-widest text-neutral-300"
+					title={inferenceNotice || undefined}
+				>
+					Inference {inferenceLabel(inferenceActive)}
+				</p>
+			{/if}
 		</div>
 		<div class="flex items-center gap-2">
 			{#if unlocked}
@@ -1939,6 +2052,40 @@ onDestroy(() => {
 							</button>
 							{#if modelNotice}
 								<p class="text-sm text-neutral-200">{modelNotice}</p>
+							{/if}
+						</form>
+						<form
+							class="flex flex-col gap-4 border border-neutral-700 bg-neutral-900 p-4"
+							on:submit|preventDefault={() => undefined}
+						>
+							<fieldset class="flex flex-col gap-3">
+								<legend class="text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+									Inference
+								</legend>
+								<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+									Inference EP
+									<select
+										class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100 disabled:text-neutral-500"
+										bind:value={inferenceEp}
+										on:change={onInferenceChange}
+										disabled={savingInference}
+									>
+										{#each inferenceProviders as provider (provider)}
+											<option value={provider}>{inferenceLabel(provider)}</option>
+										{/each}
+									</select>
+								</label>
+								<p class="text-sm text-neutral-200">
+									Active: {inferenceReady
+										? inferenceLabel(inferenceActive)
+										: "Checking..."}
+								</p>
+								<p class="text-sm text-neutral-400">
+									CPU is always listed. DirectML and CUDA are listed only when this PC can run them.
+								</p>
+							</fieldset>
+							{#if inferenceNotice}
+								<p class="text-sm text-neutral-200">{inferenceNotice}</p>
 							{/if}
 						</form>
 					{:else}

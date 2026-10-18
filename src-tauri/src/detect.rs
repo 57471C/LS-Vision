@@ -19,6 +19,7 @@ use image::{ExtendedColorType, ImageEncoder};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::inference_ep::{self, Provider};
 use crate::local_config;
 
 const CONF_THRESHOLD: f32 = 0.25;
@@ -61,6 +62,7 @@ struct CacheKey {
     path: PathBuf,
     mtime_ns: u128,
     len: u64,
+    requested: Provider,
 }
 
 struct LoadedModel {
@@ -68,8 +70,12 @@ struct LoadedModel {
     names: Vec<String>,
     image_size: usize,
     end_to_end: bool,
+    requested: Provider,
+    provider: Provider,
     session: ort::session::Session,
 }
+
+static MODEL_CACHE: Mutex<Option<LoadedModel>> = Mutex::new(None);
 
 fn failure(message: &str) -> Value {
     json!({
@@ -789,7 +795,7 @@ fn file_name(path: &Path) -> String {
         .to_string()
 }
 
-fn cache_key(path: &Path) -> Result<CacheKey, String> {
+fn cache_key(path: &Path, requested: Provider) -> Result<CacheKey, String> {
     let meta = std::fs::metadata(path).map_err(|err| {
         format!(
             "{} failed to load: {}",
@@ -807,11 +813,12 @@ fn cache_key(path: &Path) -> Result<CacheKey, String> {
         path: path.to_path_buf(),
         mtime_ns,
         len: meta.len(),
+        requested,
     })
 }
 
-/// Cargo tests run from `target/debug/deps`. `copy-dylibs` puts `onnxruntime.dll`
-/// in `target/debug` when Windows will not symlink into `deps`.
+/// Cargo tests run from `target/debug/deps`. `copy-dylibs` puts ONNX Runtime next
+/// to `target/debug` when Windows will not symlink into `deps`.
 fn prepare_runtime() {
     let Ok(exe) = std::env::current_exe() else {
         return;
@@ -819,19 +826,54 @@ fn prepare_runtime() {
     let Some(exe_dir) = exe.parent() else {
         return;
     };
-    if exe_dir.join("onnxruntime.dll").exists() {
-        return;
-    }
     let Some(parent) = exe_dir.parent() else {
         return;
     };
-    for name in ["onnxruntime.dll", "onnxruntime_providers_shared.dll"] {
-        let source = parent.join(name);
+    if !parent.join("onnxruntime.dll").is_file() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !runtime_dll(name) {
+            continue;
+        }
         let dest = exe_dir.join(name);
-        if source.exists() && !dest.exists() {
-            let _ = std::fs::copy(&source, &dest);
+        if !dest.exists() {
+            let _ = std::fs::copy(&path, &dest);
         }
     }
+}
+
+fn runtime_dll(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if !lower.ends_with(".dll") {
+        return false;
+    }
+    [
+        "onnxruntime",
+        "directml",
+        "cublas",
+        "cudart",
+        "cudnn",
+        "cufft",
+        "curand",
+        "nvrtc",
+        "nvinfer",
+        "nvonnxparser",
+        "zlibwapi",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix))
+}
+
+pub(crate) fn ensure_runtime() -> bool {
+    runtime().is_ok()
 }
 
 fn runtime() -> Result<ort::environment::Environment, String> {
@@ -864,14 +906,52 @@ fn input_image_size(session: &ort::session::Session) -> usize {
     DEFAULT_IMAGE_SIZE
 }
 
-fn load_model(path: &Path, key: CacheKey) -> Result<LoadedModel, String> {
+fn execution_provider(provider: Provider) -> ort::ep::ExecutionProviderDispatch {
+    match provider {
+        Provider::DirectMl => ort::ep::DirectML::default().build(),
+        Provider::Cuda => ort::ep::CUDA::default().build(),
+        Provider::Cpu => ort::ep::CPU::default().build(),
+    }
+}
+
+fn open_session(
+    env: &ort::environment::Environment,
+    path: &Path,
+    provider: Provider,
+) -> Result<ort::session::Session, String> {
     let name = file_name(path);
-    let env = runtime().map_err(|err| format!("{name} failed to load: {}", short_error(&err)))?;
-    let mut builder = ort::session::Session::builder(&env)
+    let builder = ort::session::Session::builder(env)
         .map_err(|err| format!("{name} failed to load: {}", short_error(&err.to_string())))?;
-    let session = builder
-        .commit_from_file(path)
-        .map_err(|err| format!("{name} failed to load: {}", short_error(&err.to_string())))?;
+    let mut builder = if provider == Provider::Cpu {
+        builder
+    } else {
+        builder
+            .with_execution_providers([execution_provider(provider).error_on_failure()])
+            .map_err(|err| {
+                format!(
+                    "{name} failed to load with {}: {}",
+                    provider.label(),
+                    short_error(&err.to_string())
+                )
+            })?
+    };
+    builder.commit_from_file(path).map_err(|err| {
+        format!(
+            "{name} failed to load with {}: {}",
+            provider.label(),
+            short_error(&err.to_string())
+        )
+    })
+}
+
+fn finish_model(
+    path: &Path,
+    key: CacheKey,
+    requested: Provider,
+    provider: Provider,
+    session: ort::session::Session,
+) -> Result<LoadedModel, String> {
+    let name = file_name(path);
     let (names, end_to_end) = {
         let metadata = session
             .metadata()
@@ -887,30 +967,96 @@ fn load_model(path: &Path, key: CacheKey) -> Result<LoadedModel, String> {
         (names, end_to_end)
     };
     let image_size = input_image_size(&session);
+    let message = if provider == requested {
+        String::new()
+    } else {
+        format!(
+            "{} did not start. Using {}.",
+            requested.label(),
+            provider.label()
+        )
+    };
+    inference_ep::remember(requested, provider, message);
     Ok(LoadedModel {
         key,
         names,
         image_size,
         end_to_end,
+        requested,
+        provider,
         session,
     })
+}
+
+fn load_model(path: &Path, key: CacheKey, requested: Provider) -> Result<LoadedModel, String> {
+    let env = runtime()?;
+    match open_session(&env, path, requested) {
+        Ok(session) => finish_model(path, key, requested, requested, session),
+        Err(err) if requested != Provider::Cpu => {
+            let session = open_session(&env, path, Provider::Cpu)
+                .map_err(|cpu_err| format!("{err} {cpu_err}"))?;
+            let mut model = finish_model(path, key, requested, Provider::Cpu, session)?;
+            model.key.requested = requested;
+            inference_ep::remember(
+                requested,
+                Provider::Cpu,
+                format!(
+                    "{} did not start ({}). Using CPU.",
+                    requested.label(),
+                    short_error(&err)
+                ),
+            );
+            Ok(model)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 fn with_model<T>(
     path: &Path,
     run: impl FnOnce(&mut LoadedModel) -> Result<T, String>,
 ) -> Result<T, String> {
-    static CACHE: Mutex<Option<LoadedModel>> = Mutex::new(None);
-    let mut guard = CACHE.lock().unwrap_or_else(|err| err.into_inner());
-    let key = cache_key(path)?;
+    let mut guard = MODEL_CACHE.lock().unwrap_or_else(|err| err.into_inner());
+    let requested = inference_ep::selected_provider();
+    let key = cache_key(path, requested)?;
     let stale = guard.as_ref().is_none_or(|engine| engine.key != key);
     if stale {
-        *guard = Some(load_model(path, key)?);
+        *guard = Some(load_model(path, key, requested)?);
     }
     let model = guard
         .as_mut()
         .ok_or_else(|| "YOLO model is not loaded".to_string())?;
     run(model)
+}
+
+/// Drop the cached session and load the active `.onnx` model with the saved provider.
+pub(crate) fn reload_session() -> Result<(), String> {
+    {
+        let mut guard = MODEL_CACHE.lock().unwrap_or_else(|err| err.into_inner());
+        *guard = None;
+    }
+    let requested = inference_ep::selected_provider();
+    let Ok(root) = local_config::project_root() else {
+        inference_ep::remember(requested, requested, "");
+        return Ok(());
+    };
+    let name = match local_config::configured_model_name(&root) {
+        Ok(name) => name,
+        Err(_) => {
+            inference_ep::remember(requested, requested, "");
+            return Ok(());
+        }
+    };
+    if !name.to_ascii_lowercase().ends_with(".onnx") {
+        inference_ep::remember(requested, requested, "");
+        return Ok(());
+    }
+    let path = local_config::vision_models_dir(&root).join(&name);
+    if !path.is_file() {
+        inference_ep::remember(requested, requested, "");
+        return Ok(());
+    }
+    with_model(&path, |_| Ok(()))
 }
 
 fn detect_view(
@@ -937,6 +1083,37 @@ fn detect_view(
     ))
 }
 
+fn infer_detections(
+    model: &mut LoadedModel,
+    data: Vec<f32>,
+    image_size: usize,
+    view_w: i32,
+    view_h: i32,
+    origin_x: i32,
+    origin_y: i32,
+) -> Result<Vec<Detection>, String> {
+    let tensor = ort::value::Tensor::from_array(([1usize, 3, image_size, image_size], data))
+        .map_err(|err| format!("Detect failed: {}", short_error(&err.to_string())))?;
+    let outputs = model
+        .session
+        .run(ort::inputs![tensor])
+        .map_err(|err| format!("Detect failed: {}", short_error(&err.to_string())))?;
+    let (shape, values) = outputs[0]
+        .try_extract_tensor::<f32>()
+        .map_err(|err| format!("Detect failed: {}", short_error(&err.to_string())))?;
+    detections_from_output(
+        values,
+        shape,
+        &model.names,
+        model.end_to_end,
+        view_w,
+        view_h,
+        image_size as i32,
+        origin_x,
+        origin_y,
+    )
+}
+
 fn run_model(
     path: &Path,
     rgb: &[u8],
@@ -948,28 +1125,36 @@ fn run_model(
     let (data, view_w, view_h, origin_x, origin_y) =
         detect_view(rgb, width, height, roi, image_size)?;
     with_model(path, |model| {
-        let names = model.names.clone();
-        let end_to_end = model.end_to_end;
-        let tensor = ort::value::Tensor::from_array(([1usize, 3, image_size, image_size], data))
-            .map_err(|err| format!("Detect failed: {}", short_error(&err.to_string())))?;
-        let outputs = model
-            .session
-            .run(ort::inputs![tensor])
-            .map_err(|err| format!("Detect failed: {}", short_error(&err.to_string())))?;
-        let (shape, values) = outputs[0]
-            .try_extract_tensor::<f32>()
-            .map_err(|err| format!("Detect failed: {}", short_error(&err.to_string())))?;
-        detections_from_output(
-            values,
-            shape,
-            &names,
-            end_to_end,
-            view_w,
-            view_h,
-            image_size as i32,
-            origin_x,
-            origin_y,
-        )
+        let retry = if model.provider == Provider::Cpu {
+            None
+        } else {
+            Some(data.clone())
+        };
+        match infer_detections(model, data, image_size, view_w, view_h, origin_x, origin_y) {
+            Ok(found) => Ok(found),
+            Err(message) => {
+                let Some(retry) = retry else {
+                    return Err(message);
+                };
+                let failed = model.provider;
+                let env = runtime()?;
+                model.session = open_session(&env, path, Provider::Cpu)
+                    .map_err(|cpu_err| format!("{message} {cpu_err}"))?;
+                model.provider = Provider::Cpu;
+                let detail = message
+                    .strip_prefix("Detect failed: ")
+                    .unwrap_or(message.as_str());
+                inference_ep::remember(
+                    model.requested,
+                    Provider::Cpu,
+                    format!(
+                        "{} failed while detecting ({detail}). Using CPU.",
+                        failed.label()
+                    ),
+                );
+                infer_detections(model, retry, image_size, view_w, view_h, origin_x, origin_y)
+            }
+        }
     })
 }
 
