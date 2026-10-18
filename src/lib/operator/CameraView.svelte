@@ -1,25 +1,27 @@
 <script lang="ts">
 // biome-ignore-all lint/correctness/noUnusedVariables: Biome 2.4 does not treat Svelte template references as uses
 
+import { useOperator } from "$lib/stores/operator";
+
+const {
+	barcodeOverlay,
+	cameraFeedOn,
+	camerasMissing,
+	onRoiPointerDown,
+	onRoiPointerMove,
+	onRoiPointerUp,
+	operator,
+	refs,
+	rememberPaneSize,
+	resumeLiveFeed,
+	zoom,
+} = useOperator();
+
 type SnapshotView = {
 	kitCode: string;
 	image: string;
 	takenAt: string;
 	detected?: boolean;
-};
-
-type DetectRoi = {
-	x: number;
-	y: number;
-	w: number;
-	h: number;
-};
-
-type BarcodeRoi = {
-	x: number;
-	y: number;
-	width: number;
-	height: number;
 };
 
 type Detection = {
@@ -58,51 +60,12 @@ const LABEL_FONT = 12;
 const LABEL_PAD_X = 4;
 const LABEL_PAD_Y = 3;
 
-export let paneFrame: HTMLElement | null = null;
-export let liveCanvas: HTMLCanvasElement | undefined = undefined;
-export let paneImage: HTMLImageElement | null = null;
-export let snapshot: SnapshotView | null = null;
-export let feedOn = false;
-export let cameraFeedOn = false;
-export let camerasMissing = false;
-export let camerasReady = false;
-export let liveMessage = "";
-export let livePainted = false;
-export let zoom: {
-	left: number;
-	top: number;
-	width: number;
-	height: number;
-} | null = null;
-export let paneWidth = 0;
-export let paneHeight = 0;
-export let frameWidth = 0;
-export let frameHeight = 0;
-export let detectRoi: DetectRoi | null = null;
-export let drawing = false;
-export let barcodeDrawing = false;
-export let barcodeOverlay: BarcodeRoi | null = null;
-export let detections: Detection[] = [];
-export let detectState: "idle" | "running" | "done" = "idle";
-export let draftMark: {
-	left: number;
-	top: number;
-	width: number;
-	height: number;
-} | null = null;
-export let roiMessage = "";
-export let onImageLoad: (image: HTMLImageElement | null) => void = () => {};
-export let onResume: () => void = () => {};
-export let onPointerDown: (event: PointerEvent) => void = () => {};
-export let onPointerMove: (event: PointerEvent) => void = () => {};
-export let onPointerUp: (event: PointerEvent) => void = () => {};
-
 function imageLoaded(event: Event) {
 	const image =
 		event.currentTarget instanceof HTMLImageElement
 			? event.currentTarget
 			: null;
-	onImageLoad(image);
+	rememberPaneSize(image);
 }
 
 function colorForIc(ic: string): string {
@@ -196,64 +159,64 @@ function detectionMarks(
 <section class="flex min-h-0 min-w-0 flex-col overflow-hidden border border-neutral-700 bg-black">
 	<div class="flex shrink-0 items-center justify-between border-b border-neutral-800 px-3 py-1.5">
 		<h2 class="text-[11px] font-semibold uppercase tracking-widest text-neutral-500">
-			{snapshot ? "Snapshot" : "Camera"}
+			{$operator.snapshot ? "Snapshot" : "Camera"}
 		</h2>
-		{#if roiMessage}
-			<p class="text-xs text-amber-200">{roiMessage}</p>
-		{:else if snapshot}
+		{#if $operator.roiMessage}
+			<p class="text-xs text-amber-200">{$operator.roiMessage}</p>
+		{:else if $operator.snapshot}
 			<p class="text-xs text-amber-200">Automatic stream is stopped</p>
 		{/if}
 	</div>
-	<div bind:this={paneFrame} class="relative min-h-0 flex-1 overflow-hidden">
-		{#if snapshot || (feedOn && cameraFeedOn)}
+	<div bind:this={refs.paneFrame} class="relative min-h-0 flex-1 overflow-hidden">
+		{#if $operator.snapshot || ($operator.feedOn && $cameraFeedOn)}
 			<div
-				class="absolute {zoom ? '' : 'inset-0'}"
-				style={zoom
-					? `left:${zoom.left}px;top:${zoom.top}px;width:${zoom.width}px;height:${zoom.height}px;`
+				class="absolute {$zoom ? '' : 'inset-0'}"
+				style={$zoom
+					? `left:${$zoom.left}px;top:${$zoom.top}px;width:${$zoom.width}px;height:${$zoom.height}px;`
 					: ""}
 			>
-				{#if feedOn && cameraFeedOn}
+				{#if $operator.feedOn && $cameraFeedOn}
 					<canvas
-						bind:this={liveCanvas}
-						class="h-full w-full {zoom ? 'object-fill' : 'object-contain'}"
-						class:invisible={Boolean(snapshot) || !livePainted}
+						bind:this={refs.liveCanvas}
+						class="h-full w-full {$zoom ? 'object-fill' : 'object-contain'}"
+						class:invisible={Boolean($operator.snapshot) || !$operator.livePainted}
 						aria-label="Camera feed"
 					></canvas>
-					{#if !snapshot && (liveMessage || !livePainted)}
+					{#if !$operator.snapshot && ($operator.liveMessage || !$operator.livePainted)}
 						<p class="absolute inset-0 flex items-center justify-center px-6 text-center text-sm text-neutral-300">
-							{liveMessage || "Opening camera…"}
+							{$operator.liveMessage || "Opening camera…"}
 						</p>
 					{/if}
 				{/if}
-				{#if snapshot}
+				{#if $operator.snapshot}
 					<img
-						bind:this={paneImage}
-						src={snapshot.image}
-						alt={snapshot.detected
-							? `Detected parts for kit ${snapshot.kitCode}`
-							: `Snapshot of kit ${snapshot.kitCode}`}
-						class="{feedOn && cameraFeedOn
+						bind:this={refs.paneImage}
+						src={$operator.snapshot.image}
+						alt={$operator.snapshot.detected
+							? `Detected parts for kit ${$operator.snapshot.kitCode}`
+							: `Snapshot of kit ${$operator.snapshot.kitCode}`}
+						class="{$operator.feedOn && $cameraFeedOn
 							? 'absolute inset-0'
-							: ''} h-full w-full {zoom ? 'object-fill' : 'object-contain'}"
+							: ''} h-full w-full {$zoom ? 'object-fill' : 'object-contain'}"
 						on:load={imageLoaded}
 					/>
 				{/if}
-				{#if (snapshot || cameraFeedOn) && paneWidth > 0 && paneHeight > 0 && !drawing && detectRoi}
-					{@const x = detectRoi.x * paneWidth}
-					{@const y = detectRoi.y * paneHeight}
-					{@const w = detectRoi.w * paneWidth}
-					{@const h = detectRoi.h * paneHeight}
+				{#if ($operator.snapshot || $cameraFeedOn) && $operator.paneWidth > 0 && $operator.paneHeight > 0 && !$operator.drawing && $operator.detectRoi}
+					{@const x = $operator.detectRoi.x * $operator.paneWidth}
+					{@const y = $operator.detectRoi.y * $operator.paneHeight}
+					{@const w = $operator.detectRoi.w * $operator.paneWidth}
+					{@const h = $operator.detectRoi.h * $operator.paneHeight}
 					<svg
 						class="pointer-events-none absolute inset-0 z-10 h-full w-full"
-						viewBox="0 0 {paneWidth} {paneHeight}"
-						preserveAspectRatio={zoom ? "none" : "xMidYMid meet"}
+						viewBox="0 0 {$operator.paneWidth} {$operator.paneHeight}"
+						preserveAspectRatio={$zoom ? "none" : "xMidYMid meet"}
 					>
-						<rect x="0" y="0" width={paneWidth} height={y} fill="black" fill-opacity="0.45" />
+						<rect x="0" y="0" width={$operator.paneWidth} height={y} fill="black" fill-opacity="0.45" />
 						<rect
 							x="0"
 							y={y + h}
-							width={paneWidth}
-							height={paneHeight - (y + h)}
+							width={$operator.paneWidth}
+							height={$operator.paneHeight - (y + h)}
 							fill="black"
 							fill-opacity="0.45"
 						/>
@@ -261,7 +224,7 @@ function detectionMarks(
 						<rect
 							x={x + w}
 							y={y}
-							width={paneWidth - (x + w)}
+							width={$operator.paneWidth - (x + w)}
 							height={h}
 							fill="black"
 							fill-opacity="0.45"
@@ -279,12 +242,12 @@ function detectionMarks(
 						/>
 					</svg>
 				{/if}
-				{#if !snapshot && !drawing && !barcodeDrawing && cameraFeedOn && paneWidth > 0 && paneHeight > 0}
-					{@const box = barcodeOverlay}
+				{#if !$operator.snapshot && !$operator.drawing && !$operator.barcodeDrawing && $cameraFeedOn && $operator.paneWidth > 0 && $operator.paneHeight > 0}
+					{@const box = $barcodeOverlay}
 					{#if box}
 						<svg
 							class="pointer-events-none absolute inset-0 z-10 h-full w-full"
-							viewBox="0 0 {paneWidth} {paneHeight}"
+							viewBox="0 0 {$operator.paneWidth} {$operator.paneHeight}"
 							preserveAspectRatio="xMidYMid meet"
 						>
 							<rect
@@ -300,10 +263,10 @@ function detectionMarks(
 						</svg>
 					{/if}
 				{/if}
-				{#if snapshot && paneWidth > 0 && paneHeight > 0 && detections.length > 0}
-					{@const marks = detectionMarks(snapshot, paneWidth, paneHeight, frameWidth, frameHeight, detections, zoom)}
-					{@const viewW = zoom ? zoom.width : frameWidth}
-					{@const viewH = zoom ? zoom.height : frameHeight}
+				{#if $operator.snapshot && $operator.paneWidth > 0 && $operator.paneHeight > 0 && $operator.detections.length > 0}
+					{@const marks = detectionMarks($operator.snapshot, $operator.paneWidth, $operator.paneHeight, $operator.frameWidth, $operator.frameHeight, $operator.detections, $zoom)}
+					{@const viewW = $zoom ? $zoom.width : $operator.frameWidth}
+					{@const viewH = $zoom ? $zoom.height : $operator.frameHeight}
 					{#if marks.length > 0 && viewW > 0 && viewH > 0}
 						<svg
 							class="pointer-events-none absolute left-0 top-0 z-10"
@@ -346,43 +309,43 @@ function detectionMarks(
 					{/if}
 				{/if}
 			</div>
-		{:else if feedOn && camerasMissing}
+		{:else if $operator.feedOn && $camerasMissing}
 			<div
 				class="absolute inset-0 flex items-center justify-center px-6 text-center text-lg font-semibold text-amber-200"
 				role="status"
 			>
 				No cameras found
 			</div>
-		{:else if feedOn && !camerasReady}
+		{:else if $operator.feedOn && !$operator.camerasReady}
 			<div class="absolute inset-0 flex items-center justify-center text-lg text-neutral-400">
 				Looking for cameras...
 			</div>
-		{:else if !feedOn}
+		{:else if !$operator.feedOn}
 			<div class="absolute inset-0 flex items-center justify-center text-lg text-neutral-500">
 				Feed stopped
 			</div>
 		{/if}
-		{#if snapshot}
+		{#if $operator.snapshot}
 			<div
-				class="pointer-events-none absolute left-3 top-3 z-20 bg-neutral-950/80 {detectRoi &&
-				!drawing
+				class="pointer-events-none absolute left-3 top-3 z-20 bg-neutral-950/80 {$operator.detectRoi &&
+				!$operator.drawing
 					? 'px-2 py-1'
 					: 'px-3 py-2'}"
 			>
 				<p
-					class="font-mono font-semibold leading-none text-white {detectRoi && !drawing
+					class="font-mono font-semibold leading-none text-white {$operator.detectRoi && !$operator.drawing
 						? 'text-sm'
 						: 'text-3xl'}"
 				>
-					{snapshot.kitCode}
+					{$operator.snapshot.kitCode}
 				</p>
 				<p
-					class="mt-1 text-neutral-300 {detectRoi && !drawing ? 'text-[11px]' : 'text-sm'}"
+					class="mt-1 text-neutral-300 {$operator.detectRoi && !$operator.drawing ? 'text-[11px]' : 'text-sm'}"
 				>
-					Taken {snapshot.takenAt}
+					Taken {$operator.snapshot.takenAt}
 				</p>
 			</div>
-			{#if detectState === "running"}
+			{#if $operator.detectState === "running"}
 				<p class="pointer-events-none absolute bottom-3 left-3 z-40 bg-neutral-950/80 px-3 py-2 text-sm font-semibold text-amber-200">
 					Detecting parts...
 				</p>
@@ -390,28 +353,28 @@ function detectionMarks(
 			<button
 				type="button"
 				class="absolute bottom-3 right-3 z-40 inline-flex min-h-11 items-center border border-yellow-300 bg-yellow-400 px-4 text-sm font-semibold text-neutral-950"
-				on:click={onResume}
+				on:click={resumeLiveFeed}
 			>
-				{feedOn ? "Resume live feed" : "Back to feed"}
+				{$operator.feedOn ? "Resume live feed" : "Back to feed"}
 			</button>
 		{/if}
-		{#if (drawing && snapshot) || (barcodeDrawing && !snapshot)}
+		{#if ($operator.drawing && $operator.snapshot) || ($operator.barcodeDrawing && !$operator.snapshot)}
 			<div
 				class="absolute inset-0 z-30 cursor-crosshair"
-				on:pointerdown={onPointerDown}
-				on:pointermove={onPointerMove}
-				on:pointerup={onPointerUp}
-				on:pointercancel={onPointerUp}
+				on:pointerdown={onRoiPointerDown}
+				on:pointermove={onRoiPointerMove}
+				on:pointerup={onRoiPointerUp}
+				on:pointercancel={onRoiPointerUp}
 			></div>
 			<p class="pointer-events-none absolute left-3 top-3 z-40 bg-neutral-950/80 px-3 py-2 text-sm text-amber-200">
-				{barcodeDrawing
+				{$operator.barcodeDrawing
 					? "Drag a rectangle on the camera."
 					: "Drag a rectangle on the snapshot."}
 			</p>
-			{#if draftMark}
+			{#if $operator.draftMark}
 				<div
 					class="pointer-events-none absolute z-50"
-					style="left:{draftMark.left}px;top:{draftMark.top}px;width:{draftMark.width}px;height:{draftMark.height}px;box-sizing:border-box;border:3px dotted #fde68a;background:rgba(253,230,138,0.2);box-shadow:0 0 0 1px #0a0a0a;"
+					style="left:{$operator.draftMark.left}px;top:{$operator.draftMark.top}px;width:{$operator.draftMark.width}px;height:{$operator.draftMark.height}px;box-sizing:border-box;border:3px dotted #fde68a;background:rgba(253,230,138,0.2);box-shadow:0 0 0 1px #0a0a0a;"
 				></div>
 			{/if}
 		{/if}
