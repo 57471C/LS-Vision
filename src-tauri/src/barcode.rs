@@ -25,8 +25,9 @@ use crate::local_config;
 const MAX_IMAGE_BYTES: usize = 12 * 1024 * 1024;
 const READ_ERROR: &str = "Could not read the image.";
 const NO_CODE: &str = "No code detected";
-// Setup/debug only. Set this to true to save vision/debug-barcode.jpg and append
-// vision/barcode-debug.log. Leave it false during normal operation.
+// Setup/debug only. Set this to true to save debug-barcode.jpg and append
+// barcode-debug.log under LocalAppData (or Documents). Leave it false during
+// normal operation. Those files are never written under Program Files.
 const BARCODE_SETUP_DEBUG: bool = false;
 
 #[tauri::command]
@@ -145,9 +146,7 @@ fn store_debug_jpeg(bytes: &[u8]) -> Result<Option<PathBuf>, String> {
     if cfg!(test) {
         return Ok(None);
     }
-    let path = local_config::project_root()?
-        .join("vision")
-        .join("debug-barcode.jpg");
+    let path = local_config::user_save_dir()?.join("debug-barcode.jpg");
     std::fs::write(&path, bytes).map_err(|err| err.to_string())?;
     Ok(Some(path))
 }
@@ -157,10 +156,10 @@ fn record_debug(line: &str) {
         return;
     }
     eprintln!("{line}");
-    let Ok(root) = local_config::project_root() else {
+    let Ok(dir) = local_config::user_save_dir() else {
         return;
     };
-    let path = root.join("vision").join("barcode-debug.log");
+    let path = dir.join("barcode-debug.log");
     let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
         return;
     };

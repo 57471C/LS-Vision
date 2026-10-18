@@ -74,7 +74,7 @@ type DetectionMark = {
 	labelH: number;
 };
 
-// Same order the sidecar used when it painted boxes. OpenCV stored these as BGR.
+// OpenCV stored these as BGR.
 const PART_COLORS = [
 	"rgb(60, 180, 0)",
 	"rgb(255, 165, 0)",
@@ -1132,36 +1132,6 @@ async function toggleModelMenu() {
 	await loadModel();
 }
 
-async function reloadSidecarModel(filename: string) {
-	let res: Response;
-	try {
-		res = await fetch("http://127.0.0.1:8008/settings/model", {
-			cache: "no-store",
-		});
-	} catch {
-		throw new Error(
-			"Saved. The sidecar is not running, so the model was not reloaded.",
-		);
-	}
-	if (!res.ok) throw new Error("Saved. The sidecar did not reload the model.");
-	const body = (await res.json()) as {
-		status?: unknown;
-		loaded?: unknown;
-		active?: unknown;
-		message?: unknown;
-	};
-	const message = typeof body.message === "string" ? body.message.trim() : "";
-	const active = typeof body.active === "string" ? body.active.trim() : "";
-	const loadedThisFile =
-		body.status !== "fail" &&
-		body.loaded === true &&
-		active.toLowerCase() === filename.toLowerCase();
-	if (!loadedThisFile) {
-		throw new Error(message || "Saved. The sidecar did not reload the model.");
-	}
-	modelName = active;
-}
-
 async function chooseModel(filename: string) {
 	if (!admin || savingModel) return;
 	if (filename.toLowerCase() === modelName.toLowerCase()) {
@@ -1181,18 +1151,11 @@ async function chooseModel(filename: string) {
 			typeof saved.active === "string" && saved.active.trim()
 				? saved.active.trim()
 				: filename;
-		if (active.toLowerCase().endsWith(".onnx")) {
-			modelName = active;
-			modelMenuOpen = false;
-			try {
-				await reloadSidecarModel(active);
-			} catch {
-				modelNotice = `Saved. Active model is ${active}.`;
-			}
-		} else {
-			await reloadSidecarModel(active);
-			modelMenuOpen = false;
-		}
+		modelName = active;
+		modelMenuOpen = false;
+		modelNotice = active.toLowerCase().endsWith(".onnx")
+			? `Saved. Active model is ${active}.`
+			: `${active} is a .pt file. Choose an .onnx model to detect parts.`;
 	} catch (err: unknown) {
 		modelNotice = invokeError(err, "Could not switch the model");
 	} finally {

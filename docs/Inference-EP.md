@@ -1,6 +1,6 @@
 # Inference EP
 
-ONNX Runtime execution providers used for detection.
+ONNX Runtime execution providers used for detection. Inference runs in the Rust process.
 
 ## Available providers
 

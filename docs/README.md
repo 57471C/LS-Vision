@@ -13,4 +13,4 @@ Operator and admin guide for the LS-Vision kit inspection app.
 - [Training and Models](Training-and-Models.md)
 - [Troubleshooting](Troubleshooting.md)
 
-This is an early starter. Pages will be filled in as features stabilise.
+These pages describe the 0.3.0 app. Inference, the camera, barcode decode, and BoM lookup run in Rust.

@@ -122,10 +122,6 @@ let cameraNotice = "";
 let cameraListNotice = "";
 let previewNotice = "";
 let savingCamera = false;
-let killingSidecar = false;
-let sidecarUp = false;
-let sidecarNotice = "";
-let sidecarTimer: ReturnType<typeof setInterval> | null = null;
 let configLoadId = 0;
 
 const PREVIEW_LABEL = "camera-preview";
@@ -253,7 +249,8 @@ function asBarcodeRoi(value: unknown): BarcodeRoi | null {
 	const y = Number(row.y);
 	const width = Number(row.width);
 	const height = Number(row.height);
-	if (![x, y, width, height].every((part) => Number.isFinite(part))) return null;
+	if (![x, y, width, height].every((part) => Number.isFinite(part)))
+		return null;
 	if (width <= 0 || height <= 0) return null;
 	return { x, y, width, height };
 }
@@ -472,9 +469,7 @@ function applyInference(data: {
 		? selected
 		: inferenceProviders[0];
 	const active = typeof data.active === "string" ? data.active : "";
-	inferenceActive = inferenceProviders.includes(active)
-		? active
-		: inferenceEp;
+	inferenceActive = inferenceProviders.includes(active) ? active : inferenceEp;
 	inferenceNotice = typeof data.message === "string" ? data.message : "";
 	inferenceReady = true;
 }
@@ -564,7 +559,9 @@ function formatBenchmark(data: {
 	const width = typeof data.width === "number" ? data.width : 0;
 	const height = typeof data.height === "number" ? data.height : 0;
 	const image = typeof data.image === "string" ? data.image : "";
-	const resolution = image ? `${width}×${height} ${image}` : `${width}×${height}`;
+	const resolution = image
+		? `${width}×${height} ${image}`
+		: `${width}×${height}`;
 	return [
 		`Active EP: ${inferenceLabel(provider)}`,
 		`Average: ${formatMs(average)} ms`,
@@ -694,7 +691,6 @@ function unlock() {
 	loadSource();
 	void loadInference();
 	if (section === "camera") void loadCameraSettings();
-	watchSidecar();
 }
 
 function onAuthChange() {
@@ -709,9 +705,7 @@ function lock() {
 	password = "";
 	gateMessage = "";
 	mssqlPassword = "";
-	sidecarNotice = "";
 	sessionStorage.removeItem(UNLOCK_KEY);
-	stopSidecarWatch();
 }
 
 async function saveScan() {
@@ -1395,82 +1389,6 @@ function invokeError(err: unknown, fallback: string): string {
 	return errorMessage(err, fallback);
 }
 
-async function refreshSidecar() {
-	if (killingSidecar) return;
-	try {
-		const res = await fetch("http://127.0.0.1:8008/health");
-		sidecarUp = res.ok;
-	} catch {
-		sidecarUp = false;
-	}
-}
-
-function watchSidecar() {
-	void refreshSidecar();
-	if (sidecarTimer !== null) return;
-	sidecarTimer = setInterval(() => {
-		void refreshSidecar();
-	}, 2000);
-}
-
-function stopSidecarWatch() {
-	if (sidecarTimer !== null) {
-		clearInterval(sidecarTimer);
-		sidecarTimer = null;
-	}
-	sidecarUp = false;
-}
-
-async function killSidecar() {
-	if (killingSidecar || !sidecarUp) return;
-	killingSidecar = true;
-	sidecarNotice = "";
-	let stopped = false;
-	try {
-		try {
-			const res = await fetch("http://127.0.0.1:8008/shutdown", {
-				method: "POST",
-			});
-			if (res.ok) stopped = true;
-		} catch {
-			// The process can close the socket before the response finishes.
-			stopped = true;
-		}
-		if (inTauri()) {
-			try {
-				const { invoke } = await import("@tauri-apps/api/core");
-				const message = await invoke<string>("kill_vision_sidecar");
-				if (
-					typeof message === "string" &&
-					message.toLowerCase().includes("stopped")
-				) {
-					stopped = true;
-				}
-			} catch (err: unknown) {
-				if (!stopped) {
-					sidecarNotice = invokeError(err, "Could not stop the vision sidecar");
-				}
-			}
-		}
-		sidecarUp = true;
-		for (let attempt = 0; attempt < 8; attempt += 1) {
-			await new Promise((resolve) => setTimeout(resolve, 200));
-			try {
-				const res = await fetch("http://127.0.0.1:8008/health");
-				sidecarUp = res.ok;
-			} catch {
-				sidecarUp = false;
-			}
-			if (!sidecarUp) break;
-		}
-		if (!sidecarUp) sidecarNotice = "Stopped vision sidecar.";
-		else if (!sidecarNotice)
-			sidecarNotice = "Could not stop the vision sidecar.";
-	} finally {
-		killingSidecar = false;
-	}
-}
-
 function postPreviewIndex(index: number) {
 	const channel = new BroadcastChannel(PREVIEW_CHANNEL);
 	channel.postMessage({
@@ -1582,11 +1500,9 @@ onMount(() => {
 	}
 	void loadSource();
 	if (section === "camera") void loadCameraSettings();
-	watchSidecar();
 });
 
 onDestroy(() => {
-	stopSidecarWatch();
 	cancelCameraApply();
 });
 </script>
@@ -1615,19 +1531,6 @@ onDestroy(() => {
 		</div>
 		<div class="flex items-center gap-2">
 			{#if unlocked}
-				{#if sidecarUp || killingSidecar}
-					<button
-						type="button"
-						class="inline-flex min-h-11 items-center border border-red-800 bg-red-600 px-4 text-sm font-semibold text-white disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
-						on:click={killSidecar}
-						disabled={killingSidecar}
-					>
-						{killingSidecar ? "Stopping..." : "Kill Vision Sidecar"}
-					</button>
-				{/if}
-				{#if sidecarNotice}
-					<p class="max-w-64 text-sm text-neutral-200">{sidecarNotice}</p>
-				{/if}
 				<button
 					type="button"
 					class="inline-flex min-h-11 items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100"
