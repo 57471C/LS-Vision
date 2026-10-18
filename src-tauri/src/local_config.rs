@@ -74,7 +74,8 @@ fn default_config() -> Value {
             "resolution": "",
             "focus": null,
             "brightness": null,
-            "contrast": null
+            "contrast": null,
+            "displayFps": 15
         }
     })
 }

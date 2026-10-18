@@ -27,6 +27,16 @@
 		"resolution": "",
 		"focus": null,
 		"brightness": null,
-		"contrast": null
+		"contrast": null,
+		"displayFps": 15,
+		"byIndex": {
+			"0": {
+				"resolution": "",
+				"focus": null,
+				"brightness": null,
+				"contrast": null,
+				"displayFps": 15
+			}
+		}
 	}
 }

@@ -4,8 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { onDestroy, onMount } from "svelte";
 
 const PREVIEW_CHANNEL = "ls-vision-camera-preview";
-/** About 15 fps. The next request waits until this long after the previous one started. */
-const FRAME_MS = 66;
+const DISPLAY_FPS = [15, 20, 25, 30];
 
 type PreviewBody = {
 	status?: string;
@@ -18,6 +17,7 @@ type PreviewBody = {
 };
 
 let index = 0;
+let displayFps = 15;
 let message = "";
 let failed = false;
 let status = "";
@@ -25,6 +25,7 @@ let painted = false;
 let canvasFps = "";
 let canvasEl: HTMLCanvasElement | undefined;
 let generation = 0;
+let displayFpsPinned = false;
 const paintStamps: number[] = [];
 
 function formatStatus(body: PreviewBody, canvasRate: string): string {
@@ -52,6 +53,15 @@ function readIndex(value: unknown): number | null {
 	const next = Number(value);
 	if (!Number.isInteger(next) || next < 0 || next > 32) return null;
 	return next;
+}
+
+function readDisplayFps(value: unknown): number {
+	const next = Number(value);
+	return DISPLAY_FPS.includes(next) ? next : 15;
+}
+
+function frameMs(): number {
+	return 1000 / displayFps;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -154,8 +164,21 @@ async function runPreview(gen: number) {
 			await sleep(400);
 			continue;
 		}
-		const remain = FRAME_MS - (performance.now() - started);
+		const remain = frameMs() - (performance.now() - started);
 		if (gen === generation && remain > 0) await sleep(remain);
+	}
+}
+
+async function loadDisplayFps() {
+	try {
+		const config = await invoke<{ camera?: { displayFps?: unknown } }>(
+			"load_local_config",
+		);
+		if (!displayFpsPinned) {
+			displayFps = readDisplayFps(config.camera?.displayFps);
+		}
+	} catch {
+		if (!displayFpsPinned) displayFps = 15;
 	}
 }
 
@@ -164,12 +187,23 @@ onMount(() => {
 	const initial = readIndex(params.get("index"));
 	if (initial !== null) index = initial;
 	void retitle(index);
-	void runPreview(generation);
 	const channel = new BroadcastChannel(PREVIEW_CHANNEL);
 	channel.onmessage = (event) => {
+		if (event.data && "displayFps" in event.data) {
+			displayFpsPinned = true;
+			const next = readDisplayFps(event.data.displayFps);
+			if (next !== displayFps) {
+				displayFps = next;
+				paintStamps.length = 0;
+				canvasFps = "";
+			}
+		}
 		const next = readIndex(event.data?.index);
 		if (next !== null) useIndex(next);
 	};
+	void loadDisplayFps().then(() => {
+		if (generation === 0) void runPreview(generation);
+	});
 	return () => {
 		generation += 1;
 		channel.close();

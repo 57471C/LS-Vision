@@ -1,5 +1,6 @@
 <script lang="ts">
 // biome-ignore-all lint/correctness/noUnusedVariables: Biome 2.4 does not treat Svelte template references as uses
+
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
@@ -8,6 +9,7 @@ import {
 	DecodeHintType,
 } from "@zxing/library";
 import { onDestroy, onMount, tick } from "svelte";
+import { activateCamera } from "$lib/camera-settings";
 
 type Part = { ic: string; des: string; qty: number };
 type InspectView = {
@@ -112,6 +114,10 @@ let loading = false;
 let cameraIndex = 0;
 // Set when the saved camera is missing, so focus does not put that index back.
 let skippedSavedIndex: number | null = null;
+// Saves stay in order. A slower choice must not replace a newer one.
+let cameraSaveChain: Promise<void> = Promise.resolve();
+let cameraSaveGeneration = 0;
+let cameraSavePending = 0;
 let cameraIndexes: number[] = [];
 let camerasReady = false;
 let cameraLookupFailed = false;
@@ -904,8 +910,12 @@ function asRoi(value: unknown): DetectRoi | null {
 }
 
 async function loadCamera() {
+	const pending = cameraSavePending;
 	try {
 		const data = await readConfig();
+		// Focus can read the file while a choice is still being saved.
+		if (!pageAlive || pending !== cameraSavePending || cameraSavePending !== 0)
+			return;
 		const camera =
 			data.camera && typeof data.camera === "object" ? data.camera : {};
 		const index = Number(camera.index);
@@ -932,21 +942,28 @@ async function saveCameraIndex() {
 	const index = Number(cameraIndex);
 	cameraIndex = index;
 	if (!Number.isInteger(index) || index < 0 || index > 32) return;
-	try {
-		const config = await invoke<Record<string, unknown>>("load_local_config");
-		const camera =
-			config.camera &&
-			typeof config.camera === "object" &&
-			!Array.isArray(config.camera)
-				? { ...(config.camera as Record<string, unknown>) }
-				: {};
-		camera.index = index;
-		config.camera = camera;
-		await invoke("save_local_config", { config });
-	} catch {
-		// The live view still uses the picked index. The next launch reads the last save.
-	}
-	if (feedOn && !snapshot) showLiveFeed();
+	const generation = ++cameraSaveGeneration;
+	cameraSavePending += 1;
+	const run = cameraSaveChain.then(async () => {
+		try {
+			if (!pageAlive || generation !== cameraSaveGeneration) return;
+			const config = await invoke<Record<string, unknown>>("load_local_config");
+			if (!pageAlive || generation !== cameraSaveGeneration) return;
+			activateCamera(config, index);
+			await invoke("save_local_config", { config });
+			if (!pageAlive || generation !== cameraSaveGeneration) return;
+			if (feedOn && !snapshot) showLiveFeed();
+		} catch {
+			// The live view still uses the picked index. The next launch reads the last save.
+		} finally {
+			cameraSavePending -= 1;
+		}
+	});
+	cameraSaveChain = run.then(
+		() => undefined,
+		() => undefined,
+	);
+	await run;
 }
 
 function readAdminFlag() {
@@ -1846,24 +1863,26 @@ async function decodeAndInspect() {
 				bind:value={barcode}
 			/>
 		</label>
-		<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
-			Camera
-			<select
-				class="min-h-11 border border-neutral-600 bg-neutral-950 px-3 font-mono text-base normal-case tracking-normal text-neutral-100"
-				bind:value={cameraIndex}
-				on:change={saveCameraIndex}
-			>
-				{#if camerasMissing}
-					<option value={cameraIndex}>No cameras found</option>
-				{:else if cameraIndexes.length > 0}
-					{#each cameraIndexes as index (index)}
-						<option value={index}>{index}</option>
-					{/each}
-				{:else}
-					<option value={cameraIndex}>{cameraIndex}</option>
-				{/if}
-			</select>
-		</label>
+		{#if admin}
+			<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+				Camera
+				<select
+					class="min-h-11 border border-neutral-600 bg-neutral-950 px-3 font-mono text-base normal-case tracking-normal text-neutral-100"
+					bind:value={cameraIndex}
+					on:change={saveCameraIndex}
+				>
+					{#if camerasMissing}
+						<option value={cameraIndex}>No cameras found</option>
+					{:else if cameraIndexes.length > 0}
+						{#each cameraIndexes as index (index)}
+							<option value={index}>{index}</option>
+						{/each}
+					{:else}
+						<option value={cameraIndex}>{cameraIndex}</option>
+					{/if}
+				</select>
+			</label>
+		{/if}
 		<button
 			type="button"
 			class="inline-flex min-h-11 items-center border border-blue-500 bg-blue-600 px-4 text-sm font-semibold text-white disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"

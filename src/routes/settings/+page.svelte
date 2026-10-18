@@ -1,6 +1,16 @@
 <script lang="ts">
 // biome-ignore-all lint/correctness/noUnusedVariables: Biome 2.4 does not treat Svelte template references as uses
+
 import { onDestroy, onMount } from "svelte";
+import {
+	activateCamera,
+	assignActiveCamera,
+	type CameraSettings,
+	readDisplayFps,
+	rememberActiveCamera,
+	retainCameraSettings,
+	settingsForCamera,
+} from "$lib/camera-settings";
 
 const DEV_PASSWORD = "admin";
 const UNLOCK_KEY = "ls-vision-settings-open";
@@ -66,12 +76,15 @@ let cameraChoices: number[] = [0];
 let cameraModes: CameraMode[] = [];
 let cameraModeDefault = "";
 let cameraResolution = "";
+const DISPLAY_FPS = [15, 20, 25, 30];
+let cameraDisplayFps = 15;
 let cameraFocus = 50;
 let cameraBrightness = 50;
 let cameraContrast = 50;
 let savedCamera = {
 	index: 0,
 	resolution: "",
+	displayFps: 15,
 	focus: 50,
 	brightness: 50,
 	contrast: 50,
@@ -83,6 +96,10 @@ let cameraApplyTimer: ReturnType<typeof setTimeout> | null = null;
 let cameraPushId = 0;
 // Posts stay in order. A slow live update must not land after Reset or Cancel.
 let cameraPostChain: Promise<void> = Promise.resolve();
+// Last config used to fill the form. A camera change can paint before the file write.
+let cameraFile: Record<string, unknown> | null = null;
+// Bumped when the form changes. A finished file write paints only if it is still current.
+let cameraFileVersion = 0;
 let cameraNotice = "";
 let cameraListNotice = "";
 let previewNotice = "";
@@ -752,14 +769,15 @@ function cameraSettingsBody() {
 	return {
 		index: Number(cameraIndex),
 		resolution: cameraResolution,
+		displayFps: readDisplayFps(cameraDisplayFps),
 		focus: cameraFocus,
 		brightness: cameraBrightness,
 		contrast: cameraContrast,
 	};
 }
 
-async function postCameraSettings(applyOnly = false) {
-	const body = cameraSettingsBody();
+async function postCameraSettings(applyOnly = false, preset?: CameraSettings) {
+	const body = preset ?? cameraSettingsBody();
 	// The Rust camera stores these fields. It does not apply focus, brightness,
 	// or contrast to the device, so a live slider change does not write config.
 	if (applyOnly) return { ...body, status: "pass", message: "" };
@@ -777,18 +795,26 @@ async function postCameraSettings(applyOnly = false) {
 	) {
 		throw new Error("Choose a resolution from the list.");
 	}
+	const version = cameraFileVersion;
 	const current = await loadDocument();
-	const camera = {
-		...objectField(current.camera),
+	const settings = {
 		index,
 		resolution: body.resolution,
+		displayFps: body.displayFps,
 		focus: body.focus,
 		brightness: body.brightness,
 		contrast: body.contrast,
 	};
-	current.camera = camera;
+	// Save belongs to the camera on the form when Save was clicked. A later
+	// camera change must not move that record onto the newly selected camera.
+	if (Number(cameraIndex) === index) assignActiveCamera(current, settings);
+	else {
+		rememberActiveCamera(current);
+		retainCameraSettings(current, settings);
+	}
 	await storeDocument(current);
-	return { ...camera, status: "pass", message: "Saved" };
+	if (cameraFileVersion === version) cameraFile = current;
+	return { ...settings, status: "pass", message: "Saved" };
 }
 
 function queueCameraPost(work: () => Promise<void>): Promise<void> {
@@ -816,6 +842,7 @@ function rememberSaved() {
 	savedCamera = {
 		index: Number(cameraIndex),
 		resolution: cameraResolution,
+		displayFps: readDisplayFps(cameraDisplayFps),
 		focus: cameraFocus,
 		brightness: cameraBrightness,
 		contrast: cameraContrast,
@@ -825,12 +852,14 @@ function rememberSaved() {
 function showCamera(next: {
 	index: number;
 	resolution: string;
+	displayFps: number;
 	focus: number;
 	brightness: number;
 	contrast: number;
 }) {
 	cameraIndex = next.index;
 	cameraResolution = isModeId(next.resolution) ? next.resolution : "";
+	cameraDisplayFps = readDisplayFps(next.displayFps);
 	cameraFocus = clampLevel(next.focus);
 	cameraBrightness = clampLevel(next.brightness);
 	cameraContrast = clampLevel(next.contrast);
@@ -863,11 +892,13 @@ function resetCamera() {
 	showCamera({
 		index: Number(cameraIndex),
 		resolution: cameraModeDefault,
+		displayFps: 15,
 		focus: 50,
 		brightness: 50,
 		contrast: 50,
 	});
 	void persistResolution(cameraResolution);
+	void persistDisplayFps(cameraDisplayFps);
 	void applyShownCamera("Reset to defaults.");
 }
 
@@ -879,6 +910,7 @@ function cancelCameraEdits() {
 function applyCamera(data: {
 	index?: unknown;
 	resolution?: unknown;
+	displayFps?: unknown;
 	focus?: unknown;
 	brightness?: unknown;
 	contrast?: unknown;
@@ -887,6 +919,7 @@ function applyCamera(data: {
 	if (Number.isInteger(index) && index >= 0 && index <= 32) cameraIndex = index;
 	const resolution = typeof data.resolution === "string" ? data.resolution : "";
 	cameraResolution = isModeId(resolution) ? resolution : "";
+	cameraDisplayFps = readDisplayFps(data.displayFps);
 	cameraFocus = levelValue(data.focus) ?? 50;
 	cameraBrightness = levelValue(data.brightness) ?? 50;
 	cameraContrast = levelValue(data.contrast) ?? 50;
@@ -916,28 +949,110 @@ async function loadCameraDevices() {
 
 async function loadCameraSettings() {
 	cameraNotice = "";
+	const version = cameraFileVersion;
 	try {
 		const config = await loadDocument();
-		applyCamera(objectField(config.camera));
-		rememberSaved();
+		if (cameraFileVersion === version) {
+			cameraFile = config;
+			const camera = objectField(config.camera);
+			const index = Number(camera.index);
+			const selected =
+				Number.isInteger(index) && index >= 0 && index <= 32 ? index : 0;
+			showCamera(settingsForCamera(camera, selected));
+			rememberSaved();
+		}
 	} catch (err: unknown) {
-		cameraNotice = invokeError(err, "Could not load the camera settings");
+		if (cameraFileVersion === version) {
+			cameraNotice = invokeError(err, "Could not load the camera settings");
+		}
 	}
 	await loadCameraDevices();
+	if (cameraFileVersion !== version) return;
 	await loadCameraModes();
 }
 
-async function persistResolution(resolution: string) {
+function copyCameraFile(): Record<string, unknown> | null {
+	if (!cameraFile) return null;
+	return JSON.parse(JSON.stringify(cameraFile)) as Record<string, unknown>;
+}
+
+function cameraRecord(
+	document: Record<string, unknown>,
+	index: number,
+	patch: Partial<{
+		resolution: string;
+		displayFps: number;
+	}>,
+): CameraSettings {
+	rememberActiveCamera(document);
+	const record = settingsForCamera(objectField(document.camera), index);
+	if (patch.resolution !== undefined) {
+		record.resolution = isModeId(patch.resolution) ? patch.resolution : "";
+	}
+	if (patch.displayFps !== undefined) {
+		record.displayFps = readDisplayFps(patch.displayFps);
+	}
+	return record;
+}
+
+function stageCameraPatch(
+	index: number,
+	patch: Partial<{
+		resolution: string;
+		displayFps: number;
+	}>,
+) {
+	const draft = copyCameraFile();
+	if (!draft) return;
+	const record = cameraRecord(draft, index, patch);
+	if (Number(cameraIndex) === index) assignActiveCamera(draft, record);
+	else retainCameraSettings(draft, record);
+	cameraFile = draft;
+	cameraFileVersion += 1;
+}
+
+async function persistCamera(
+	index: number,
+	patch: Partial<{
+		resolution: string;
+		displayFps: number;
+	}>,
+) {
+	stageCameraPatch(index, patch);
+	const version = cameraFileVersion;
 	await queueCameraPost(async () => {
 		const current = await loadDocument();
-		const camera = {
-			...objectField(current.camera),
-			resolution,
-		};
-		current.camera = camera;
+		const record = cameraRecord(current, index, patch);
+		// The dropdown may already show another camera. Keep the patch on this
+		// camera, and leave the selected camera's top-level fields alone.
+		const selected = Number(cameraIndex) === index;
+		if (selected) assignActiveCamera(current, record);
+		else retainCameraSettings(current, record);
 		await storeDocument(current);
-		savedCamera = { ...savedCamera, resolution };
+		if (cameraFileVersion !== version) return;
+		cameraFile = current;
+		if (!selected) return;
+		savedCamera = {
+			...savedCamera,
+			index,
+			resolution: record.resolution,
+			displayFps: record.displayFps,
+		};
 	});
+}
+
+async function persistResolution(resolution: string) {
+	await persistCamera(Number(cameraIndex), { resolution });
+}
+
+async function persistDisplayFps(displayFps: number) {
+	await persistCamera(Number(cameraIndex), { displayFps });
+}
+
+function onDisplayFpsChange() {
+	cameraDisplayFps = readDisplayFps(cameraDisplayFps);
+	postPreviewIndex(Number(cameraIndex));
+	void persistDisplayFps(cameraDisplayFps);
 }
 
 async function loadCameraModes() {
@@ -983,13 +1098,14 @@ async function saveCamera() {
 	}
 	rememberLevels();
 	const id = ++cameraPushId;
+	const body = cameraSettingsBody();
 	savingCamera = true;
 	cameraNotice = "";
 	try {
 		await queueCameraPost(async () => {
 			if (id !== cameraPushId) return;
-			const data = await postCameraSettings();
-			if (id !== cameraPushId) return;
+			const data = await postCameraSettings(false, body);
+			if (id !== cameraPushId || Number(cameraIndex) !== body.index) return;
 			applyCamera(data);
 			rememberSaved();
 			cameraIndex = Number(cameraIndex);
@@ -1094,14 +1210,53 @@ async function killSidecar() {
 
 function postPreviewIndex(index: number) {
 	const channel = new BroadcastChannel(PREVIEW_CHANNEL);
-	channel.postMessage({ index });
+	channel.postMessage({
+		index,
+		displayFps: readDisplayFps(cameraDisplayFps),
+	});
 	channel.close();
 }
 
 function onCameraIndexChange() {
 	cameraIndex = Number(cameraIndex);
-	postPreviewIndex(cameraIndex);
-	void loadCameraModes();
+	const next = cameraIndex;
+	cameraFileVersion += 1;
+	const version = cameraFileVersion;
+	const draft = copyCameraFile();
+	if (draft) {
+		const record = activateCamera(draft, next);
+		cameraFile = draft;
+		cameraModes = [];
+		cameraModeDefault = "";
+		showCamera(record);
+		rememberSaved();
+	}
+	postPreviewIndex(next);
+	void switchToCamera(next, version);
+}
+
+async function switchToCamera(next: number, version: number) {
+	try {
+		await queueCameraPost(async () => {
+			if (Number(cameraIndex) !== next) return;
+			const current = await loadDocument();
+			if (Number(cameraIndex) !== next) return;
+			const record = activateCamera(current, next);
+			await storeDocument(current);
+			if (Number(cameraIndex) !== next || cameraFileVersion !== version) return;
+			cameraFile = current;
+			showCamera(record);
+			rememberSaved();
+		});
+	} catch (err: unknown) {
+		if (Number(cameraIndex) === next) {
+			cameraNotice = errorMessage(err, "Could not load the camera settings");
+		}
+		return;
+	}
+	if (Number(cameraIndex) !== next) return;
+	postPreviewIndex(next);
+	await loadCameraModes();
 }
 
 async function openPreview() {
@@ -1372,7 +1527,7 @@ onDestroy(() => {
 									</select>
 								</label>
 								<p class="text-sm text-neutral-400">
-									The operator page opens this camera. A camera that is unplugged at launch is tried again next time.
+									The operator page opens this camera. A camera that is unplugged at launch is tried again next time. Resolution, display rate, and levels are kept for each camera.
 								</p>
 								{#if cameraListNotice}
 									<p class="text-sm text-neutral-200">{cameraListNotice}</p>
@@ -1401,6 +1556,21 @@ onDestroy(() => {
 								</label>
 								<p class="text-sm text-neutral-400">
 									The preview reopens in this mode. NV12 is used when the camera lists it.
+								</p>
+								<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+									Display FPS
+									<select
+										class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
+										bind:value={cameraDisplayFps}
+										on:change={onDisplayFpsChange}
+									>
+										{#each DISPLAY_FPS as rate (rate)}
+											<option value={rate}>{rate}</option>
+										{/each}
+									</select>
+								</label>
+								<p class="text-sm text-neutral-400">
+									The preview canvas aims for this rate. The next frame is requested after the previous one is drawn.
 								</p>
 								<div class="divide-y divide-neutral-800 border-y border-neutral-800">
 									<div class="flex items-center gap-3 py-1">
