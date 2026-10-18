@@ -1029,12 +1029,15 @@ fn with_model<T>(
     run(model)
 }
 
+/// Drop the cached session so the next detection reads the model file again.
+pub(crate) fn forget_session() {
+    let mut guard = MODEL_CACHE.lock().unwrap_or_else(|err| err.into_inner());
+    *guard = None;
+}
+
 /// Drop the cached session and load the active `.onnx` model with the saved provider.
 pub(crate) fn reload_session() -> Result<(), String> {
-    {
-        let mut guard = MODEL_CACHE.lock().unwrap_or_else(|err| err.into_inner());
-        *guard = None;
-    }
+    forget_session();
     let requested = inference_ep::selected_provider();
     let Ok(root) = local_config::project_root() else {
         inference_ep::remember(requested, requested, "");
@@ -1051,7 +1054,13 @@ pub(crate) fn reload_session() -> Result<(), String> {
         inference_ep::remember(requested, requested, "");
         return Ok(());
     }
-    let path = local_config::vision_models_dir(&root).join(&name);
+    let path = match local_config::app_models_dir() {
+        Ok(dir) => dir.join(&name),
+        Err(_) => {
+            inference_ep::remember(requested, requested, "");
+            return Ok(());
+        }
+    };
     if !path.is_file() {
         inference_ep::remember(requested, requested, "");
         return Ok(());
@@ -1188,9 +1197,14 @@ fn detect_image_now(image: Option<String>) -> Result<Value, String> {
     if !name.to_ascii_lowercase().ends_with(".onnx") {
         return Ok(failure(&format!("{name} is not an ONNX file.")));
     }
-    let path = local_config::vision_models_dir(&root).join(&name);
+    let path = match local_config::app_models_dir() {
+        Ok(dir) => dir.join(&name),
+        Err(message) => return Ok(failure(&message)),
+    };
     if !path.is_file() {
-        return Ok(failure(&format!("{name} was not found in vision/models.")));
+        return Ok(failure(&format!(
+            "{name} was not found in the models folder."
+        )));
     }
     let Some(text) = image.filter(|value| !value.trim().is_empty()) else {
         return Ok(failure("No image and no snapshot"));
@@ -1236,9 +1250,9 @@ fn run_benchmark() -> Result<DetectBenchmark, String> {
     if !name.to_ascii_lowercase().ends_with(".onnx") {
         return Err(format!("{name} is not an ONNX file."));
     }
-    let model_path = local_config::vision_models_dir(&root).join(&name);
+    let model_path = local_config::app_models_dir()?.join(&name);
     if !model_path.is_file() {
-        return Err(format!("{name} was not found in vision/models."));
+        return Err(format!("{name} was not found in the models folder."));
     }
     benchmark_files(&model_path, &benchmark_image(&root)?)
 }
@@ -1377,6 +1391,13 @@ fn benchmark_files(model_path: &Path, image_path: &Path) -> Result<DetectBenchma
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forget_session_drops_the_cached_model() {
+        forget_session();
+        let guard = MODEL_CACHE.lock().unwrap_or_else(|err| err.into_inner());
+        assert!(guard.is_none());
+    }
 
     #[test]
     fn py_round_matches_python_3_half_to_even() {

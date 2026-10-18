@@ -71,6 +71,7 @@ let modelName = "";
 let modelActive = "best.onnx";
 let modelNotice = "";
 let savingModel = false;
+let updatingModel = false;
 let inferenceProviders: string[] = ["cpu"];
 let inferenceEp = "cpu";
 let inferenceActive = "cpu";
@@ -618,6 +619,31 @@ async function saveModel() {
 		modelNotice = invokeError(err, "Could not save the model");
 	} finally {
 		savingModel = false;
+	}
+}
+
+async function updateModel() {
+	updatingModel = true;
+	modelNotice = "";
+	try {
+		const data = await invokeRust<{
+			model?: unknown;
+			active?: unknown;
+			files?: unknown;
+			message?: unknown;
+		}>("update_model", { filename: modelName });
+		const message =
+			typeof data.message === "string" && data.message
+				? data.message
+				: "Updated";
+		if (message !== "No file selected.") {
+			applyModel(data);
+		}
+		modelNotice = message;
+	} catch (err: unknown) {
+		modelNotice = invokeError(err, "Could not update the model");
+	} finally {
+		updatingModel = false;
 	}
 }
 
@@ -2182,7 +2208,7 @@ onDestroy(() => {
 									<select
 										class="border border-neutral-600 bg-neutral-950 px-3 py-2 font-mono text-base font-medium normal-case tracking-normal text-neutral-100 disabled:text-neutral-500"
 										bind:value={modelName}
-										disabled={savingModel || modelFiles.length === 0}
+										disabled={savingModel || updatingModel || modelFiles.length === 0}
 									>
 										{#each modelFiles as file (file)}
 											<option value={file}>{file}</option>
@@ -2190,20 +2216,29 @@ onDestroy(() => {
 									</select>
 								</label>
 								<p class="text-sm text-neutral-400">
-									{#if modelFiles.length === 0}
-										No .pt or .onnx files in vision/models. Detection uses best.onnx when that file is present, otherwise best.pt.
-									{:else}
-										Choose a .pt or .onnx file in vision/models. A missing file, or no selection, uses best.onnx when that file is present, otherwise best.pt.
-									{/if}
+									Models are stored in the app data models folder. Update model copies an .onnx file over the selected .onnx name, or over best.onnx. The next detection loads that file.
 								</p>
 							</fieldset>
-							<button
-								type="submit"
-								class="inline-flex min-h-11 w-fit items-center border border-blue-500 bg-blue-600 px-4 text-sm font-semibold text-white disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
-								disabled={savingModel || modelFiles.length === 0 || !modelName}
-							>
-								{savingModel ? "Saving..." : "Save"}
-							</button>
+							<div class="flex flex-wrap gap-2">
+								<button
+									type="submit"
+									class="inline-flex min-h-11 w-fit items-center border border-blue-500 bg-blue-600 px-4 text-sm font-semibold text-white disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
+									disabled={savingModel ||
+										updatingModel ||
+										modelFiles.length === 0 ||
+										!modelName}
+								>
+									{savingModel ? "Saving..." : "Save"}
+								</button>
+								<button
+									type="button"
+									class="inline-flex min-h-11 w-fit items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100 disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
+									on:click={updateModel}
+									disabled={savingModel || updatingModel}
+								>
+									{updatingModel ? "Updating..." : "Update model"}
+								</button>
+							</div>
 							{#if modelNotice}
 								<p class="text-sm text-neutral-200">{modelNotice}</p>
 							{/if}

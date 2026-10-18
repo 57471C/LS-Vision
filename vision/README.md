@@ -21,7 +21,7 @@ Place `best.pt` in `vision/models/`. Weight files (`*.pt`, `*.onnx`) stay local 
 yolo export model=best.pt format=onnx
 ```
 
-Put the `.onnx` file in `vision/models/` and select it in Settings.
+In Settings > Training, use Update model and choose the `.onnx` file. The app copies it into the app data models folder (`%APPDATA%\studio.lean.ls-vision\models` on Windows). Dev and the installed app use that folder. The installer does not bundle the file.
 
 ## Activate the environment (every new terminal)
 

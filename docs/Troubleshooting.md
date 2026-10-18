@@ -18,7 +18,7 @@ The button ignores extra clicks for 1.52 seconds. It reads Please wait, stays di
 
 ## A .pt model does not detect
 
-Detection runs `.onnx` only. Export the checkpoint with `yolo export model=best.pt format=onnx`, put the file in `vision/models/`, and select it.
+Detection runs `.onnx` only. Export the checkpoint with `yolo export model=best.pt format=onnx`, then use Settings > Training > Update model to copy the file into the app data models folder.
 
 ## BoM not found
 
