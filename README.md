@@ -2,7 +2,7 @@
 
 Desktop application for verifying fastener kits on the bench using computer vision.
 
-Built with Tauri 2, SvelteKit, TypeScript, and Rust. `.onnx` detection runs in Rust. The Python sidecar still serves the camera, barcode frames, `.pt` models, and the settings routes.
+Built with Tauri 2, SvelteKit, TypeScript, and Rust. `.onnx` detection, the camera snapshot, barcode decode, and BoM lookup run in Rust. The app does not start the Python sidecar. `vision/main.py` is still in the repo.
 
 ## What it does
 
@@ -20,7 +20,7 @@ See [plan.md](plan.md) for the full architecture, flow, and phased implementatio
 
 - **Frontend**: SvelteKit + TypeScript + Vite
 - **Desktop shell**: Tauri 2 (Rust)
-- **Vision**: `.onnx` detection in Rust (ONNX Runtime). The Python sidecar still runs the camera, barcode frames, and `.pt` models.
+- **Vision**: `.onnx` detection in Rust (ONNX Runtime). The camera snapshot is Rust (Media Foundation). A `.pt` file is training-only and does not detect.
 - **Data**: JSON/CSV for development; MSSQL for production BoM lookup
 
 ## Getting started
@@ -47,4 +47,4 @@ See [vision/README.md](vision/README.md) for full sidecar details.
 
 ## Project status
 
-`.onnx` part detection runs in the Tauri process. Camera capture, barcode frames, `.pt` fallback, and most settings routes still use the Python sidecar. See `plan.md` for the remaining ONNX migration steps.
+`.onnx` detection, camera snapshots, barcode decode, and BoM lookup (JSON, API, and MSSQL) run in the Tauri process. The app does not spawn `vision/main.py`. That file remains for a manual run. A `.pt` model shows a warning instead of detecting. Settings can still stop a sidecar that was started by hand. See `plan.md` for Phase 3.

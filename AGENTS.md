@@ -10,7 +10,7 @@ LS-Vision is an early-stage Tauri 2 + SvelteKit desktop app for bench-top kit ve
 
 - Frontend: SvelteKit routes under `src/routes/`. Operator UI starts at `src/routes/+page.svelte`.
 - Rust/Tauri backend: `src-tauri/`.
-- Vision sidecar (current): `vision/` Python package. `.onnx` detection runs in Rust (`detect_image`) and keeps the same JSON the page already draws. The sidecar still serves the camera, barcode frames, `.pt` models, and settings routes. Phase 2 in `plan.md` removes that sidecar.
+- Vision: `.onnx` detection runs in Rust (`detect_image`) and keeps the same JSON the page already draws. Camera snapshots (`capture_snapshot`), barcode decode, and BoM lookup (JSON, API, and MSSQL) also run in Rust. The app does not spawn `vision/main.py`. That file remains; Phase 3 in `plan.md` is the leftover cleanup. A `.pt` model warns instead of detecting.
 - BoM lookup should stay behind a simple interface so the source (JSON/CSV vs MSSQL) can be swapped via settings.
 
 ## Conventions
@@ -19,7 +19,7 @@ LS-Vision is an early-stage Tauri 2 + SvelteKit desktop app for bench-top kit ve
 - Admin functionality (parts, cameras, BoM source, models) should be separable from the main operator flow.
 - One kit type and one barcode per bench/job.
 - Prefer explicit, readable code over clever abstractions at this stage.
-- When adding vision features, consider both the current Python sidecar path and the future ONNX-in-Rust path.
+- When adding vision features, keep the Rust ONNX path. `vision/main.py` is no longer on the runtime path.
 
 ## Current priorities
 

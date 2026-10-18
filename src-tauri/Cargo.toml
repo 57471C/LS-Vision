@@ -30,6 +30,15 @@ image = { version = "=0.25.8", default-features = false, features = ["jpeg", "pn
 turbojpeg = "=1.5.1"
 rxing = { version = "0.9.3", default-features = false, features = ["image", "decoders", "encoders", "encoding_rs", "oned", "qrcode"] }
 ort = { version = "=2.0.0-rc.14", features = ["ndarray", "download-binaries", "copy-dylibs"] }
+odbc-api = "=29.2.0"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "=0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+] }
+windows-core = "=0.62.2"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

@@ -2,7 +2,7 @@
 //!
 //! `detect_image` returns the same JSON as POST /detect: `detections` of
 //! `{ ic, confidence, bbox }` and `image_base64` of the original frame.
-//! A `.pt` file stays on the Python sidecar. This command reads `.onnx` only.
+//! This command reads `.onnx` only. A `.pt` name is a training file; the page warns and does not detect.
 //!
 //! Boxes are checked against Ultralytics `YOLO(best.onnx)`, not `YOLO(best.pt)`.
 //! Those two already disagree on the same photo. JPEG bytes are decoded with
@@ -143,7 +143,11 @@ fn cv_round_f32(value: f32) -> i32 {
 fn json_f64(value: &Value) -> Option<f64> {
     // JSON true must not become 1. A string is not a fraction.
     let number = value.as_f64()?;
-    if number.is_finite() { Some(number) } else { None }
+    if number.is_finite() {
+        Some(number)
+    } else {
+        None
+    }
 }
 
 fn clean_detect_roi(raw: &Value) -> Option<Roi> {
@@ -191,7 +195,12 @@ fn roi_slice(width: usize, height: usize, roi: &Roi) -> (usize, usize, usize, us
     (x as usize, y as usize, rw as usize, rh as usize)
 }
 
-fn crop_rgb(rgb: &[u8], width: usize, height: usize, roi: &Roi) -> (Vec<u8>, usize, usize, i32, i32) {
+fn crop_rgb(
+    rgb: &[u8],
+    width: usize,
+    height: usize,
+    roi: &Roi,
+) -> (Vec<u8>, usize, usize, i32, i32) {
     let (x, y, rw, rh) = roi_slice(width, height, roi);
     let mut out = Vec::with_capacity(rw * rh * 3);
     for row in 0..rh {
@@ -444,17 +453,19 @@ fn nms(mut items: Vec<Candidate>) -> Vec<Candidate> {
             }
         }
     }
-    keep.into_iter().map(|index| {
-        let item = &items[index];
-        Candidate {
-            x1: item.x1,
-            y1: item.y1,
-            x2: item.x2,
-            y2: item.y2,
-            score: item.score,
-            class_id: item.class_id,
-        }
-    }).collect()
+    keep.into_iter()
+        .map(|index| {
+            let item = &items[index];
+            Candidate {
+                x1: item.x1,
+                y1: item.y1,
+                x2: item.x2,
+                y2: item.y2,
+                score: item.score,
+                class_id: item.class_id,
+            }
+        })
+        .collect()
 }
 
 fn class_name(names: &[String], class_id: usize) -> String {
@@ -489,7 +500,10 @@ fn parse_class_names(text: &str) -> Vec<String> {
             index += 1;
             continue;
         }
-        let Ok(key) = std::str::from_utf8(&bytes[key_start..key_end]).unwrap_or("").parse::<usize>() else {
+        let Ok(key) = std::str::from_utf8(&bytes[key_start..key_end])
+            .unwrap_or("")
+            .parse::<usize>()
+        else {
             index += 1;
             continue;
         };
@@ -541,7 +555,14 @@ fn names_from_pairs(pairs: Vec<(usize, String)>) -> Vec<String> {
     names
 }
 
-fn score_at(values: &[f32], bcn: bool, channels: usize, boxes: usize, class_slot: usize, box_index: usize) -> f32 {
+fn score_at(
+    values: &[f32],
+    bcn: bool,
+    channels: usize,
+    boxes: usize,
+    class_slot: usize,
+    box_index: usize,
+) -> f32 {
     if bcn {
         values[class_slot * boxes + box_index]
     } else {
@@ -549,7 +570,12 @@ fn score_at(values: &[f32], bcn: bool, channels: usize, boxes: usize, class_slot
     }
 }
 
-fn candidates_from_output(values: &[f32], channels: usize, boxes: usize, bcn: bool) -> Vec<Candidate> {
+fn candidates_from_output(
+    values: &[f32],
+    channels: usize,
+    boxes: usize,
+    bcn: bool,
+) -> Vec<Candidate> {
     let class_count = channels.saturating_sub(4);
     let mut found = Vec::new();
     if class_count == 0 {
@@ -623,7 +649,9 @@ fn detections_from_output(
     };
     let mut detections = Vec::with_capacity(chosen.len());
     for item in chosen {
-        let scaled = scale_box(item.x1, item.y1, item.x2, item.y2, view_h, view_w, image_size);
+        let scaled = scale_box(
+            item.x1, item.y1, item.x2, item.y2, view_h, view_w, image_size,
+        );
         detections.push(Detection {
             ic: class_name(names, item.class_id),
             confidence: round_places(f64::from(item.score), 4),
@@ -638,7 +666,12 @@ fn detections_from_output(
     Ok(detections)
 }
 
-fn end_to_end_candidates(values: &[f32], channels: usize, boxes: usize, bcn: bool) -> Vec<Candidate> {
+fn end_to_end_candidates(
+    values: &[f32],
+    channels: usize,
+    boxes: usize,
+    bcn: bool,
+) -> Vec<Candidate> {
     if channels < 6 {
         return Vec::new();
     }
@@ -732,7 +765,8 @@ fn decode_jpeg(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
 }
 
 fn decode_with_image(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
-    let image = image::load_from_memory(bytes).map_err(|_| "Could not read the image".to_string())?;
+    let image =
+        image::load_from_memory(bytes).map_err(|_| "Could not read the image".to_string())?;
     let rgb = image.to_rgb8();
     let (width, height) = rgb.dimensions();
     reject_size(width, height)?;
@@ -807,9 +841,12 @@ fn runtime() -> Result<ort::environment::Environment, String> {
         return Ok(env);
     }
     prepare_runtime();
-    let env = ort::init()
-        .build()
-        .map_err(|err| format!("YOLO model is not loaded: {}", short_error(&err.to_string())))?;
+    let env = ort::init().build().map_err(|err| {
+        format!(
+            "YOLO model is not loaded: {}",
+            short_error(&err.to_string())
+        )
+    })?;
     *guard = Some(env.clone());
     Ok(env)
 }
@@ -859,7 +896,10 @@ fn load_model(path: &Path, key: CacheKey) -> Result<LoadedModel, String> {
     })
 }
 
-fn with_model<T>(path: &Path, run: impl FnOnce(&mut LoadedModel) -> Result<T, String>) -> Result<T, String> {
+fn with_model<T>(
+    path: &Path,
+    run: impl FnOnce(&mut LoadedModel) -> Result<T, String>,
+) -> Result<T, String> {
     static CACHE: Mutex<Option<LoadedModel>> = Mutex::new(None);
     let mut guard = CACHE.lock().unwrap_or_else(|err| err.into_inner());
     let key = cache_key(path)?;
@@ -867,7 +907,9 @@ fn with_model<T>(path: &Path, run: impl FnOnce(&mut LoadedModel) -> Result<T, St
     if stale {
         *guard = Some(load_model(path, key)?);
     }
-    let model = guard.as_mut().ok_or_else(|| "YOLO model is not loaded".to_string())?;
+    let model = guard
+        .as_mut()
+        .ok_or_else(|| "YOLO model is not loaded".to_string())?;
     run(model)
 }
 
@@ -903,7 +945,8 @@ fn run_model(
     roi: Option<&Roi>,
 ) -> Result<Vec<Detection>, String> {
     let image_size = with_model(path, |model| Ok(model.image_size))?;
-    let (data, view_w, view_h, origin_x, origin_y) = detect_view(rgb, width, height, roi, image_size)?;
+    let (data, view_w, view_h, origin_x, origin_y) =
+        detect_view(rgb, width, height, roi, image_size)?;
     with_model(path, |model| {
         let names = model.names.clone();
         let end_to_end = model.end_to_end;
@@ -1082,10 +1125,23 @@ mod tests {
         assert!(clean_detect_roi(&json!({"x": true, "y": 0, "w": 0.5, "h": 0.5})).is_none());
         assert!(clean_detect_roi(&json!({"x": 0.0, "y": 0.0, "w": 0.001, "h": 0.5})).is_none());
         let roi = clean_detect_roi(&json!({"x": 0.25, "y": 0.25, "w": 0.5, "h": 0.5})).unwrap();
-        assert_eq!(roi, Roi { x: 0.25, y: 0.25, w: 0.5, h: 0.5 });
+        assert_eq!(
+            roi,
+            Roi {
+                x: 0.25,
+                y: 0.25,
+                w: 0.5,
+                h: 0.5
+            }
+        );
         assert_eq!(roi_slice(100, 200, &roi), (25, 50, 50, 100));
         // 0.125 * 8 = 1.0 exactly. 12.5 pixels on a 100-wide image rounds to 12.
-        let half = Roi { x: 0.125, y: 0.0, w: 0.5, h: 0.5 };
+        let half = Roi {
+            x: 0.125,
+            y: 0.0,
+            w: 0.5,
+            h: 0.5,
+        };
         assert_eq!(roi_slice(100, 100, &half).0, 12);
     }
 
@@ -1098,7 +1154,9 @@ mod tests {
         let resized = resize_linear(&src, 4, 4, 3, 2);
         assert_eq!(
             resized,
-            vec![6, 7, 8, 11, 12, 13, 15, 16, 17, 30, 31, 32, 35, 36, 37, 39, 40, 41]
+            vec![
+                6, 7, 8, 11, 12, 13, 15, 16, 17, 30, 31, 32, 35, 36, 37, 39, 40, 41
+            ]
         );
     }
 
@@ -1121,8 +1179,7 @@ mod tests {
             "JPEG decode does not match cv2 on Example3.jpg"
         );
         let payload = detect_on_model(&bytes, &model, None).unwrap();
-        let got: Vec<Detection> =
-            serde_json::from_value(payload["detections"].clone()).unwrap();
+        let got: Vec<Detection> = serde_json::from_value(payload["detections"].clone()).unwrap();
         let fixture = manifest.join("tests").join("example3-onnx-detections.json");
         let expected: Vec<Detection> =
             serde_json::from_str(&std::fs::read_to_string(&fixture).unwrap()).unwrap();

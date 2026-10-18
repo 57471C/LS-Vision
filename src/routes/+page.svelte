@@ -156,23 +156,18 @@ let imagePick: ((file: File | null) => void) | null = null;
 let streamMs = DEFAULT_SCAN_SECONDS * 1000;
 let streamLeft = DEFAULT_SCAN_SECONDS;
 let streamTimer: ReturnType<typeof setInterval> | null = null;
-let streamEpoch = 0;
-let streamRetries = 0;
-let streamRetry: ReturnType<typeof setTimeout> | null = null;
-let ignoreStreamErrorUntil = 0;
+let liveImage = "";
+let liveMessage = "";
+let liveTimer: ReturnType<typeof setInterval> | null = null;
+let liveBusy = false;
 let watchInFlight = false;
 let pageAlive = true;
-let sidecarUp = false;
-let sidecarStarting = false;
-let sidecarSeconds = 0;
-let sidecarTick: ReturnType<typeof setInterval> | null = null;
-let healthTimer: ReturnType<typeof setInterval> | null = null;
 let erpName = "";
 let erpUrl = "";
 let erpOpen = false;
 let iframeFailed = false;
 let erpChecking = false;
-let erpAttempt = 0;
+
 let erpLoadedUrl = "";
 let erpCloseButton: HTMLButtonElement | null = null;
 let modelName = "best.onnx";
@@ -190,13 +185,12 @@ function stopWatch() {
 }
 
 function startWatch() {
-	// A dead sidecar uses the same paused countdown as Stop feed.
-	if (snapshot || camerasMissing || !sidecarUp || !feedOn) return;
+	if (snapshot || camerasMissing || !feedOn) return;
 	stopWatch();
 	streamLeft = streamMs / 1000;
 	void watchFeed();
 	streamTimer = setInterval(() => {
-		if (!feedOn || snapshot || !sidecarUp) return;
+		if (!feedOn || snapshot) return;
 		if (streamLeft <= 1) {
 			streamLeft = streamMs / 1000;
 			void watchFeed();
@@ -206,45 +200,24 @@ function startWatch() {
 	}, 1000);
 }
 
-function clearStreamRetry() {
-	if (streamRetry !== null) {
-		clearTimeout(streamRetry);
-		streamRetry = null;
+function stopLive() {
+	if (liveTimer !== null) {
+		clearInterval(liveTimer);
+		liveTimer = null;
 	}
 }
 
 function showLiveFeed() {
 	if (camerasMissing) return;
-	clearStreamRetry();
-	streamRetries = 0;
-	// Changing the img src aborts the previous request and fires its error.
-	ignoreStreamErrorUntil = Date.now() + 1000;
-	streamEpoch += 1;
+	startLive();
 	startWatch();
-}
-
-function retryStream() {
-	// A request that started before the sidecar was listening stays broken.
-	// Stop/Start feed fixes that by loading a new stream URL. Do the same once
-	// the sidecar is up, and again if that attempt fails.
-	if (Date.now() < ignoreStreamErrorUntil) return;
-	if (!pageAlive || !feedOn || snapshot || !sidecarUp || streamRetry !== null)
-		return;
-	if (streamRetries >= 3) return;
-	streamRetry = setTimeout(() => {
-		streamRetry = null;
-		if (!pageAlive || !feedOn || snapshot || !sidecarUp) return;
-		streamRetries += 1;
-		ignoreStreamErrorUntil = Date.now() + 1000;
-		streamEpoch += 1;
-	}, 2000);
 }
 
 function toggleFeed() {
 	feedOn = !feedOn;
 	if (feedOn) showLiveFeed();
 	else {
-		clearStreamRetry();
+		stopLive();
 		stopWatch();
 	}
 }
@@ -259,7 +232,7 @@ function resumeLiveFeed() {
 	detectState = "idle";
 	paneWidth = 0;
 	paneHeight = 0;
-	if (feedOn) startWatch();
+	if (feedOn) showLiveFeed();
 }
 
 function holdStill(image: string, kitCode: string) {
@@ -276,6 +249,7 @@ function holdStill(image: string, kitCode: string) {
 		detected: false,
 	};
 	stopWatch();
+	stopLive();
 	return detectGeneration;
 }
 
@@ -436,30 +410,17 @@ async function requestDetections(body: { image?: string }): Promise<{
 	image_base64?: unknown;
 	message?: unknown;
 }> {
-	// .onnx runs in Rust. A .pt file still uses the sidecar until that path is removed.
+	// .onnx runs in Rust. A .pt file is the training checkpoint and is not detected.
 	if (modelName.toLowerCase().endsWith(".onnx")) {
 		return await invoke("detect_image", {
 			image: body.image ?? null,
 		});
 	}
-	const res = await fetch("http://127.0.0.1:8008/detect", {
-		method: "POST",
-		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify(body),
-	});
-	const payload = (await res.json()) as {
-		detections?: unknown;
-		image_base64?: unknown;
-		message?: unknown;
+	return {
+		detections: [],
+		image_base64: null,
+		message: `${modelName} is a .pt file. Choose an .onnx model to detect parts.`,
 	};
-	if (!res.ok) {
-		throw new Error(
-			typeof payload.message === "string" && payload.message
-				? payload.message
-				: "Detect failed",
-		);
-	}
-	return payload;
 }
 
 async function runDetect(generation: number, body: { image?: string }) {
@@ -660,12 +621,39 @@ async function decodeCameraImage(image: string): Promise<RustDecode> {
 }
 
 async function readFrame(index: number): Promise<WatchBody> {
-	const res = await fetch(
-		`http://127.0.0.1:8008/camera/snapshot?index=${index}&frame=1`,
-	);
-	const body = (await res.json()) as WatchBody;
-	if (!res.ok) throw new Error(body.message || "Decode failed");
+	const body = await invoke<WatchBody>("capture_snapshot", { index });
+	if (body.status === "fail") throw new Error(body.message || "No frame");
 	return body;
+}
+
+async function refreshLive() {
+	if (!pageAlive || !feedOn || snapshot || liveBusy || !cameraFeedOn) return;
+	liveBusy = true;
+	const index = cameraIndex;
+	try {
+		const frame = await invoke<WatchBody>("capture_snapshot", { index });
+		if (!pageAlive || !feedOn || snapshot || index !== cameraIndex) return;
+		if (frame.status === "fail" || !frame.image) {
+			liveMessage = frame.message || "Camera did not open.";
+			return;
+		}
+		liveImage = frame.image;
+		liveMessage = "";
+	} catch (err: unknown) {
+		if (!pageAlive || index !== cameraIndex) return;
+		liveMessage = invokeError(err, "Camera did not open.");
+	} finally {
+		liveBusy = false;
+	}
+}
+
+function startLive() {
+	if (snapshot || !feedOn || !cameraFeedOn) return;
+	stopLive();
+	void refreshLive();
+	liveTimer = setInterval(() => {
+		void refreshLive();
+	}, 400);
 }
 
 async function lookupCode(code: string): Promise<InspectView> {
@@ -679,13 +667,7 @@ async function lookupCode(code: string): Promise<InspectView> {
 		const file = await invoke("load_bom_json");
 		return viewFromBomFile(file, code);
 	}
-	const res = await fetch("http://127.0.0.1:8008/inspect", {
-		method: "POST",
-		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({ barcode: code }),
-	});
-	if (!res.ok) throw new Error(await res.text());
-	return (await res.json()) as InspectView;
+	return await invoke<InspectView>("inspect_bom", { barcode: code });
 }
 
 function stillWatches(index: number): boolean {
@@ -701,23 +683,19 @@ function stillWatches(index: number): boolean {
 
 async function watchFeed() {
 	if (!feedOn || snapshot || watchInFlight || loading) return;
-	// Wait for the camera list. A snapshot open before that would grab index 0
-	// and make the probe fight the reader.
+	// Wait for the camera list so the first open uses the saved index.
 	if (!cameraFeedOn) return;
 	watchInFlight = true;
 	const index = cameraIndex;
 	try {
-		// Test mode is the typed code. The sidecar snapshot route still skips
-		// decode for that mode. Every other source tries native, then JS, then Rust.
+		// Test mode uses the typed code and does not read the camera.
+		// Every other source tries native, then JS, then Rust.
 		await ensureBomSource();
 		await loadTestMode();
 		if (!pageAlive || !feedOn || snapshot || loading || index !== cameraIndex) {
 			return;
 		}
-		if (testMode) {
-			await fetch(`http://127.0.0.1:8008/camera/snapshot?index=${index}`);
-			return;
-		}
+		if (testMode) return;
 		const frame = await readFrame(index);
 		if (!stillWatches(index) || !frame.image) return;
 		const decoded = await decodeCameraImage(frame.image);
@@ -738,12 +716,23 @@ async function watchFeed() {
 	}
 }
 
+type LocalConfig = {
+	source?: unknown;
+	scanSeconds?: unknown;
+	testMode?: unknown;
+	detectRoi?: unknown;
+	camera?: { index?: unknown } | null;
+	erp?: { name?: unknown; url?: unknown } | null;
+};
+
+async function readConfig(): Promise<LocalConfig> {
+	return await invoke<LocalConfig>("load_local_config");
+}
+
 async function loadScan() {
 	try {
-		const res = await fetch("http://127.0.0.1:8008/settings/scan");
-		if (!res.ok) return;
-		const data = await res.json();
-		const seconds = Number(data.seconds);
+		const data = await readConfig();
+		const seconds = Number(data.scanSeconds);
 		if (!Number.isInteger(seconds) || seconds < 1 || seconds > 60) return;
 		streamMs = seconds * 1000;
 		if (feedOn && !snapshot) streamLeft = seconds;
@@ -755,13 +744,14 @@ async function loadScan() {
 
 async function loadErp() {
 	try {
-		const res = await fetch("http://127.0.0.1:8008/settings/erp");
-		if (!res.ok) return;
-		const data = await res.json();
-		const nextName = typeof data.name === "string" ? data.name.trim() : "";
-		const nextUrl = typeof data.url === "string" ? data.url.trim() : "";
+		const data = await readConfig();
+		const erp =
+			data.erp && typeof data.erp === "object"
+				? data.erp
+				: { name: "", url: "" };
+		const nextName = typeof erp.name === "string" ? erp.name.trim() : "";
+		const nextUrl = typeof erp.url === "string" ? erp.url.trim() : "";
 		if (nextUrl !== erpUrl) {
-			erpAttempt += 1;
 			erpOpen = false;
 			iframeFailed = false;
 			erpChecking = false;
@@ -795,17 +785,9 @@ function noteCameraLookupFailed() {
 async function loadCamerasOnce(): Promise<boolean> {
 	const selected = Number(cameraIndex);
 	try {
-		const res = await fetch(
-			`http://127.0.0.1:8008/cameras?selected=${selected}`,
-		);
+		const listed = await invoke<unknown>("list_cameras");
 		if (!pageAlive) return false;
-		if (!res.ok) {
-			noteCameraLookupFailed();
-			return false;
-		}
-		const data = (await res.json()) as { cameras?: unknown };
-		if (!pageAlive) return false;
-		const found = cameraList(data.cameras);
+		const found = cameraList(listed);
 		const current = Number(cameraIndex);
 		// They picked another index while the probe was running. Keep it.
 		if (
@@ -846,41 +828,25 @@ async function connectCameras() {
 	await loadCameras();
 	if (!pageAlive || snapshot || !feedOn) return;
 	if (camerasMissing) {
+		stopLive();
 		stopWatch();
-		clearStreamRetry();
 		return;
 	}
 	if (!cameraFeedOn) return;
 	showLiveFeed();
 }
 
-async function checkSidecar() {
+async function boot() {
 	if (!pageAlive) return;
-	const wasUp = sidecarUp;
-	try {
-		const res = await fetch("http://127.0.0.1:8008/health");
-		sidecarUp = res.ok;
-	} catch {
-		sidecarUp = false;
-	}
-	if (sidecarUp) stopSidecarWait();
-	else {
-		stopWatch();
-		clearStreamRetry();
-	}
-	if (pageAlive && sidecarUp && !wasUp) {
-		void loadErp();
-		void loadScan();
-		void loadTestMode();
-		void loadDetectRoi();
-		void loadBarcodeRoi();
-		void loadBomSource();
-		void loadModel();
-		void (async () => {
-			await loadCamera();
-			if (pageAlive) await connectCameras();
-		})();
-	}
+	void loadErp();
+	void loadScan();
+	void loadTestMode();
+	void loadDetectRoi();
+	void loadBarcodeRoi();
+	void loadBomSource();
+	void loadModel();
+	await loadCamera();
+	if (pageAlive) await connectCameras();
 }
 
 function ensureBomSource(): Promise<void> {
@@ -905,10 +871,8 @@ async function loadBomSource() {
 
 async function loadTestMode() {
 	try {
-		const res = await fetch("http://127.0.0.1:8008/settings/test-mode");
-		if (!res.ok) return;
-		const data = await res.json();
-		testMode = data.enabled === true;
+		const data = await readConfig();
+		testMode = data.testMode === true;
 	} catch {
 		// A missed read keeps the current mode.
 	}
@@ -941,10 +905,10 @@ function asRoi(value: unknown): DetectRoi | null {
 
 async function loadCamera() {
 	try {
-		const res = await fetch("http://127.0.0.1:8008/settings/camera");
-		if (!res.ok) return;
-		const data = await res.json();
-		const index = Number(data.index);
+		const data = await readConfig();
+		const camera =
+			data.camera && typeof data.camera === "object" ? data.camera : {};
+		const index = Number(camera.index);
 		if (!Number.isInteger(index) || index < 0 || index > 32) return;
 		if (index === skippedSavedIndex) return;
 		cameraIndex = index;
@@ -956,8 +920,11 @@ async function loadCamera() {
 async function applySavedCamera() {
 	const previous = Number(cameraIndex);
 	await loadCamera();
-	if (!pageAlive || !sidecarUp) return;
-	if (Number(cameraIndex) !== previous) await loadCameras();
+	if (!pageAlive) return;
+	if (Number(cameraIndex) !== previous) {
+		await loadCameras();
+		if (feedOn && !snapshot) showLiveFeed();
+	}
 }
 
 async function saveCameraIndex() {
@@ -966,14 +933,20 @@ async function saveCameraIndex() {
 	cameraIndex = index;
 	if (!Number.isInteger(index) || index < 0 || index > 32) return;
 	try {
-		await fetch("http://127.0.0.1:8008/settings/camera", {
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ index }),
-		});
+		const config = await invoke<Record<string, unknown>>("load_local_config");
+		const camera =
+			config.camera &&
+			typeof config.camera === "object" &&
+			!Array.isArray(config.camera)
+				? { ...(config.camera as Record<string, unknown>) }
+				: {};
+		camera.index = index;
+		config.camera = camera;
+		await invoke("save_local_config", { config });
 	} catch {
 		// The live view still uses the picked index. The next launch reads the last save.
 	}
+	if (feedOn && !snapshot) showLiveFeed();
 }
 
 function readAdminFlag() {
@@ -983,7 +956,7 @@ function readAdminFlag() {
 	bomSourceReady = loadBomSource();
 	void loadTestMode();
 	void loadModel();
-	if (sidecarUp) void applySavedCamera();
+	void applySavedCamera();
 }
 
 function matchModelName(name: string, files: string[]): string {
@@ -1302,10 +1275,8 @@ function onRoiPointerUp(event: PointerEvent) {
 
 async function loadDetectRoi() {
 	try {
-		const res = await fetch("http://127.0.0.1:8008/settings/detect-roi");
-		if (!res.ok) return;
-		const data = await res.json();
-		detectRoi = asRoi(data.roi);
+		const data = await readConfig();
+		detectRoi = asRoi(data.detectRoi);
 	} catch {
 		// A missed read keeps the current region.
 	}
@@ -1321,25 +1292,16 @@ async function saveDetectRoi(roi: DetectRoi | null) {
 	savingRoi = true;
 	roiMessage = "";
 	try {
-		const res = await fetch("http://127.0.0.1:8008/settings/detect-roi", {
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ roi: roi ? roundRoi(roi) : null }),
-		});
-		const data = (await res.json().catch(() => ({}))) as {
-			status?: string;
-			message?: string;
-			roi?: unknown;
-		};
-		if (!res.ok || data.status === "fail") {
-			throw new Error(data.message || "Could not save the ROI");
-		}
-		detectRoi = asRoi(data.roi);
+		const config = await invoke<Record<string, unknown>>("load_local_config");
+		const next = roi ? roundRoi(roi) : null;
+		config.detectRoi = next;
+		await invoke("save_local_config", { config });
+		detectRoi = asRoi(next);
 		draftRoi = null;
 		draftMark = null;
 		drawing = false;
 		roiDrag = null;
-		roiMessage = data.message || "Saved.";
+		roiMessage = "Saved.";
 		rerunDetect();
 	} catch (err: unknown) {
 		roiMessage = errorMessage(err, "Could not save the ROI");
@@ -1502,28 +1464,9 @@ async function openErp() {
 	// The ERP page stays loaded behind the vision view. Opening it again
 	// must not navigate the iframe, or a menu selection is lost.
 	if (erpLoadedUrl === erpUrl && !iframeFailed) return;
-	const attempt = ++erpAttempt;
 	iframeFailed = false;
-	erpChecking = true;
-	erpLoadedUrl = "";
-	try {
-		const res = await fetch("http://127.0.0.1:8008/settings/erp/frame", {
-			signal: AbortSignal.timeout(12000),
-		});
-		if (!res.ok) throw new Error(await res.text());
-		const data = await res.json();
-		if (attempt !== erpAttempt) return;
-		if (data.frame === true) {
-			erpLoadedUrl = erpUrl;
-		} else {
-			iframeFailed = true;
-		}
-		erpChecking = false;
-	} catch {
-		if (attempt !== erpAttempt) return;
-		iframeFailed = true;
-		erpChecking = false;
-	}
+	erpChecking = false;
+	erpLoadedUrl = erpUrl;
 }
 
 function closeErp() {
@@ -1558,10 +1501,7 @@ onMount(() => {
 		frameObserver = new ResizeObserver(() => measureFrame());
 		frameObserver.observe(paneFrame);
 	}
-	void checkSidecar();
-	healthTimer = setInterval(() => {
-		void checkSidecar();
-	}, 3000);
+	void boot();
 });
 
 onDestroy(() => {
@@ -1570,12 +1510,7 @@ onDestroy(() => {
 	frameObserver?.disconnect();
 	frameObserver = null;
 	stopWatch();
-	clearStreamRetry();
-	stopSidecarWait();
-	if (healthTimer !== null) {
-		clearInterval(healthTimer);
-		healthTimer = null;
-	}
+	stopLive();
 });
 
 function errorMessage(err: unknown, fallback: string): string {
@@ -1585,40 +1520,6 @@ function errorMessage(err: unknown, fallback: string): string {
 function invokeError(err: unknown, fallback: string): string {
 	if (typeof err === "string" && err.trim()) return err;
 	return errorMessage(err, fallback);
-}
-
-function stopSidecarWait() {
-	sidecarStarting = false;
-	if (sidecarTick !== null) {
-		clearInterval(sidecarTick);
-		sidecarTick = null;
-	}
-}
-
-function beginSidecarWait() {
-	sidecarStarting = true;
-	sidecarSeconds = 0;
-	if (sidecarTick !== null) clearInterval(sidecarTick);
-	sidecarTick = setInterval(() => {
-		sidecarSeconds += 1;
-	}, 1000);
-}
-
-async function startSidecar() {
-	if (sidecarStarting || sidecarUp) return;
-	beginSidecarWait();
-	try {
-		const res = await invoke("start_vision_sidecar");
-		console.log(res);
-	} catch (err) {
-		console.error(err);
-		stopSidecarWait();
-		return;
-	}
-	void checkSidecar();
-	setTimeout(() => {
-		void checkSidecar();
-	}, 1500);
 }
 
 function apiField(row: Record<string, unknown>, names: string[]): unknown {
@@ -1790,13 +1691,7 @@ async function runInspect() {
 	loading = true;
 	result = null;
 	try {
-		const res = await fetch("http://127.0.0.1:8008/inspect", {
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ barcode }),
-		});
-		if (!res.ok) throw new Error(await res.text());
-		const body = (await res.json()) as InspectView;
+		const body = await invoke<InspectView>("inspect_bom", { barcode });
 		result = body;
 		if (body.status === "pass") {
 			storeBom(body);
@@ -1826,9 +1721,8 @@ async function decodeAndInspect() {
 		const frame = await readFrame(cameraIndex);
 		if (!pageAlive) return;
 		if (!frame.image) {
-			// A sidecar that does not know frame=1 still returns the code on a
-			// BoM miss, and no image. Keep that code. A new sidecar puts the
-			// JPEG here. The native QR detector reads it first, then ZXing, then Rust.
+			// A frame without a JPEG still keeps a code when the body has one.
+			// The native QR detector reads a JPEG first, then ZXing, then Rust.
 			if (frame.barcode) {
 				barcode = frame.barcode;
 				dropBom();
@@ -1895,25 +1789,25 @@ async function decodeAndInspect() {
 		<div class="flex flex-wrap items-center gap-2">
 			<p
 				class="inline-flex min-h-9 items-center gap-2 border px-2.5 text-xs font-semibold uppercase tracking-wide {snapshot ||
-				(sidecarUp && camerasMissing)
+				camerasMissing
 					? 'border-amber-700/80 bg-amber-950 text-amber-200'
-					: feedOn && sidecarUp && cameraFeedOn
+					: feedOn && cameraFeedOn
 						? 'border-neutral-600 bg-neutral-800 text-neutral-100'
 						: 'border-neutral-700 bg-neutral-900 text-neutral-400'}"
 			>
 				<span
-					class="h-2 w-2 shrink-0 {snapshot || (sidecarUp && camerasMissing)
+					class="h-2 w-2 shrink-0 {snapshot || camerasMissing
 						? 'bg-amber-400'
-						: feedOn && sidecarUp && cameraFeedOn
+						: feedOn && cameraFeedOn
 							? 'bg-green-400'
 							: 'bg-neutral-500'}"
 					aria-hidden="true"
 				></span>
 				{snapshot
 					? "Stream stopped"
-					: sidecarUp && camerasMissing
+					: camerasMissing
 						? "No cameras found"
-						: feedOn && sidecarUp && cameraFeedOn
+						: feedOn && cameraFeedOn
 							? `Streaming · ${streamLeft}s`
 							: "Stream paused"}
 			</p>
@@ -1937,43 +1831,6 @@ async function decodeAndInspect() {
 					/>
 				</svg>
 			</a>
-			<button
-				type="button"
-				class="inline-flex min-h-11 min-w-44 items-center justify-center gap-2 border px-3 text-sm font-semibold disabled:opacity-100 {sidecarStarting
-					? 'cursor-wait border-amber-300 bg-amber-400 text-neutral-950 disabled:cursor-wait'
-					: sidecarUp
-						? 'cursor-default border-green-700 bg-green-600 text-white disabled:cursor-default'
-						: 'border-red-800 bg-red-600 text-white'}"
-				disabled={sidecarStarting || sidecarUp}
-				aria-busy={sidecarStarting}
-				aria-label={sidecarStarting
-					? "Starting vision sidecar"
-					: sidecarUp
-						? "Vision sidecar running"
-						: "Start Vision Sidecar"}
-				on:click={startSidecar}
-			>
-				{#if sidecarStarting}
-					<span class="inline-flex items-end gap-1" aria-hidden="true">
-						<span
-							class="inline-block h-1.5 w-1.5 rounded-full bg-neutral-950 animate-bounce motion-reduce:animate-none"
-						></span>
-						<span
-							class="inline-block h-1.5 w-1.5 rounded-full bg-neutral-950 animate-bounce motion-reduce:animate-none"
-							style="animation-delay: 150ms"
-						></span>
-						<span
-							class="inline-block h-1.5 w-1.5 rounded-full bg-neutral-950 animate-bounce motion-reduce:animate-none"
-							style="animation-delay: 300ms"
-						></span>
-					</span>
-					<span class="font-mono tabular-nums">{sidecarSeconds}s</span>
-				{:else if sidecarUp}
-					Vision sidecar running
-				{:else}
-					Start Vision Sidecar
-				{/if}
-			</button>
 		</div>
 	</header>
 
@@ -2082,26 +1939,6 @@ async function decodeAndInspect() {
 				{/if}
 			</div>
 			<div bind:this={paneFrame} class="relative min-h-0 flex-1 overflow-hidden">
-				{#if sidecarStarting && !snapshot}
-					<div
-						class="pointer-events-none absolute inset-0 z-20 flex flex-col items-center justify-center gap-3 text-neutral-100"
-					>
-						<span class="inline-flex items-end gap-1.5" aria-hidden="true">
-							<span
-								class="inline-block h-2 w-2 rounded-full bg-white animate-bounce motion-reduce:animate-none"
-							></span>
-							<span
-								class="inline-block h-2 w-2 rounded-full bg-white animate-bounce motion-reduce:animate-none"
-								style="animation-delay: 150ms"
-							></span>
-							<span
-								class="inline-block h-2 w-2 rounded-full bg-white animate-bounce motion-reduce:animate-none"
-								style="animation-delay: 300ms"
-							></span>
-						</span>
-						<p class="font-mono text-sm tabular-nums">Starting sidecar · {sidecarSeconds}s</p>
-					</div>
-				{/if}
 				{#if snapshot || (feedOn && cameraFeedOn)}
 					<div
 						class="absolute {zoom ? '' : 'inset-0'}"
@@ -2119,15 +1956,18 @@ async function decodeAndInspect() {
 								class="h-full w-full {zoom ? 'object-fill' : 'object-contain'}"
 								on:load={rememberPaneSize}
 							/>
-						{:else if cameraFeedOn}
+						{:else if cameraFeedOn && liveImage}
 							<img
 								bind:this={paneImage}
-								src="http://127.0.0.1:8008/camera/stream?index={cameraIndex}&feed={streamEpoch}"
+								src={liveImage}
 								alt="Camera feed"
 								class="h-full w-full {zoom ? 'object-fill' : 'object-contain'}"
 								on:load={rememberPaneSize}
-								on:error={retryStream}
 							/>
+						{:else if cameraFeedOn}
+							<p class="absolute inset-0 flex items-center justify-center px-6 text-center text-sm text-neutral-300">
+								{liveMessage || "Opening camera…"}
+							</p>
 						{/if}
 						{#if (snapshot || cameraFeedOn) && paneWidth > 0 && paneHeight > 0 && !drawing && detectRoi}
 							{@const x = detectRoi.x * paneWidth}
@@ -2244,7 +2084,7 @@ async function decodeAndInspect() {
 					>
 						No cameras found
 					</div>
-				{:else if feedOn && sidecarUp && !sidecarStarting}
+				{:else if feedOn && !camerasReady}
 					<div class="absolute inset-0 flex items-center justify-center text-lg text-neutral-400">
 						Looking for cameras...
 					</div>

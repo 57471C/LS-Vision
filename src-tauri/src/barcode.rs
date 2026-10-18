@@ -1,6 +1,6 @@
 //! Decode one Code 39 or QR symbol from an image.
-//! The camera stays on the Python sidecar. This command only reads pixels
-//! it is given: a data URL, raw base64, or a snapshot body with an `image` field.
+//! The camera frame comes from `capture_snapshot`. This command only reads
+//! pixels it is given: a data URL, raw base64, or a snapshot body with an `image` field.
 
 use std::collections::HashSet;
 use std::fs::OpenOptions;
