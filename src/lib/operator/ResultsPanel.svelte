@@ -1,6 +1,10 @@
 <script lang="ts">
 // biome-ignore-all lint/correctness/noUnusedVariables: Biome 2.4 does not treat Svelte template references as uses
 
+import { useOperator } from "$lib/stores/operator";
+
+const { chooseAndDetect, operator } = useOperator();
+
 type Part = { ic: string; des: string; qty: number };
 
 type InspectView = {
@@ -30,15 +34,6 @@ type DetectedCount = {
 	ic: string;
 	count: number;
 };
-
-export let result: InspectView | null = null;
-export let testMode = false;
-export let bomSource: "json" | "mssql" | "api" = "json";
-export let bom: BomView | null = null;
-export let detectState: "idle" | "running" | "done" = "idle";
-export let detectMessage = "";
-export let detections: Detection[] = [];
-export let onChooseImage: () => void | Promise<void> = () => {};
 
 function detectionCounts(items: Detection[]): Record<string, number> {
 	const counts: Record<string, number> = {};
@@ -80,24 +75,24 @@ function matchSummary(parts: Part[], items: Detection[]): string {
 	<h2 class="shrink-0 border-b border-neutral-800 px-3 py-1.5 text-[11px] font-semibold uppercase tracking-widest text-neutral-500">
 		Result
 	</h2>
-	{#if result}
+	{#if $operator.result}
 		<p
-			class="shrink-0 px-4 py-4 text-4xl font-black uppercase leading-none tracking-widest {result.status ===
+			class="shrink-0 px-4 py-4 text-4xl font-black uppercase leading-none tracking-widest {$operator.result.status ===
 			'pass'
 				? 'bg-green-500 text-neutral-950'
 				: 'bg-red-600 text-white'}"
 		>
-			{result.status}
+			{$operator.result.status}
 		</p>
 		<div class="result-scroll flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4">
-			{#if result.kitCode}
-				<p class="font-mono text-2xl font-semibold tracking-tight">{result.kitCode}</p>
+			{#if $operator.result.kitCode}
+				<p class="font-mono text-2xl font-semibold tracking-tight">{$operator.result.kitCode}</p>
 			{/if}
-			{#if testMode && isLoadedBom(result, bom)}
+			{#if $operator.testMode && isLoadedBom($operator.result, $operator.bom)}
 				<button
 					type="button"
 					class="inline-flex min-h-11 w-fit items-center border border-blue-500 bg-blue-600 px-4 text-sm font-semibold text-white"
-					on:click={onChooseImage}
+					on:click={chooseAndDetect}
 				>
 					Choose image
 				</button>
@@ -105,18 +100,18 @@ function matchSummary(parts: Part[], items: Detection[]): string {
 					Test mode is on. Choose an image file to detect parts for this kit.
 				</p>
 			{/if}
-			{#if result.des}
-				<p class="text-base text-neutral-300">{result.des}</p>
+			{#if $operator.result.des}
+				<p class="text-base text-neutral-300">{$operator.result.des}</p>
 			{/if}
-			{#if result.message}
-				<p class="text-base text-neutral-200">{result.message}</p>
+			{#if $operator.result.message}
+				<p class="text-base text-neutral-200">{$operator.result.message}</p>
 			{/if}
-			{#if result.parts?.length}
+			{#if $operator.result.parts?.length}
 				{@const detectFailed =
-					detectState === "done" && !!detectMessage && detections.length === 0}
+					$operator.detectState === "done" && !!$operator.detectMessage && $operator.detections.length === 0}
 				{@const showSeen =
-					detectState !== "idle" && isLoadedBom(result, bom) && !detectFailed}
-				{@const counts = detectionCounts(detections)}
+					$operator.detectState !== "idle" && isLoadedBom($operator.result, $operator.bom) && !detectFailed}
+				{@const counts = detectionCounts($operator.detections)}
 				<table class="w-full border-collapse text-left text-sm">
 					<thead>
 						<tr class="border-b border-neutral-600 text-[11px] uppercase tracking-widest text-neutral-400">
@@ -129,38 +124,38 @@ function matchSummary(parts: Part[], items: Detection[]): string {
 						</tr>
 					</thead>
 					<tbody>
-						{#each result.parts as part, i (i)}
+						{#each $operator.result.parts as part, i (i)}
 							<tr class="border-b border-neutral-800">
 								<td class="py-2 pr-3 font-mono font-medium">{part.ic}</td>
 								<td class="py-2 pr-3 text-neutral-200">{part.des}</td>
 								<td class="py-2 text-right font-semibold">{part.qty}</td>
 								{#if showSeen}
 									<td
-										class="py-2 text-right font-semibold {detectState === 'running'
+										class="py-2 text-right font-semibold {$operator.detectState === 'running'
 											? 'text-neutral-500'
 											: (counts[part.ic] ?? 0) === part.qty
 												? 'text-green-400'
 												: 'text-red-400'}"
 									>
-										{detectState === "running" ? "…" : (counts[part.ic] ?? 0)}
+										{$operator.detectState === "running" ? "…" : (counts[part.ic] ?? 0)}
 									</td>
 								{/if}
 							</tr>
 						{/each}
 					</tbody>
 				</table>
-				{#if showSeen && detectState === "done"}
-					<p class="text-sm text-neutral-300">{matchSummary(result.parts, detections)}</p>
+				{#if showSeen && $operator.detectState === "done"}
+					<p class="text-sm text-neutral-300">{matchSummary($operator.result.parts, $operator.detections)}</p>
 				{/if}
 			{/if}
-			{#if detectState === "running"}
+			{#if $operator.detectState === "running"}
 				<p class="text-sm text-neutral-400">Detecting parts...</p>
 			{/if}
-			{#if detectState === "done"}
-				{@const extras = partsOutsideBom(detections, bom?.parts ?? null)}
+			{#if $operator.detectState === "done"}
+				{@const extras = partsOutsideBom($operator.detections, $operator.bom?.parts ?? null)}
 				{#if extras.length}
 					<h3 class="text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
-						{bom ? "Not in BoM" : "Detected parts"}
+						{$operator.bom ? "Not in BoM" : "Detected parts"}
 					</h3>
 					<table class="w-full border-collapse text-left text-sm">
 						<thead>
@@ -180,15 +175,15 @@ function matchSummary(parts: Part[], items: Detection[]): string {
 					</table>
 				{/if}
 			{/if}
-			{#if detectMessage}
-				<p class="text-sm text-red-300">{detectMessage}</p>
+			{#if $operator.detectMessage}
+				<p class="text-sm text-red-300">{$operator.detectMessage}</p>
 			{/if}
-			{#if result.info}
-				<p class="text-sm text-neutral-400">{result.info}</p>
+			{#if $operator.result.info}
+				<p class="text-sm text-neutral-400">{$operator.result.info}</p>
 			{/if}
-			{#if result.kitsFound != null || result.expectedKitCount != null}
+			{#if $operator.result.kitsFound != null || $operator.result.expectedKitCount != null}
 				<p class="text-sm text-neutral-400">
-					Info only: {result.kitsFound ?? "—"} kit(s) found, {result.expectedKitCount ?? "—"} expected
+					Info only: {$operator.result.kitsFound ?? "—"} kit(s) found, {$operator.result.expectedKitCount ?? "—"} expected
 				</p>
 			{/if}
 		</div>
@@ -196,11 +191,11 @@ function matchSummary(parts: Part[], items: Detection[]): string {
 		<div class="px-4 py-8">
 			<p class="text-lg font-medium text-neutral-300">No result yet</p>
 			<p class="mt-1 text-sm text-neutral-500">
-				{testMode
-					? bomSource === "api"
+				{$operator.testMode
+					? $operator.bomSource === "api"
 						? "Type a job card number, then choose an image."
 						: "Type a barcode, then choose an image."
-					: bomSource === "api"
+					: $operator.bomSource === "api"
 						? "A decoded barcode is used as the job card number."
 						: "Decode a barcode or press Enter."}
 			</p>

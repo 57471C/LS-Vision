@@ -8,7 +8,7 @@ LS-Vision is a Tauri 2 + SvelteKit desktop app for bench-top kit verification us
 
 ## Architecture notes
 
-- Frontend: SvelteKit routes under `src/routes/`. Operator UI starts at `src/routes/+page.svelte`, which keeps the state and renders `OperatorToolbar`, `CameraView`, and `ResultsPanel` from `src/lib/operator/`.
+- Frontend: SvelteKit routes under `src/routes/`. `src/routes/+page.svelte` is a thin shell: it creates the operator session from `src/lib/operator/session.ts`, provides the store from `src/lib/stores/operator.ts`, and renders `OperatorToolbar`, `CameraView`, and `ResultsPanel`. Settings stays on `src/routes/settings/+page.svelte`.
 - Rust/Tauri backend: `src-tauri/`.
 - Inference is ONNX Runtime in Rust (`detect_image`). The app does not start a Python process. A `.pt` file is a training checkpoint: the page warns and does not detect.
 - Settings lists the execution providers this PC can run. CPU is always listed. DirectML is listed when DirectML and a Direct3D 12 adapter are present. CUDA is listed when an NVIDIA adapter and the CUDA execution provider libraries load. The saved `inferenceEp` is used when the session is created. A provider that fails to start falls back to CPU. The saved choice is kept.
