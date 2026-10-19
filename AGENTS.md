@@ -18,6 +18,7 @@ LS-Vision is a Tauri 2 + SvelteKit desktop app for bench-top kit verification us
 - BoM lookup stays behind a simple interface so Settings can swap JSON, API, and MSSQL.
 - The operator Console button and drawer show only while admin is unlocked (`sessionStorage` key `ls-vision-settings-open`). Lines are still recorded when the page is locked. Locking admin closes the drawer.
 - Release builds enable the Tauri `devtools` feature, and the main window and camera preview set `devtools: true`. Ctrl+Shift+I is Tauri's shortcut. F12 calls the same inspector from `src/routes/+layout.svelte`.
+- Pass and fail inspections are stored in SQLite under LocalAppData (`results/results.sqlite`), or Documents when LocalAppData is missing. The snapshot JPEG is a file under `results/images`. The database stores that path. Settings > Capture has "Do not save Pass / Fail results", on by default (`skipResultSave`). When it is on, the row and the JPEG are not written. File names are `P-{kitIC}-{DDMMYY}-{HH-MM-SS}.jpg` and `F-{kitIC}-{DDMMYY}-{HH-MM-SS}.jpg`. Operators open `/results` from the operator header and from the top of the settings rail. Delete shows only while admin is unlocked and removes the row and the JPEG.
 
 ## Conventions
 

@@ -50,6 +50,7 @@ let scanSeconds = 8;
 let scanNotice = "";
 let savingScan = false;
 let testMode = false;
+let skipResultSave = true;
 let testNotice = "";
 let savingTest = false;
 let roi: DetectRoi | null = null;
@@ -661,6 +662,7 @@ async function loadTestMode() {
 	try {
 		const data = await loadDocument();
 		testMode = data.testMode === true;
+		skipResultSave = data.skipResultSave !== false;
 	} catch (err: unknown) {
 		testNotice = invokeError(err, "Could not load Test mode");
 	}
@@ -680,14 +682,18 @@ async function saveTestMode() {
 	savingTest = true;
 	testNotice = "";
 	const enabled = testMode;
+	const skipSave = skipResultSave;
 	try {
 		const current = await loadDocument();
 		current.testMode = enabled;
+		current.skipResultSave = skipSave;
 		const saved = await storeDocument(current);
 		testMode = saved.testMode === true;
+		skipResultSave = saved.skipResultSave !== false;
 		testNotice = "Saved";
 	} catch (err: unknown) {
 		testMode = !enabled;
+		skipResultSave = !skipSave;
 		testNotice = errorMessage(err, "Could not save Test mode");
 	} finally {
 		savingTest = false;
@@ -1611,6 +1617,23 @@ onDestroy(() => {
 				class="settings-scroll flex w-24 shrink-0 flex-col gap-2 overflow-y-auto border-r border-neutral-800 bg-neutral-900 p-2"
 				aria-label="Settings sections"
 			>
+				<a href="/results" class={sectionOff}>
+					<svg
+						xmlns="http://www.w3.org/2000/svg"
+						viewBox="0 0 24 24"
+						class="h-5 w-5"
+						fill="none"
+						stroke="currentColor"
+						stroke-width="2"
+						aria-hidden="true"
+					>
+						<path d="M4 19V10" />
+						<path d="M10 19V5" />
+						<path d="M16 19v-6" />
+						<path d="M22 19H2" />
+					</svg>
+					Results
+				</a>
 				<button
 					type="button"
 					class={section === "camera" ? sectionOn : sectionOff}
@@ -1953,6 +1976,18 @@ onDestroy(() => {
 								</label>
 								<p class="text-sm text-neutral-400">
 									When this is on, entering a kit IC and loading its BoM asks for an image file. Detection runs on that file. When it is off, the operator page keeps the camera and barcode flow.
+								</p>
+								<label class="flex items-center gap-3 text-sm font-medium text-neutral-100">
+									<input
+										type="checkbox"
+										class="h-5 w-5 accent-blue-500"
+										bind:checked={skipResultSave}
+										disabled={savingTest}
+									/>
+									Do not save Pass / Fail results.
+								</label>
+								<p class="text-sm text-neutral-400">
+									When this is on, a pass or fail is not written and no snapshot is saved. Turn it off to keep the result and its image.
 								</p>
 							</fieldset>
 							<button

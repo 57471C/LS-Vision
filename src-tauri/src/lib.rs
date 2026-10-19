@@ -5,6 +5,7 @@ mod camera;
 mod detect;
 mod inference_ep;
 mod local_config;
+mod results;
 
 use tauri::Manager;
 
@@ -43,7 +44,11 @@ pub fn run() {
             detect::detect_image,
             detect::benchmark_detect,
             inference_ep::inference_status,
-            inference_ep::set_inference_ep
+            inference_ep::set_inference_ep,
+            results::save_result,
+            results::list_results,
+            results::delete_result,
+            results::result_image
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
