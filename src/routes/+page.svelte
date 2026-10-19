@@ -95,6 +95,12 @@ onDestroy(() => stop());
 				</button>
 			{/if}
 			<a
+				href="/results"
+				class="inline-flex h-11 items-center border border-neutral-600 bg-neutral-800 px-3 text-sm font-semibold text-neutral-100"
+			>
+				Results
+			</a>
+			<a
 				href="/settings"
 				aria-label="Settings"
 				class="inline-flex h-11 w-11 items-center justify-center border border-neutral-600 bg-neutral-800 text-neutral-100"

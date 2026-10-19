@@ -304,8 +304,84 @@ function attachSession(
 		};
 	}
 
+	function detectionCounts(items: Detection[]): Record<string, number> {
+		const counts: Record<string, number> = {};
+		for (const item of items) {
+			if (!item.ic) continue;
+			counts[item.ic] = (counts[item.ic] ?? 0) + 1;
+		}
+		return counts;
+	}
+
+	async function recordResult(image: string | null, includeDetection: boolean) {
+		const view = op.result;
+		if (!view || (view.status !== "pass" && view.status !== "fail")) return;
+		const detections = includeDetection ? op.detections.slice() : [];
+		const detectMessage = includeDetection ? op.detectMessage : "";
+		try {
+			const config = await readConfig();
+			if (config.skipResultSave !== false) return;
+			const detectFailed =
+				includeDetection && !!detectMessage && detections.length === 0;
+			const counts =
+				includeDetection && !detectFailed ? detectionCounts(detections) : null;
+			const parts = view.parts ?? [];
+			const known = new Set(parts.map((part) => part.ic));
+			const extras =
+				counts === null
+					? []
+					: Object.entries(counts)
+							.filter(([ic]) => !known.has(ic))
+							.sort((left, right) => left[0].localeCompare(right[0]))
+							.map(([ic, count]) => ({ ic, count }));
+			const outcome = await invoke<{ saved: boolean }>("save_result", {
+				passed: view.status === "pass",
+				kitIc: view.kitCode ?? "",
+				description: view.des ?? "",
+				imageBase64: image,
+				detail: {
+					message: view.message ?? "",
+					info: view.info ?? "",
+					kitsFound: view.kitsFound ?? null,
+					expectedKitCount: view.expectedKitCount ?? null,
+					parts: parts.map((part) => ({
+						ic: part.ic,
+						des: part.des,
+						qty: part.qty,
+						seen: counts ? (counts[part.ic] ?? 0) : null,
+					})),
+					extras,
+				},
+			});
+			if (outcome.saved) {
+				writeConsole(
+					`Result saved: ${view.status} ${view.kitCode?.trim() || "(no kit)"}`,
+				);
+			}
+		} catch (err: unknown) {
+			writeConsole(
+				`Result save failed: ${invokeError(err, "Could not save the result")}`,
+			);
+		}
+	}
+
+	function applyLookup(view: InspectView) {
+		op.result = view;
+		if (view.status === "pass") {
+			storeBom(view);
+			if (op.testMode && op.bom) {
+				void chooseAndDetect();
+				return;
+			}
+		} else {
+			dropBom();
+		}
+		void recordResult(null, false);
+	}
+
 	async function runDetect(generation: number, body: { image?: string }) {
 		if (generation !== detectGeneration) return;
+		const viewAtStart = op.result;
 		op.detectState = "running";
 		op.detections = [];
 		op.detectMessage = "";
@@ -340,11 +416,17 @@ function attachSession(
 				};
 			}
 			op.detectState = "done";
+			if (op.result === viewAtStart) {
+				void recordResult(op.snapshot?.image ?? body.image ?? null, true);
+			}
 		} catch (err: unknown) {
 			if (generation !== detectGeneration || !pageAlive) return;
 			op.detectMessage = errorMessage(err, "Detect failed");
 			noteModelFromDetect(op.detectMessage);
 			op.detectState = "done";
+			if (op.result === viewAtStart) {
+				void recordResult(op.snapshot?.image ?? body.image ?? null, true);
+			}
 		}
 	}
 
@@ -736,6 +818,7 @@ function attachSession(
 		source?: unknown;
 		scanSeconds?: unknown;
 		testMode?: unknown;
+		skipResultSave?: unknown;
 		detectRoi?: unknown;
 		camera?: { index?: unknown; displayFps?: unknown } | null;
 		erp?: { name?: unknown; url?: unknown } | null;
@@ -1627,18 +1710,14 @@ function attachSession(
 		op.loading = true;
 		op.result = null;
 		try {
-			const view = await lookupCode(op.barcode);
-			op.result = view;
-			if (view.status === "pass") {
-				storeBom(view);
-				if (op.testMode) void chooseAndDetect();
-			} else dropBom();
+			applyLookup(await lookupCode(op.barcode));
 		} catch (err: unknown) {
 			op.result = {
 				status: "fail",
 				message: invokeError(err, "Request failed"),
 			};
 			dropBom();
+			void recordResult(null, false);
 		} finally {
 			op.loading = false;
 		}
@@ -1649,18 +1728,14 @@ function attachSession(
 		op.loading = true;
 		op.result = null;
 		try {
-			const view = await lookupCode(op.barcode);
-			op.result = view;
-			if (view.status === "pass") {
-				storeBom(view);
-				if (op.testMode) void chooseAndDetect();
-			} else dropBom();
+			applyLookup(await lookupCode(op.barcode));
 		} catch (err: unknown) {
 			op.result = {
 				status: "fail",
 				message: invokeError(err, "Request failed"),
 			};
 			dropBom();
+			void recordResult(null, false);
 		} finally {
 			op.loading = false;
 		}
@@ -1681,18 +1756,14 @@ function attachSession(
 		op.loading = true;
 		op.result = null;
 		try {
-			const view = await lookupCode(op.barcode);
-			op.result = view;
-			if (view.status === "pass") {
-				storeBom(view);
-				if (op.testMode) void chooseAndDetect();
-			} else dropBom();
+			applyLookup(await lookupCode(op.barcode));
 		} catch (err: unknown) {
 			op.result = {
 				status: "fail",
 				message: invokeError(err, "Request failed"),
 			};
 			dropBom();
+			void recordResult(null, false);
 		} finally {
 			op.loading = false;
 		}
@@ -1723,12 +1794,14 @@ function attachSession(
 						status: "fail",
 						message: frame.message || "Barcode not found in BoM",
 					};
+					void recordResult(null, false);
 					return;
 				}
 				op.result = {
 					status: "fail",
 					message: frame.message || "No frame",
 				};
+				void recordResult(null, false);
 				return;
 			}
 			await yieldToPaint();
@@ -1740,6 +1813,7 @@ function attachSession(
 					status: "fail",
 					message: decoded.message || "No code detected",
 				};
+				void recordResult(frame.image, false);
 				return;
 			}
 			const view = await lookupCode(code);
@@ -1755,12 +1829,14 @@ function attachSession(
 			} else {
 				op.barcode = code;
 				dropBom();
+				void recordResult(frame.image, false);
 			}
 		} catch (err: unknown) {
 			op.result = {
 				status: "fail",
 				message: invokeError(err, "Decode failed"),
 			};
+			void recordResult(null, false);
 		} finally {
 			op.loading = false;
 		}

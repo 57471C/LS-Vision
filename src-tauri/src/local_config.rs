@@ -178,6 +178,7 @@ fn default_config() -> Value {
         },
         "scanSeconds": 8,
         "testMode": false,
+        "skipResultSave": true,
         "detectRoi": null,
         "barcodeRoi": null,
         "model": "",
