@@ -16,6 +16,8 @@ LS-Vision is a Tauri 2 + SvelteKit desktop app for bench-top kit verification us
 - Start/Stop Feed ignores extra clicks for 1.52 seconds. While locked, the button reads Please wait, is disabled, and draws at half opacity.
 - Barcode decode crops to `barcodeRoi` when one is saved, then tries the native QR detector, ZXing (QR), and `decode_barcode` (QR and Code 39). One trailing slash is removed. BoM lookup is JSON (`vision/sample-bom.json`), the job-card API, or MSSQL. Test mode looks up the typed code and then detects on a chosen image file.
 - BoM lookup stays behind a simple interface so Settings can swap JSON, API, and MSSQL.
+- The operator Console button and drawer show only while admin is unlocked (`sessionStorage` key `ls-vision-settings-open`). Lines are still recorded when the page is locked. Locking admin closes the drawer.
+- Release builds enable the Tauri `devtools` feature, and the main window and camera preview set `devtools: true`. Ctrl+Shift+I is Tauri's shortcut. F12 calls the same inspector from `src/routes/+layout.svelte`.
 
 ## Conventions
 
