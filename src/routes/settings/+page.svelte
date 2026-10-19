@@ -1703,13 +1703,13 @@ onDestroy(() => {
 				class="settings-scroll min-h-0 flex-1 overflow-y-auto"
 				aria-labelledby="settings-section-heading"
 			>
-				<div class="mx-auto flex max-w-2xl flex-col gap-4 p-4">
+				<div class="mx-auto grid w-full max-w-2xl grid-cols-1 items-start gap-4 p-4 xl:max-w-6xl xl:grid-cols-2">
 					{#if section === "camera"}
-						<h2 id="settings-section-heading" class="text-lg font-semibold tracking-tight">
+						<h2 id="settings-section-heading" class="text-lg font-semibold tracking-tight xl:col-span-2">
 							Camera
 						</h2>
 						<form
-							class="flex flex-col gap-4 border border-neutral-700 bg-neutral-900 p-4"
+							class="flex flex-col gap-4 border border-neutral-700 bg-neutral-900 p-4 xl:col-span-2 xl:grid xl:grid-cols-2 xl:items-start"
 							on:submit|preventDefault={saveCamera}
 						>
 							<fieldset class="flex flex-col gap-3">
@@ -1891,7 +1891,7 @@ onDestroy(() => {
 									Resolution, focus, brightness, and contrast are sent to this camera. Reset returns the defaults. Cancel returns the last saved settings.
 								</p>
 							</fieldset>
-							<div class="flex flex-wrap items-center gap-2">
+							<div class="flex flex-wrap items-center gap-2 xl:col-span-2">
 								<button
 									type="submit"
 									class="inline-flex min-h-11 items-center border border-blue-500 bg-blue-600 px-4 text-sm font-semibold text-white disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
@@ -1924,14 +1924,14 @@ onDestroy(() => {
 								</button>
 							</div>
 							{#if cameraNotice}
-								<p class="text-sm text-neutral-200">{cameraNotice}</p>
+								<p class="text-sm text-neutral-200 xl:col-span-2">{cameraNotice}</p>
 							{/if}
 							{#if previewNotice}
-								<p class="text-sm text-neutral-200">{previewNotice}</p>
+								<p class="text-sm text-neutral-200 xl:col-span-2">{previewNotice}</p>
 							{/if}
 						</form>
 					{:else if section === "capture"}
-						<h2 id="settings-section-heading" class="text-lg font-semibold tracking-tight">
+						<h2 id="settings-section-heading" class="text-lg font-semibold tracking-tight xl:col-span-2">
 							Capture
 						</h2>
 						<form
@@ -2023,7 +2023,7 @@ onDestroy(() => {
 									{/if}
 									Hold a snapshot on the operator page and use Set ROI to draw it.
 								</p>
-								<div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
+								<div class="grid grid-cols-2 gap-3 sm:grid-cols-4 xl:grid-cols-2">
 									<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
 										Left
 										<input
@@ -2115,7 +2115,7 @@ onDestroy(() => {
 									{/if}
 									On the operator page, use Set barcode ROI to draw it on the live feed.
 								</p>
-								<div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
+								<div class="grid grid-cols-2 gap-3 sm:grid-cols-4 xl:grid-cols-2">
 									<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
 										Left
 										<input
@@ -2189,7 +2189,7 @@ onDestroy(() => {
 							{/if}
 						</form>
 					{:else if section === "training"}
-						<h2 id="settings-section-heading" class="text-lg font-semibold tracking-tight">
+						<h2 id="settings-section-heading" class="text-lg font-semibold tracking-tight xl:col-span-2">
 							Training
 						</h2>
 						<form
@@ -2293,7 +2293,7 @@ onDestroy(() => {
 							{/if}
 						</form>
 					{:else}
-						<h2 id="settings-section-heading" class="text-lg font-semibold tracking-tight">
+						<h2 id="settings-section-heading" class="text-lg font-semibold tracking-tight xl:col-span-2">
 							Database
 						</h2>
 						<form
@@ -2367,78 +2367,82 @@ onDestroy(() => {
 											SQL Server Authentication
 										</label>
 									</fieldset>
-									<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
-										Server
-										<input
-											class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
-											bind:value={mssql.server}
-											autocomplete="off"
-										/>
-									</label>
-									<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
-										Database
-										<input
-											class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
-											bind:value={mssql.database}
-											autocomplete="off"
-										/>
-									</label>
-									<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
-										<span>
-											Username
-											{#if auth === "sql"}
-												<span class="font-normal normal-case tracking-normal text-red-400">Required</span>
-											{/if}
-										</span>
-										<input
-											class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100 disabled:bg-neutral-800 disabled:text-neutral-500"
-											bind:value={mssql.user}
-											autocomplete="off"
-											disabled={auth === "windows"}
-											required={auth === "sql"}
-										/>
-									</label>
-									<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
-										<span>
-											Password
-											{#if auth === "sql"}
-												<span class="font-normal normal-case tracking-normal text-red-400">Required</span>
-											{/if}
-										</span>
-										<input
-											type="password"
-											class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100 disabled:bg-neutral-800 disabled:text-neutral-500"
-											bind:value={mssqlPassword}
-											autocomplete="new-password"
-											disabled={auth === "windows"}
-											required={auth === "sql"}
-										/>
-									</label>
+									<div class="grid grid-cols-1 gap-3 xl:grid-cols-2">
+										<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+											Server
+											<input
+												class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
+												bind:value={mssql.server}
+												autocomplete="off"
+											/>
+										</label>
+										<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+											Database
+											<input
+												class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
+												bind:value={mssql.database}
+												autocomplete="off"
+											/>
+										</label>
+										<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+											<span>
+												Username
+												{#if auth === "sql"}
+													<span class="font-normal normal-case tracking-normal text-red-400">Required</span>
+												{/if}
+											</span>
+											<input
+												class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100 disabled:bg-neutral-800 disabled:text-neutral-500"
+												bind:value={mssql.user}
+												autocomplete="off"
+												disabled={auth === "windows"}
+												required={auth === "sql"}
+											/>
+										</label>
+										<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+											<span>
+												Password
+												{#if auth === "sql"}
+													<span class="font-normal normal-case tracking-normal text-red-400">Required</span>
+												{/if}
+											</span>
+											<input
+												type="password"
+												class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100 disabled:bg-neutral-800 disabled:text-neutral-500"
+												bind:value={mssqlPassword}
+												autocomplete="new-password"
+												disabled={auth === "windows"}
+												required={auth === "sql"}
+											/>
+										</label>
+									</div>
 									<p class="text-sm text-neutral-400">
 										Inspect runs the queries in vision/bom_queries.sql.
 									</p>
 								</div>
 							{:else if source === "api"}
 								<div class="flex flex-col gap-3 border-t border-neutral-800 pt-4">
-									<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
-										Base URL
-										<input
-											type="url"
-											class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
-											bind:value={apiBaseUrl}
-											autocomplete="off"
-											placeholder="https://"
-										/>
-									</label>
-									<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
-										Endpoint path
-										<input
-											class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
-											bind:value={apiPath}
-											autocomplete="off"
-											placeholder="/bom"
-										/>
-									</label>
+									<div class="grid grid-cols-1 gap-3 xl:grid-cols-2">
+										<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+											Base URL
+											<input
+												type="url"
+												class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
+												bind:value={apiBaseUrl}
+												autocomplete="off"
+												placeholder="https://"
+											/>
+										</label>
+										<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+											Endpoint path
+											<input
+												class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
+												bind:value={apiPath}
+												autocomplete="off"
+												placeholder="/bom"
+											/>
+										</label>
+									</div>
 									<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
 										API key
 										<input
@@ -2476,26 +2480,28 @@ onDestroy(() => {
 								<legend class="text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
 									ERP
 								</legend>
-								<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
-									Button name
-									<input
-										class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
-										bind:value={erpName}
-										maxlength="40"
-										autocomplete="off"
-										placeholder="ERP"
-									/>
-								</label>
-								<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
-									URL
-									<input
-										type="url"
-										class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
-										bind:value={erpUrl}
-										autocomplete="off"
-										placeholder="https://"
-									/>
-								</label>
+								<div class="grid grid-cols-1 gap-3 xl:grid-cols-2">
+									<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+										Button name
+										<input
+											class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
+											bind:value={erpName}
+											maxlength="40"
+											autocomplete="off"
+											placeholder="ERP"
+										/>
+									</label>
+									<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+										URL
+										<input
+											type="url"
+											class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
+											bind:value={erpUrl}
+											autocomplete="off"
+											placeholder="https://"
+										/>
+									</label>
+								</div>
 								<p class="text-sm text-neutral-400">
 									The operator page shows a button with this name. It slides the URL over the vision view. Leave the URL empty to hide the button.
 								</p>
