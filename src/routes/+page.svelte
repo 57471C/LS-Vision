@@ -5,6 +5,8 @@ import { onDestroy, onMount } from "svelte";
 // biome-ignore lint/correctness/noUnusedImports: the operator template uses this component
 import CameraView from "$lib/operator/CameraView.svelte";
 // biome-ignore lint/correctness/noUnusedImports: the operator template uses this component
+import OperatorConsole from "$lib/operator/OperatorConsole.svelte";
+// biome-ignore lint/correctness/noUnusedImports: the operator template uses this component
 import OperatorToolbar from "$lib/operator/OperatorToolbar.svelte";
 // biome-ignore lint/correctness/noUnusedImports: the operator template uses this component
 import ResultsPanel from "$lib/operator/ResultsPanel.svelte";
@@ -29,6 +31,7 @@ const {
 	closeErp,
 	onIframeError,
 	openErpInBrowser,
+	toggleConsole,
 } = session;
 
 onMount(() => start());
@@ -78,6 +81,19 @@ onDestroy(() => stop());
 							? `Streaming · ${$operator.streamLeft}s`
 							: "Stream paused"}
 			</p>
+			{#if $operator.admin}
+				<button
+					type="button"
+					class="inline-flex h-11 items-center border px-3 text-sm font-semibold {$operator.consoleOpen
+						? 'border-neutral-400 bg-neutral-700 text-neutral-100'
+						: 'border-neutral-600 bg-neutral-800 text-neutral-100'}"
+					aria-expanded={$operator.consoleOpen}
+					aria-controls="operator-console"
+					on:click={toggleConsole}
+				>
+					Console
+				</button>
+			{/if}
 			<a
 				href="/settings"
 				aria-label="Settings"
@@ -108,6 +124,10 @@ onDestroy(() => stop());
 
 		<ResultsPanel />
 	</div>
+
+	{#if $operator.admin && $operator.consoleOpen}
+		<OperatorConsole />
+	{/if}
 
 	<footer class="flex shrink-0 items-center border-t border-neutral-800 bg-neutral-900 px-4 py-1.5">
 		<div class="text-[11px] font-semibold uppercase tracking-widest text-neutral-500">

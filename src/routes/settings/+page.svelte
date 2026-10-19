@@ -1502,6 +1502,7 @@ async function openPreview() {
 			resizable: true,
 			focus: true,
 			center: true,
+			devtools: true,
 		});
 		preview.once("tauri://created", () => {
 			postPreviewIndex(index);

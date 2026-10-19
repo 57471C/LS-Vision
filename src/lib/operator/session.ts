@@ -9,6 +9,11 @@ import { tick } from "svelte";
 import { get, writable } from "svelte/store";
 import { activateCamera, readDisplayFps } from "$lib/camera-settings";
 import {
+	appendConsoleLine,
+	consoleStamp,
+	isCameraOpenError,
+} from "$lib/operator/console";
+import {
 	type BarcodeRoi,
 	createOperatorViews,
 	type Detection,
@@ -93,6 +98,70 @@ function attachSession(
 	let displayFps = 15;
 	let watchInFlight = false;
 	let pageAlive = true;
+	let consoleSeq = 1;
+	// Preview retries about every 400ms. One line until that text changes.
+	let cameraErrorNote = "";
+	let modelNote = "";
+
+	function writeConsole(text: string) {
+		const line = {
+			id: consoleSeq,
+			time: consoleStamp(new Date()),
+			text,
+		};
+		consoleSeq += 1;
+		op.consoleLines = appendConsoleLine(op.consoleLines, line);
+	}
+
+	function clearConsole() {
+		op.consoleLines = [];
+		// The live loop can record the current open error on its next tick.
+		cameraErrorNote = "";
+	}
+
+	function toggleConsole() {
+		op.consoleOpen = !op.consoleOpen;
+	}
+
+	function noteCameraOpenError(message: string) {
+		const text = message.trim();
+		if (!isCameraOpenError(text) || cameraErrorNote === text) return;
+		cameraErrorNote = text;
+		writeConsole(`Camera open error: ${text}`);
+	}
+
+	function noteCameraReady() {
+		cameraErrorNote = "";
+	}
+
+	function noteModelLoaded(name: string) {
+		const key = `loaded:${name}`;
+		if (modelNote === key) return;
+		modelNote = key;
+		writeConsole(`Model loaded: ${name}`);
+	}
+
+	function noteModelFailed(message: string) {
+		const text = message.trim() || "Model failed to load.";
+		const key = `failed:${text}`;
+		if (modelNote === key) return;
+		modelNote = key;
+		writeConsole(`Model failed: ${text}`);
+	}
+
+	function noteModelFromDetect(message: string) {
+		if (
+			message === "Model is missing." ||
+			message === "Model failed to load." ||
+			message.includes("is a .pt file")
+		) {
+			noteModelFailed(message);
+			return;
+		}
+		if (!message && op.modelName.toLowerCase().endsWith(".onnx")) {
+			noteModelLoaded(op.modelName);
+		}
+	}
 
 	function stopWatch() {
 		if (streamTimer !== null) {
@@ -258,6 +327,7 @@ function attachSession(
 			) {
 				op.modelNotice = "";
 			}
+			noteModelFromDetect(op.detectMessage);
 			const encoded = payload.image_base64;
 			if (op.snapshot) {
 				op.snapshot = {
@@ -273,6 +343,7 @@ function attachSession(
 		} catch (err: unknown) {
 			if (generation !== detectGeneration || !pageAlive) return;
 			op.detectMessage = errorMessage(err, "Detect failed");
+			noteModelFromDetect(op.detectMessage);
 			op.detectState = "done";
 		}
 	}
@@ -403,20 +474,24 @@ function attachSession(
 		if (fromNative) {
 			op.barcodeDecoder = "native";
 			console.info("barcode detector native");
+			writeConsole(`Barcode decoded: ${fromNative} (JS)`);
 			return { status: "pass", barcode: fromNative };
 		}
 		const fromZxing = await readZxing(frame);
 		if (fromZxing) {
 			op.barcodeDecoder = "js";
 			console.info("barcode detector zxing");
+			writeConsole(`Barcode decoded: ${fromZxing} (JS)`);
 			return { status: "pass", barcode: fromZxing };
 		}
 		const decoded = await invoke<RustDecode>("decode_barcode", {
 			image: frame,
 		});
-		if (decodedText(decoded)) {
+		const code = decodedText(decoded);
+		if (code) {
 			op.barcodeDecoder = "rust";
 			console.info("barcode detector rust");
+			writeConsole(`Barcode decoded: ${code} (backend)`);
 		} else {
 			op.barcodeDecoder = "";
 		}
@@ -424,9 +499,21 @@ function attachSession(
 	}
 
 	async function readFrame(index: number): Promise<WatchBody> {
-		const body = await invoke<WatchBody>("capture_snapshot", { index });
-		if (body.status === "fail") throw new Error(body.message || "No frame");
-		return body;
+		try {
+			const body = await invoke<WatchBody>("capture_snapshot", { index });
+			if (body.status === "fail") {
+				const message = body.message || "No frame";
+				noteCameraOpenError(body.message || "Camera did not open.");
+				throw new Error(message);
+			}
+			return body;
+		} catch (err: unknown) {
+			if (err instanceof Error && cameraErrorNote === err.message) throw err;
+			const message = invokeError(err, "Camera did not open.");
+			noteCameraOpenError(message);
+			if (err instanceof Error) throw err;
+			throw new Error(message);
+		}
 	}
 
 	function sleep(ms: number): Promise<void> {
@@ -504,10 +591,13 @@ function attachSession(
 					if (gen !== liveGeneration || !pageAlive) return;
 					if (!op.feedOn || index !== Number(op.cameraIndex)) continue;
 					if (body.status === "fail" || !body.image) {
-						op.liveMessage = body.message || "Camera did not open.";
+						const message = body.message || "Camera did not open.";
+						op.liveMessage = message;
+						noteCameraOpenError(message);
 						await sleep(400);
 						continue;
 					}
+					noteCameraReady();
 					if (!refs.liveCanvas) await tick();
 					const drew = await drawLiveFrame(body.image);
 					if (gen !== liveGeneration || !pageAlive) {
@@ -522,7 +612,9 @@ function attachSession(
 					rememberLiveSize();
 				} catch (err: unknown) {
 					if (gen !== liveGeneration || !pageAlive) return;
-					op.liveMessage = invokeError(err, "Camera did not open.");
+					const message = invokeError(err, "Camera did not open.");
+					op.liveMessage = message;
+					noteCameraOpenError(message);
 					await sleep(400);
 					continue;
 				}
@@ -542,18 +634,48 @@ function attachSession(
 		void runLive(gen);
 	}
 
+	function bomLabel(code: string): string {
+		return code.trim() ? code : "(empty)";
+	}
+
+	async function traceBom(
+		code: string,
+		run: () => Promise<InspectView>,
+	): Promise<InspectView> {
+		const label = bomLabel(code);
+		writeConsole(`BoM lookup started: ${label}`);
+		try {
+			const view = await run();
+			if (view.status === "pass") {
+				writeConsole(`BoM lookup succeeded: ${label}`);
+			} else {
+				const message = view.message?.trim() || "Lookup failed";
+				writeConsole(`BoM lookup failed: ${label}: ${message}`);
+			}
+			return view;
+		} catch (err: unknown) {
+			const message = invokeError(err, "Request failed");
+			writeConsole(`BoM lookup failed: ${label}: ${message}`);
+			throw err;
+		}
+	}
+
 	async function lookupCode(code: string): Promise<InspectView> {
-		if (op.bomSource === "api") {
-			const body = await invoke("post_bom_api", {
-				jobCardNumber: code.trim(),
-			});
-			return viewFromApiData(body);
-		}
-		if (op.bomSource === "json") {
-			const file = await invoke("load_bom_json");
-			return viewFromBomFile(file, code);
-		}
-		return await invoke<InspectView>("inspect_bom", { barcode: code });
+		// API sends the trimmed job card. JSON and MSSQL send the field as typed.
+		const sent = op.bomSource === "api" ? code.trim() : code;
+		return traceBom(sent, async () => {
+			if (op.bomSource === "api") {
+				const body = await invoke("post_bom_api", {
+					jobCardNumber: sent,
+				});
+				return viewFromApiData(body);
+			}
+			if (op.bomSource === "json") {
+				const file = await invoke("load_bom_json");
+				return viewFromBomFile(file, sent);
+			}
+			return await invoke<InspectView>("inspect_bom", { barcode: sent });
+		});
 	}
 
 	function stillWatches(index: number): boolean {
@@ -868,7 +990,10 @@ function attachSession(
 
 	function readAdminFlag() {
 		op.admin = sessionStorage.getItem(ADMIN_FLAG) === "1";
-		if (!op.admin) op.modelMenuOpen = false;
+		if (!op.admin) {
+			op.modelMenuOpen = false;
+			op.consoleOpen = false;
+		}
 		void loadBarcodeRoi();
 		bomSourceReady = loadBomSource();
 		void loadTestMode();
@@ -918,6 +1043,12 @@ function attachSession(
 			);
 			if (!present) {
 				op.modelNotice = "Model is missing.";
+				noteModelFailed("Model is missing.");
+			} else if (op.modelName.toLowerCase().endsWith(".pt")) {
+				if (op.modelNotice === "Model is missing.") op.modelNotice = "";
+				noteModelFailed(
+					`${op.modelName} is a .pt file. Choose an .onnx model to detect parts.`,
+				);
 			} else if (op.modelNotice === "Model is missing.") {
 				op.modelNotice = "";
 			}
@@ -958,11 +1089,15 @@ function attachSession(
 					: filename;
 			op.modelName = active;
 			op.modelMenuOpen = false;
-			op.modelNotice = active.toLowerCase().endsWith(".onnx")
+			const notice = active.toLowerCase().endsWith(".onnx")
 				? `Saved. Active model is ${active}.`
 				: `${active} is a .pt file. Choose an .onnx model to detect parts.`;
+			op.modelNotice = notice;
+			if (!active.toLowerCase().endsWith(".onnx")) noteModelFailed(notice);
 		} catch (err: unknown) {
-			op.modelNotice = invokeError(err, "Could not switch the model");
+			const message = invokeError(err, "Could not switch the model");
+			op.modelNotice = message;
+			noteModelFailed(message);
 		} finally {
 			op.savingModel = false;
 		}
@@ -1492,10 +1627,7 @@ function attachSession(
 		op.loading = true;
 		op.result = null;
 		try {
-			const body = await invoke("post_bom_api", {
-				jobCardNumber: op.barcode.trim(),
-			});
-			const view = viewFromApiData(body);
+			const view = await lookupCode(op.barcode);
 			op.result = view;
 			if (view.status === "pass") {
 				storeBom(view);
@@ -1517,8 +1649,7 @@ function attachSession(
 		op.loading = true;
 		op.result = null;
 		try {
-			const bom = await invoke("load_bom_json");
-			const view = viewFromBomFile(bom, op.barcode);
+			const view = await lookupCode(op.barcode);
 			op.result = view;
 			if (view.status === "pass") {
 				storeBom(view);
@@ -1550,12 +1681,10 @@ function attachSession(
 		op.loading = true;
 		op.result = null;
 		try {
-			const body = await invoke<InspectView>("inspect_bom", {
-				barcode: op.barcode,
-			});
-			op.result = body;
-			if (body.status === "pass") {
-				storeBom(body);
+			const view = await lookupCode(op.barcode);
+			op.result = view;
+			if (view.status === "pass") {
+				storeBom(view);
 				if (op.testMode) void chooseAndDetect();
 			} else dropBom();
 		} catch (err: unknown) {
@@ -1665,6 +1794,8 @@ function attachSession(
 		onErpKey,
 		onIframeError,
 		openErpInBrowser,
+		toggleConsole,
+		clearConsole,
 	};
 	return session;
 }

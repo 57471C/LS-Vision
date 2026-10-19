@@ -1,5 +1,6 @@
 import { getContext, setContext } from "svelte";
 import { derived, type Readable, type Writable } from "svelte/store";
+import type { ConsoleLine } from "$lib/operator/console";
 
 export type Part = { ic: string; des: string; qty: number };
 
@@ -114,6 +115,8 @@ export type OperatorState = {
 	modelMenuOpen: boolean;
 	savingModel: boolean;
 	modelNotice: string;
+	consoleOpen: boolean;
+	consoleLines: ConsoleLine[];
 };
 
 export function initialOperator(): OperatorState {
@@ -162,6 +165,8 @@ export function initialOperator(): OperatorState {
 		modelMenuOpen: false,
 		savingModel: false,
 		modelNotice: "",
+		consoleOpen: false,
+		consoleLines: [],
 	};
 }
 
@@ -253,6 +258,8 @@ export type OperatorSession = {
 	onErpKey: (event: KeyboardEvent) => void;
 	onIframeError: () => void;
 	openErpInBrowser: () => Promise<void>;
+	toggleConsole: () => void;
+	clearConsole: () => void;
 };
 
 export type OperatorStores = {
