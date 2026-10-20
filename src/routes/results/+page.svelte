@@ -212,6 +212,7 @@ onMount(() => {
 						<tr class="border-b border-neutral-700 text-[11px] uppercase tracking-widest text-neutral-400">
 							<th class="px-3 py-3 font-semibold">Result</th>
 							<th class="px-3 py-3 font-semibold">Kit IC</th>
+							<th class="px-3 py-3 font-semibold">Job Card</th>
 							<th class="px-3 py-3 font-semibold">Description</th>
 							<th class="px-3 py-3 font-semibold">Date/Time</th>
 							<th class="px-3 py-3 font-semibold">Image</th>
@@ -223,7 +224,7 @@ onMount(() => {
 					<tbody>
 						{#if rows.length === 0}
 							<tr>
-								<td class="px-3 py-8 text-neutral-400" colspan={admin ? 6 : 5}>No results yet</td>
+								<td class="px-3 py-8 text-neutral-400" colspan={admin ? 7 : 6}>No results yet</td>
 							</tr>
 						{/if}
 						{#each rows as row (row.id)}
@@ -236,6 +237,7 @@ onMount(() => {
 									{row.passed ? "Pass" : "Fail"}
 								</td>
 								<td class="px-3 py-3 font-mono">{row.kitIc || "—"}</td>
+								<td class="px-3 py-3 font-mono">{row.jobCard || "—"}</td>
 								<td class="px-3 py-3 text-neutral-200">{row.description || "—"}</td>
 								<td class="px-3 py-3 whitespace-nowrap">{formatResultWhen(row.createdAt)}</td>
 								<td class="px-3 py-3">
@@ -264,8 +266,11 @@ onMount(() => {
 							</tr>
 							{#if openId === row.id}
 								<tr class="border-b border-neutral-800 bg-neutral-950">
-									<td class="px-3 py-4" colspan={admin ? 6 : 5}>
+									<td class="px-3 py-4" colspan={admin ? 7 : 6}>
 										<div class="flex flex-col gap-3">
+											<p class="font-mono text-lg font-semibold text-neutral-100">
+												Job card {row.jobCard?.trim() || "—"}
+											</p>
 											{#if row.detail.message}
 												<p class="text-base text-neutral-200">{row.detail.message}</p>
 											{/if}

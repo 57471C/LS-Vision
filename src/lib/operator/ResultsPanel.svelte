@@ -11,6 +11,7 @@ type InspectView = {
 	status: string;
 	message?: string;
 	kitCode?: string;
+	jobCard?: string;
 	des?: string;
 	parts?: Part[];
 	kitsFound?: number;
@@ -87,6 +88,11 @@ function matchSummary(parts: Part[], items: Detection[]): string {
 		<div class="result-scroll flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4">
 			{#if $operator.result.kitCode}
 				<p class="font-mono text-2xl font-semibold tracking-tight">{$operator.result.kitCode}</p>
+			{/if}
+			{#if $operator.result.jobCard}
+				<p class="font-mono text-xl font-semibold tracking-tight text-neutral-100">
+					<span class="mr-2 text-[11px] font-semibold uppercase tracking-widest text-neutral-500">Job card</span>{$operator.result.jobCard}
+				</p>
 			{/if}
 			{#if $operator.testMode && isLoadedBom($operator.result, $operator.bom)}
 				<button
