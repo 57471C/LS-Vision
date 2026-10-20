@@ -2,7 +2,7 @@ export type CameraSettings = {
 	index: number;
 	resolution: string;
 	displayFps: number;
-	focus: number;
+	focus: number | null;
 	brightness: number;
 	contrast: number;
 };
@@ -44,7 +44,7 @@ export function defaultCameraSettings(index: number): CameraSettings {
 		index,
 		resolution: "",
 		displayFps: 15,
-		focus: 50,
+		focus: null,
 		brightness: 50,
 		contrast: 50,
 	};
@@ -57,7 +57,7 @@ function settingsFrom(value: unknown, index: number): CameraSettings {
 		index,
 		resolution: isModeId(resolution) ? resolution : "",
 		displayFps: readDisplayFps(data.displayFps),
-		focus: levelValue(data.focus) ?? 50,
+		focus: Object.hasOwn(data, "focus") ? levelValue(data.focus) : null,
 		brightness: levelValue(data.brightness) ?? 50,
 		contrast: levelValue(data.contrast) ?? 50,
 	};

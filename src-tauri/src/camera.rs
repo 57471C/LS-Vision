@@ -11,8 +11,11 @@
 //! does not empty the preview slot. JPEG encoding runs only when a command
 //! asks for a frame, and it does not run on the callback or on the camera
 //! thread. `capture_snapshot` keeps the selected mode. `capture_preview`
-//! scales that frame to fit in 1280×720. Focus, brightness, and contrast
-//! are stored by Settings and are not applied here.
+//! scales that frame to fit in 1280×720. A saved numeric focus is applied
+//! when the device opens, and `set_camera_focus` sets manual focus.
+//! `set_camera_autofocus` returns the camera to autofocus and clears that
+//! saved value. A missing focus leaves autofocus alone. Brightness and
+//! contrast are stored by Settings and are not applied here.
 
 use std::collections::VecDeque;
 use std::sync::mpsc::{self, Sender};
@@ -66,6 +69,11 @@ impl FrameSlots {
     }
 }
 
+enum FocusRequest {
+    Manual(u32),
+    Auto,
+}
+
 enum Job {
     List(Sender<Result<Vec<u32>, String>>),
     Modes {
@@ -76,6 +84,11 @@ enum Job {
         index: u32,
         still: bool,
         reply: Sender<Result<Frame, String>>,
+    },
+    Focus {
+        index: u32,
+        request: FocusRequest,
+        reply: Sender<Result<(), String>>,
     },
 }
 
@@ -107,6 +120,9 @@ fn camera_loop(incoming: mpsc::Receiver<Job>) {
                 Job::Grab { reply, .. } => {
                     let _ = reply.send(Err(message));
                 }
+                Job::Focus { reply, .. } => {
+                    let _ = reply.send(Err(message));
+                }
             }
             continue;
         }
@@ -123,6 +139,13 @@ fn camera_loop(incoming: mpsc::Receiver<Job>) {
                 reply,
             } => {
                 let _ = reply.send(grab(&mut open, index, still));
+            }
+            Job::Focus {
+                index,
+                request,
+                reply,
+            } => {
+                let _ = reply.send(apply_focus(&mut open, index, request));
             }
         }
     }
@@ -213,6 +236,70 @@ pub fn capture_preview(index: Option<u32>) -> Result<Value, String> {
     }
 }
 
+/// Set manual focus on the open camera. `focus` is 0–100. The value is
+/// stored only after the camera accepts it. Null stays autofocus.
+#[tauri::command]
+pub fn set_camera_focus(index: Option<u32>, focus: u32) -> Result<Value, String> {
+    let index = index.unwrap_or_else(saved_index);
+    if index > 32 {
+        return Ok(fail("Camera index must be from 0 to 32."));
+    }
+    if focus > 100 {
+        return Ok(fail("Focus must be from 0 to 100."));
+    }
+    let (tx, rx) = mpsc::channel();
+    jobs()
+        .send(Job::Focus {
+            index,
+            request: FocusRequest::Manual(focus),
+            reply: tx,
+        })
+        .map_err(|_| "Camera thread stopped.".to_string())?;
+    match rx.recv() {
+        Ok(Ok(())) => {}
+        Ok(Err(message)) => return Ok(fail(&message)),
+        Err(_) => return Err("Camera thread stopped.".to_string()),
+    }
+    if let Err(message) = remember_focus(index, Some(focus)) {
+        return Ok(fail(&message));
+    }
+    Ok(json!({
+        "status": "pass",
+        "index": index,
+        "focus": focus,
+    }))
+}
+
+/// Return the open camera to autofocus and clear the saved manual value.
+#[tauri::command]
+pub fn set_camera_autofocus(index: Option<u32>) -> Result<Value, String> {
+    let index = index.unwrap_or_else(saved_index);
+    if index > 32 {
+        return Ok(fail("Camera index must be from 0 to 32."));
+    }
+    let (tx, rx) = mpsc::channel();
+    jobs()
+        .send(Job::Focus {
+            index,
+            request: FocusRequest::Auto,
+            reply: tx,
+        })
+        .map_err(|_| "Camera thread stopped.".to_string())?;
+    match rx.recv() {
+        Ok(Ok(())) => {}
+        Ok(Err(message)) => return Ok(fail(&message)),
+        Err(_) => return Err("Camera thread stopped.".to_string()),
+    }
+    if let Err(message) = remember_focus(index, None) {
+        return Ok(fail(&message));
+    }
+    Ok(json!({
+        "status": "pass",
+        "index": index,
+        "focus": null,
+    }))
+}
+
 fn command_frame(index: Option<u32>, still: bool) -> Result<Frame, Result<Value, String>> {
     let index = index.unwrap_or_else(saved_index);
     if index > 32 {
@@ -279,15 +366,9 @@ fn modes_for(open: &mut Option<session::Device>, index: u32) -> Result<Vec<Mode>
 }
 
 fn grab(open: &mut Option<session::Device>, index: u32, still: bool) -> Result<Frame, String> {
-    let wanted = saved_resolution();
-    let keep = open
-        .as_ref()
-        .is_some_and(|device| device.index() == index && device.serves(wanted));
-    if !keep {
-        if let Some(mut previous) = open.take() {
-            previous.shutdown();
-        }
-        *open = Some(session::open_device(index, wanted)?);
+    let opened = ensure_device(open, index)?;
+    if opened {
+        apply_saved_focus(open);
     }
     match take_frame(open.as_ref().expect("camera was opened"), still) {
         Ok(frame) => Ok(frame),
@@ -295,7 +376,8 @@ fn grab(open: &mut Option<session::Device>, index: u32, still: bool) -> Result<F
             if let Some(mut previous) = open.take() {
                 previous.shutdown();
             }
-            *open = Some(session::open_device(index, wanted)?);
+            *open = Some(session::open_device(index, saved_resolution())?);
+            apply_saved_focus(open);
             take_frame(open.as_ref().expect("camera was reopened"), still)
         }
         Err(message) => {
@@ -304,6 +386,47 @@ fn grab(open: &mut Option<session::Device>, index: u32, still: bool) -> Result<F
             }
             Err(message)
         }
+    }
+}
+
+/// Open this camera when the current session is a different device or mode.
+/// Returns true when a new session was opened. A focus change uses this
+/// without applying the previously saved focus first.
+fn ensure_device(open: &mut Option<session::Device>, index: u32) -> Result<bool, String> {
+    let wanted = saved_resolution();
+    let keep = open
+        .as_ref()
+        .is_some_and(|device| device.index() == index && device.serves(wanted));
+    if keep {
+        return Ok(false);
+    }
+    if let Some(mut previous) = open.take() {
+        previous.shutdown();
+    }
+    *open = Some(session::open_device(index, wanted)?);
+    Ok(true)
+}
+
+fn apply_saved_focus(open: &mut Option<session::Device>) {
+    let Some(device) = open.as_ref() else {
+        return;
+    };
+    let Some(focus) = stored_focus_for(device.index()) else {
+        return;
+    };
+    let _ = device.set_focus(focus);
+}
+
+fn apply_focus(
+    open: &mut Option<session::Device>,
+    index: u32,
+    request: FocusRequest,
+) -> Result<(), String> {
+    ensure_device(open, index)?;
+    let device = open.as_ref().expect("camera was opened");
+    match request {
+        FocusRequest::Manual(focus) => device.set_focus(focus),
+        FocusRequest::Auto => device.set_autofocus(),
     }
 }
 
@@ -356,6 +479,130 @@ fn saved_resolution() -> Option<Requested> {
         .and_then(|value| value.as_str())
         .unwrap_or("");
     parse_resolution(text)
+}
+
+/// Map a 0–100 slider onto the camera range. 0 is `min`. 100 is the highest
+/// step-aligned value that is still at most `max`. A step of 0 or less is 1.
+fn focus_device_value(percent: u32, min: i32, max: i32, step: i32) -> i32 {
+    if max <= min {
+        return min;
+    }
+    let percent = i64::from(percent.min(100));
+    let step = i64::from(if step <= 0 { 1 } else { step });
+    let min = i64::from(min);
+    let max = i64::from(max);
+    let span = max - min;
+    let target = min + span * percent / 100;
+    let offset = target - min;
+    let aligned = min + offset - offset.rem_euclid(step);
+    let max_offset = max - min;
+    let aligned_max = min + max_offset - max_offset.rem_euclid(step);
+    aligned.min(aligned_max) as i32
+}
+
+/// A number in `byIndex` wins. Null, or no record, means leave autofocus.
+fn stored_focus(camera: &Value, index: u32) -> Option<u32> {
+    let camera = camera.as_object()?;
+    if let Some(by_index) = camera.get("byIndex").and_then(Value::as_object)
+        && let Some(record) = by_index.get(&index.to_string())
+    {
+        return record.get("focus").and_then(focus_number);
+    }
+    let active = camera
+        .get("index")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())?;
+    if active == index {
+        return camera.get("focus").and_then(focus_number);
+    }
+    None
+}
+
+fn focus_number(value: &Value) -> Option<u32> {
+    let number = value
+        .as_u64()
+        .or_else(|| value.as_i64().and_then(|number| u64::try_from(number).ok()))?;
+    let number = u32::try_from(number).ok()?;
+    (number <= 100).then_some(number)
+}
+
+fn stored_focus_for(index: u32) -> Option<u32> {
+    let root = local_config::project_root().ok()?;
+    let config = local_config::load_document(&root).ok()?;
+    stored_focus(config.get("camera")?, index)
+}
+
+fn remember_focus(index: u32, focus: Option<u32>) -> Result<(), String> {
+    let root = local_config::project_root()?;
+    let mut config = local_config::load_document(&root)?;
+    write_focus(&mut config, index, focus)?;
+    local_config::save_document(&root, &config)
+}
+
+/// Write only `focus`, on this camera's record and on the active camera.
+/// `None` clears a saved manual value so the camera stays on autofocus.
+fn write_focus(config: &mut Value, index: u32, focus: Option<u32>) -> Result<(), String> {
+    let Some(root) = config.as_object_mut() else {
+        return Err("Config must be a JSON object.".to_string());
+    };
+    if root.get("camera").is_some_and(|camera| !camera.is_object()) {
+        return Err("Camera settings must be a JSON object.".to_string());
+    }
+    let camera = root.entry("camera").or_insert_with(|| json!({}));
+    let Some(camera) = camera.as_object_mut() else {
+        return Err("Camera settings must be a JSON object.".to_string());
+    };
+    let stored = match focus {
+        Some(value) => json!(value),
+        None => Value::Null,
+    };
+    let active = camera
+        .get("index")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value <= 32);
+    let copied = if active == Some(index) {
+        ["resolution", "displayFps", "brightness", "contrast"]
+            .into_iter()
+            .filter_map(|name| camera.get(name).map(|value| (name, value.clone())))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    if camera
+        .get("byIndex")
+        .is_some_and(|value| !value.is_object())
+    {
+        camera.insert("byIndex".to_string(), json!({}));
+    }
+    {
+        let by_index = camera
+            .entry("byIndex")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .expect("byIndex is an object");
+        let key = index.to_string();
+        match by_index.get_mut(&key) {
+            Some(record) if record.is_object() => {
+                record
+                    .as_object_mut()
+                    .expect("focus record")
+                    .insert("focus".to_string(), stored.clone());
+            }
+            _ => {
+                let mut record = serde_json::Map::new();
+                for (name, value) in copied {
+                    record.insert(name.to_string(), value);
+                }
+                record.insert("focus".to_string(), stored.clone());
+                by_index.insert(key, Value::Object(record));
+            }
+        }
+    }
+    if active == Some(index) {
+        camera.insert("focus".to_string(), stored);
+    }
+    Ok(())
 }
 
 fn parse_resolution(text: &str) -> Option<Requested> {
@@ -980,6 +1227,9 @@ mod session {
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::{Duration, Instant};
 
+    use windows::Win32::Media::DirectShow::{
+        CameraControl_Flags_Auto, CameraControl_Flags_Manual, CameraControl_Focus, IAMCameraControl,
+    };
     use windows::Win32::Media::MediaFoundation::{
         IMFActivate, IMFAttributes, IMFMediaSource, IMFMediaType, IMFSample, IMFSourceReader,
         IMFSourceReaderCallback, IMFSourceReaderCallback_Impl, MF_API_VERSION,
@@ -1000,7 +1250,7 @@ mod session {
     use windows::Win32::System::Com::{
         COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize,
     };
-    use windows::core::{Error, HRESULT, Ref, implement};
+    use windows::core::{Error, HRESULT, Interface, Ref, implement};
 
     use super::{
         FpsMeter, Mode, PixelFormat, RELEASE_WAIT, RESOURCE_CODE, Requested, choose_mode,
@@ -1119,6 +1369,15 @@ mod session {
         }
     }
 
+    struct FocusRange {
+        control: IAMCameraControl,
+        min: i32,
+        max: i32,
+        step: i32,
+        default_value: i32,
+        caps: i32,
+    }
+
     pub(super) struct Device {
         index: u32,
         modes: Vec<Mode>,
@@ -1161,6 +1420,75 @@ mod session {
         /// a snapshot does not make the paced preview wait for another sample.
         pub(super) fn copy_still(&self, timeout: Duration) -> Result<Arc<Vec<u8>>, String> {
             self.wait_slot(timeout, false)
+        }
+
+        /// Manual focus. A camera that cannot be cast, or whose range or set
+        /// call fails, returns an error and leaves the open session running.
+        pub(super) fn set_focus(&self, percent: u32) -> Result<(), String> {
+            let range = self.focus_range()?;
+            let manual = CameraControl_Flags_Manual.0;
+            if range.caps != 0 && range.caps & manual == 0 {
+                return Err("This camera does not support manual focus.".to_string());
+            }
+            let value = super::focus_device_value(percent, range.min, range.max, range.step);
+            unsafe {
+                range
+                    .control
+                    .Set(CameraControl_Focus.0, value, manual)
+                    .map_err(|err| short_camera(&mf_error(&err)))?;
+            }
+            Ok(())
+        }
+
+        /// Autofocus. The same failure leaves the open session running.
+        pub(super) fn set_autofocus(&self) -> Result<(), String> {
+            let range = self.focus_range()?;
+            let auto = CameraControl_Flags_Auto.0;
+            if range.caps != 0 && range.caps & auto == 0 {
+                return Err("This camera does not support autofocus.".to_string());
+            }
+            unsafe {
+                range
+                    .control
+                    .Set(CameraControl_Focus.0, range.default_value, auto)
+                    .map_err(|err| short_camera(&mf_error(&err)))?;
+            }
+            Ok(())
+        }
+
+        fn focus_range(&self) -> Result<FocusRange, String> {
+            let source = self
+                .source
+                .as_ref()
+                .ok_or_else(|| "Camera did not open.".to_string())?;
+            let control = source
+                .cast::<IAMCameraControl>()
+                .map_err(|_| "This camera does not support focus.".to_string())?;
+            let mut min = 0_i32;
+            let mut max = 0_i32;
+            let mut step = 0_i32;
+            let mut default_value = 0_i32;
+            let mut caps = 0_i32;
+            unsafe {
+                control
+                    .GetRange(
+                        CameraControl_Focus.0,
+                        &mut min,
+                        &mut max,
+                        &mut step,
+                        &mut default_value,
+                        &mut caps,
+                    )
+                    .map_err(|err| short_camera(&mf_error(&err)))?;
+            }
+            Ok(FocusRange {
+                control,
+                min,
+                max,
+                step,
+                default_value,
+                caps,
+            })
         }
 
         fn wait_slot(&self, timeout: Duration, preview: bool) -> Result<Arc<Vec<u8>>, String> {
@@ -1912,6 +2240,14 @@ mod session {
             Err("Camera capture is only available on Windows.".to_string())
         }
 
+        pub(super) fn set_focus(&self, _percent: u32) -> Result<(), String> {
+            Err("Camera capture is only available on Windows.".to_string())
+        }
+
+        pub(super) fn set_autofocus(&self) -> Result<(), String> {
+            Err("Camera capture is only available on Windows.".to_string())
+        }
+
         pub(super) fn shutdown(&mut self) {}
     }
 
@@ -1975,6 +2311,110 @@ mod tests {
         slots.publish(vec![4]);
         assert_eq!(slots.copy_still().expect("new still").as_slice(), &[4]);
         assert_eq!(slots.take_preview().expect("new preview").as_slice(), &[4]);
+    }
+
+    #[test]
+    fn focus_maps_the_slider_onto_the_device_range() {
+        assert_eq!(focus_device_value(0, 0, 255, 1), 0);
+        assert_eq!(focus_device_value(100, 0, 255, 1), 255);
+        assert_eq!(focus_device_value(50, 0, 255, 1), 127);
+        assert_eq!(focus_device_value(100, 0, 10, 3), 9);
+        assert_eq!(focus_device_value(0, 10, 20, 5), 10);
+        assert_eq!(focus_device_value(100, 10, 20, 5), 20);
+        assert_eq!(focus_device_value(50, 10, 20, 5), 15);
+        assert_eq!(focus_device_value(1, 0, 100, 5), 0);
+        assert_eq!(focus_device_value(5, 0, 100, 5), 5);
+        assert_eq!(focus_device_value(100, 5, 5, 1), 5);
+        assert_eq!(focus_device_value(40, 0, 100, 0), 40);
+        assert_eq!(focus_device_value(40, 0, 100, -2), 40);
+        assert_eq!(focus_device_value(80, 20, 10, 1), 20);
+        assert_eq!(focus_device_value(200, 0, 100, 1), 100);
+    }
+
+    #[test]
+    fn stored_focus_ignores_null_and_prefers_the_camera_record() {
+        let camera = json!({
+            "index": 0,
+            "focus": 20,
+            "byIndex": {
+                "0": { "focus": null, "resolution": "640x480@30" },
+                "1": { "focus": 80 }
+            }
+        });
+        assert_eq!(stored_focus(&camera, 0), None);
+        assert_eq!(stored_focus(&camera, 1), Some(80));
+        assert_eq!(stored_focus(&camera, 2), None);
+        let active = json!({ "index": 1, "focus": 40 });
+        assert_eq!(stored_focus(&active, 1), Some(40));
+        assert_eq!(stored_focus(&active, 0), None);
+    }
+
+    #[test]
+    fn write_focus_changes_only_the_focus_fields() {
+        let mut config = json!({
+            "trainingDir": "D:\\shots",
+            "camera": {
+                "index": 1,
+                "resolution": "1920x1080@30",
+                "displayFps": 15,
+                "focus": null,
+                "brightness": 60,
+                "contrast": 40,
+                "byIndex": {
+                    "1": {
+                        "resolution": "1920x1080@30",
+                        "displayFps": 15,
+                        "focus": null,
+                        "brightness": 60,
+                        "contrast": 40
+                    }
+                }
+            }
+        });
+        write_focus(&mut config, 1, Some(35)).unwrap();
+        assert_eq!(config["trainingDir"], "D:\\shots");
+        assert_eq!(config["camera"]["resolution"], "1920x1080@30");
+        assert_eq!(config["camera"]["displayFps"], 15);
+        assert_eq!(config["camera"]["brightness"], 60);
+        assert_eq!(config["camera"]["contrast"], 40);
+        assert_eq!(config["camera"]["focus"], 35);
+        assert_eq!(config["camera"]["byIndex"]["1"]["focus"], 35);
+        assert_eq!(config["camera"]["byIndex"]["1"]["brightness"], 60);
+        assert_eq!(
+            config["camera"]["byIndex"]["1"]["resolution"],
+            "1920x1080@30"
+        );
+
+        let mut bare = json!({
+            "camera": {
+                "index": 0,
+                "resolution": "1280x720@30",
+                "displayFps": 20,
+                "focus": null,
+                "brightness": 50,
+                "contrast": 50
+            }
+        });
+        write_focus(&mut bare, 0, Some(70)).unwrap();
+        assert_eq!(bare["camera"]["focus"], 70);
+        assert_eq!(bare["camera"]["resolution"], "1280x720@30");
+        assert_eq!(bare["camera"]["brightness"], 50);
+        assert_eq!(bare["camera"]["byIndex"]["0"]["focus"], 70);
+        assert_eq!(bare["camera"]["byIndex"]["0"]["resolution"], "1280x720@30");
+        assert_eq!(bare["camera"]["byIndex"]["0"]["displayFps"], 20);
+        assert_eq!(bare["camera"]["byIndex"]["0"]["contrast"], 50);
+
+        write_focus(&mut bare, 2, Some(10)).unwrap();
+        assert_eq!(bare["camera"]["focus"], 70);
+        assert_eq!(bare["camera"]["byIndex"]["2"]["focus"], 10);
+        assert!(bare["camera"]["byIndex"]["2"].get("resolution").is_none());
+
+        write_focus(&mut config, 1, None).unwrap();
+        assert!(config["camera"]["focus"].is_null());
+        assert!(config["camera"]["byIndex"]["1"]["focus"].is_null());
+        assert_eq!(config["camera"]["brightness"], 60);
+        assert_eq!(config["camera"]["resolution"], "1920x1080@30");
+        assert_eq!(config["trainingDir"], "D:\\shots");
     }
 
     #[test]

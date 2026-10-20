@@ -99,9 +99,17 @@ let cameraResolution = "";
 const DISPLAY_FPS = [15, 20, 25, 30];
 let cameraDisplayFps = 15;
 let cameraFocus = 50;
+let focusAuto = false;
 let cameraBrightness = 50;
 let cameraContrast = 50;
-let savedCamera = {
+let savedCamera: {
+	index: number;
+	resolution: string;
+	displayFps: number;
+	focus: number | null;
+	brightness: number;
+	contrast: number;
+} = {
 	index: 0,
 	resolution: "",
 	displayFps: 15,
@@ -123,7 +131,11 @@ let cameraFileVersion = 0;
 let cameraNotice = "";
 let cameraListNotice = "";
 let previewNotice = "";
+let previewChannel: BroadcastChannel | null = null;
 let savingCamera = false;
+let trainingDir = "";
+let trainingNotice = "";
+let savingTraining = false;
 let configLoadId = 0;
 
 const PREVIEW_LABEL = "camera-preview";
@@ -1059,7 +1071,7 @@ function cameraSettingsBody() {
 		index: Number(cameraIndex),
 		resolution: cameraResolution,
 		displayFps: readDisplayFps(cameraDisplayFps),
-		focus: cameraFocus,
+		focus: focusAuto ? null : cameraFocus,
 		brightness: cameraBrightness,
 		contrast: cameraContrast,
 	};
@@ -1067,8 +1079,9 @@ function cameraSettingsBody() {
 
 async function postCameraSettings(applyOnly = false, preset?: CameraSettings) {
 	const body = preset ?? cameraSettingsBody();
-	// The Rust camera stores these fields. It does not apply focus, brightness,
-	// or contrast to the device, so a live slider change does not write config.
+	// This form stores the fields. The preview Focus slider is what sets the
+	// camera. Brightness and contrast are not applied, so a live change here
+	// does not write config.
 	if (applyOnly) return { ...body, status: "pass", message: "" };
 	const index = Number(body.index);
 	if (!Number.isInteger(index) || index < 0 || index > 32) {
@@ -1132,24 +1145,30 @@ function rememberSaved() {
 		index: Number(cameraIndex),
 		resolution: cameraResolution,
 		displayFps: readDisplayFps(cameraDisplayFps),
-		focus: cameraFocus,
+		focus: focusAuto ? null : cameraFocus,
 		brightness: cameraBrightness,
 		contrast: cameraContrast,
 	};
+}
+
+function setCameraFocus(value: number) {
+	focusAuto = false;
+	cameraFocus = value;
 }
 
 function showCamera(next: {
 	index: number;
 	resolution: string;
 	displayFps: number;
-	focus: number;
+	focus: number | null;
 	brightness: number;
 	contrast: number;
 }) {
 	cameraIndex = next.index;
 	cameraResolution = isModeId(next.resolution) ? next.resolution : "";
 	cameraDisplayFps = readDisplayFps(next.displayFps);
-	cameraFocus = clampLevel(next.focus);
+	focusAuto = next.focus === null;
+	cameraFocus = next.focus === null ? 50 : clampLevel(next.focus);
 	cameraBrightness = clampLevel(next.brightness);
 	cameraContrast = clampLevel(next.contrast);
 	rememberLevels();
@@ -1209,7 +1228,9 @@ function applyCamera(data: {
 	const resolution = typeof data.resolution === "string" ? data.resolution : "";
 	cameraResolution = isModeId(resolution) ? resolution : "";
 	cameraDisplayFps = readDisplayFps(data.displayFps);
-	cameraFocus = levelValue(data.focus) ?? 50;
+	const parsedFocus = levelValue(data.focus);
+	focusAuto = parsedFocus === null;
+	cameraFocus = parsedFocus ?? 50;
 	cameraBrightness = levelValue(data.brightness) ?? 50;
 	cameraContrast = levelValue(data.contrast) ?? 50;
 	rememberLevels();
@@ -1258,6 +1279,58 @@ async function loadCameraSettings() {
 	await loadCameraDevices();
 	if (cameraFileVersion !== version) return;
 	await loadCameraModes();
+	if (cameraFileVersion !== version) return;
+	await loadTrainingFolder();
+}
+
+async function loadTrainingFolder() {
+	trainingNotice = "";
+	try {
+		const config = await loadDocument();
+		const saved =
+			typeof config.trainingDir === "string" ? config.trainingDir.trim() : "";
+		if (saved) {
+			trainingDir = saved;
+			return;
+		}
+		trainingDir = await invokeRust<string>("default_training_folder");
+	} catch (err: unknown) {
+		if (!trainingDir.trim()) trainingDir = "Documents\\ls-vision\\training";
+		trainingNotice = invokeError(err, "Could not load the training folder");
+	}
+}
+
+async function browseTrainingFolder() {
+	trainingNotice = "";
+	try {
+		const picked = await invokeRust<string>("pick_training_folder");
+		if (typeof picked === "string" && picked.trim())
+			trainingDir = picked.trim();
+	} catch (err: unknown) {
+		trainingNotice = invokeError(err, "Could not choose a folder");
+	}
+}
+
+async function saveTrainingFolder() {
+	if (savingTraining) return;
+	savingTraining = true;
+	trainingNotice = "";
+	try {
+		const checked = await invokeRust<string>("check_training_folder", {
+			path: trainingDir.trim(),
+		});
+		await queueCameraPost(async () => {
+			const config = await loadDocument();
+			config.trainingDir = checked;
+			cameraFile = await storeDocument(config);
+			trainingDir = checked;
+			trainingNotice = "Saved.";
+		});
+	} catch (err: unknown) {
+		trainingNotice = invokeError(err, "Could not save the training folder");
+	} finally {
+		savingTraining = false;
+	}
 }
 
 function copyCameraFile(): Record<string, unknown> | null {
@@ -1421,6 +1494,60 @@ function invokeError(err: unknown, fallback: string): string {
 	return errorMessage(err, fallback);
 }
 
+function patchCameraFocus(
+	document: Record<string, unknown>,
+	nextIndex: number,
+	nextFocus: number | null,
+) {
+	const camera = objectField(document.camera);
+	const byIndex = objectField(camera.byIndex);
+	const key = String(nextIndex);
+	if (Object.hasOwn(byIndex, key)) {
+		const record = objectField(byIndex[key]);
+		record.focus = nextFocus;
+		byIndex[key] = record;
+	} else if (Number(camera.index) === nextIndex) {
+		byIndex[key] = {
+			resolution:
+				typeof camera.resolution === "string" ? camera.resolution : "",
+			displayFps: camera.displayFps,
+			focus: nextFocus,
+			brightness: camera.brightness,
+			contrast: camera.contrast,
+		};
+	} else {
+		byIndex[key] = { focus: nextFocus };
+	}
+	if (Number(camera.index) === nextIndex) camera.focus = nextFocus;
+	camera.byIndex = byIndex;
+	document.camera = camera;
+}
+
+function onPreviewFocus(event: MessageEvent) {
+	const data = event.data;
+	if (!data || typeof data !== "object" || !("focus" in data)) return;
+	const payload = data as { index?: unknown; focus?: unknown };
+	const nextIndex = Number(payload.index);
+	if (!Number.isInteger(nextIndex) || nextIndex !== Number(cameraIndex)) return;
+	const cleared = payload.focus === null;
+	const nextFocus = Number(payload.focus);
+	if (
+		!cleared &&
+		(!Number.isInteger(nextFocus) || nextFocus < 0 || nextFocus > 100)
+	)
+		return;
+	focusAuto = cleared;
+	cameraFocus = cleared ? 50 : nextFocus;
+	focusText = String(cameraFocus);
+	savedCamera = { ...savedCamera, focus: cleared ? null : nextFocus };
+	const draft = copyCameraFile();
+	if (draft) {
+		patchCameraFocus(draft, nextIndex, cleared ? null : nextFocus);
+		cameraFile = draft;
+	}
+	cameraFileVersion += 1;
+}
+
 function postPreviewIndex(index: number) {
 	const channel = new BroadcastChannel(PREVIEW_CHANNEL);
 	channel.postMessage({
@@ -1526,6 +1653,8 @@ async function openPreview() {
 }
 
 onMount(() => {
+	previewChannel = new BroadcastChannel(PREVIEW_CHANNEL);
+	previewChannel.onmessage = onPreviewFocus;
 	void loadInference();
 	if (!unlocked) {
 		void loadModel();
@@ -1537,6 +1666,8 @@ onMount(() => {
 
 onDestroy(() => {
 	cancelCameraApply();
+	previewChannel?.close();
+	previewChannel = null;
 });
 </script>
 
@@ -1806,7 +1937,7 @@ onDestroy(() => {
 											</svg>
 											Focus
 										</span>
-										<button type="button" class="inline-flex h-11 w-8 shrink-0 items-center justify-center text-lg text-neutral-300 hover:text-white" aria-label="Decrease focus" on:click={() => stepLevel(cameraFocus, -1, (value) => (cameraFocus = value), (value) => (focusText = value))}>−</button>
+										<button type="button" class="inline-flex h-11 w-8 shrink-0 items-center justify-center text-lg text-neutral-300 hover:text-white" aria-label="Decrease focus" on:click={() => stepLevel(cameraFocus, -1, setCameraFocus, (value) => (focusText = value))}>−</button>
 										<input
 											type="range"
 											class="camera-slider min-w-0 flex-1"
@@ -1816,9 +1947,9 @@ onDestroy(() => {
 											value={cameraFocus}
 											style="--fill: {cameraFocus}%"
 											aria-label="Focus"
-											on:input={(event) => slideLevel(event.currentTarget.value, cameraFocus, (value) => (cameraFocus = value), (value) => (focusText = value))}
+											on:input={(event) => slideLevel(event.currentTarget.value, cameraFocus, setCameraFocus, (value) => (focusText = value))}
 										/>
-										<button type="button" class="inline-flex h-11 w-8 shrink-0 items-center justify-center text-lg text-neutral-300 hover:text-white" aria-label="Increase focus" on:click={() => stepLevel(cameraFocus, 1, (value) => (cameraFocus = value), (value) => (focusText = value))}>+</button>
+										<button type="button" class="inline-flex h-11 w-8 shrink-0 items-center justify-center text-lg text-neutral-300 hover:text-white" aria-label="Increase focus" on:click={() => stepLevel(cameraFocus, 1, setCameraFocus, (value) => (focusText = value))}>+</button>
 										<input
 											type="text"
 											inputmode="numeric"
@@ -1826,12 +1957,12 @@ onDestroy(() => {
 											class="h-9 w-14 shrink-0 border border-neutral-600 bg-neutral-950 text-center font-mono text-sm text-neutral-100"
 											aria-label="Focus value"
 											value={focusText}
-											on:input={(event) => previewDraft(event.currentTarget.value, (value) => (focusText = value), (value) => (cameraFocus = value))}
-											on:blur={() => commitDraft(focusText, cameraFocus, (value) => (cameraFocus = value), (value) => (focusText = value))}
+											on:input={(event) => previewDraft(event.currentTarget.value, (value) => (focusText = value), setCameraFocus)}
+											on:blur={() => commitDraft(focusText, cameraFocus, setCameraFocus, (value) => (focusText = value))}
 											on:keydown={(event) => {
 												if (event.key !== "Enter") return;
 												event.preventDefault();
-												commitDraft(focusText, cameraFocus, (value) => (cameraFocus = value), (value) => (focusText = value));
+												commitDraft(focusText, cameraFocus, setCameraFocus, (value) => (focusText = value));
 											}}
 										/>
 									</div>
@@ -1911,7 +2042,7 @@ onDestroy(() => {
 									</div>
 								</div>
 								<p class="text-sm text-neutral-400">
-									Resolution, focus, brightness, and contrast are sent to this camera. Reset returns the defaults. Cancel returns the last saved settings.
+									Resolution is sent to this camera. The preview Focus slider sets focus and saves it here. Auto on the preview clears it. Brightness and contrast are saved with the camera. Reset returns the defaults. Cancel returns the last saved settings.
 								</p>
 							</fieldset>
 							<div class="flex flex-wrap items-center gap-2 xl:col-span-2">
@@ -1951,6 +2082,50 @@ onDestroy(() => {
 							{/if}
 							{#if previewNotice}
 								<p class="text-sm text-neutral-200 xl:col-span-2">{previewNotice}</p>
+							{/if}
+						</form>
+						<form
+							class="flex flex-col gap-4 border border-neutral-700 bg-neutral-900 p-4 xl:col-span-2"
+							on:submit|preventDefault={saveTrainingFolder}
+						>
+							<fieldset class="flex flex-col gap-3">
+								<legend class="text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+									Training image folder
+								</legend>
+								<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+									Folder
+									<input
+										type="text"
+										class="border border-neutral-600 bg-neutral-950 px-3 py-2 font-mono text-sm font-medium normal-case tracking-normal text-neutral-100"
+										bind:value={trainingDir}
+										disabled={savingTraining}
+										spellcheck="false"
+										autocomplete="off"
+									/>
+								</label>
+								<p class="text-sm text-neutral-400">
+									Preview snapshots are saved in a dd-mm-yyyy folder here. The default is Documents/ls-vision/training. Save stores this folder.
+								</p>
+							</fieldset>
+							<div class="flex flex-wrap items-center gap-2">
+								<button
+									type="submit"
+									class="inline-flex min-h-11 items-center border border-blue-500 bg-blue-600 px-4 text-sm font-semibold text-white disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
+									disabled={savingTraining}
+								>
+									{savingTraining ? "Saving..." : "Save"}
+								</button>
+								<button
+									type="button"
+									class="inline-flex min-h-11 items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100 disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
+									on:click={browseTrainingFolder}
+									disabled={savingTraining}
+								>
+									Browse
+								</button>
+							</div>
+							{#if trainingNotice}
+								<p class="text-sm text-neutral-200">{trainingNotice}</p>
 							{/if}
 						</form>
 					{:else if section === "capture"}

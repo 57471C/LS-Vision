@@ -6,6 +6,7 @@ mod detect;
 mod inference_ep;
 mod local_config;
 mod results;
+mod training;
 
 use tauri::Manager;
 
@@ -41,6 +42,13 @@ pub fn run() {
             camera::list_camera_modes,
             camera::capture_snapshot,
             camera::capture_preview,
+            camera::set_camera_focus,
+            camera::set_camera_autofocus,
+            training::default_training_folder,
+            training::check_training_folder,
+            training::pick_training_folder,
+            training::suggest_training_filename,
+            training::save_training_image,
             detect::detect_image,
             detect::benchmark_detect,
             inference_ep::inference_status,

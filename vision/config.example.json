@@ -24,6 +24,8 @@
 	"barcodeRoi": null,
 	"model": "best.pt",
 	"inferenceEp": "directml",
+	"trainingDir": "",
+	"trainingImageName": "",
 	"camera": {
 		"index": 0,
 		"resolution": "",
