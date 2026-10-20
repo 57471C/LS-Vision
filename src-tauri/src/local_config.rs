@@ -72,6 +72,26 @@ fn env_path(key: &str) -> Option<PathBuf> {
     Some(PathBuf::from(value))
 }
 
+/// Training snapshots use Documents even when LocalAppData exists.
+pub(crate) fn training_dir_for_home(home: &Path) -> PathBuf {
+    home.join("Documents").join("ls-vision").join("training")
+}
+
+pub(crate) fn default_training_dir() -> Result<PathBuf, String> {
+    let Some(home) = env_path("USERPROFILE").or_else(|| env_path("HOME")) else {
+        return Err("Could not find Documents.".to_string());
+    };
+    let dir = training_dir_for_home(&home);
+    if is_program_files(&dir) {
+        return Err("Training images cannot be written under Program Files.".to_string());
+    }
+    Ok(dir)
+}
+
+pub(crate) fn path_is_program_files(path: &Path) -> bool {
+    is_program_files(path)
+}
+
 fn is_program_files(path: &Path) -> bool {
     let text = normalize_path(path);
     if text.ends_with("\\program files") || text.ends_with("\\program files (x86)") {
@@ -183,6 +203,8 @@ fn default_config() -> Value {
         "barcodeRoi": null,
         "model": "",
         "inferenceEp": "directml",
+        "trainingDir": "",
+        "trainingImageName": "",
         "camera": {
             "index": 0,
             "resolution": "",
@@ -690,6 +712,8 @@ mod tests {
         assert_eq!(document["source"], "json");
         assert_eq!(document["model"], "");
         assert_eq!(document["inferenceEp"], "directml");
+        assert_eq!(document["trainingDir"], "");
+        assert_eq!(document["trainingImageName"], "");
         assert_eq!(document["scanSeconds"], 8);
         assert!(!config_file(project.root()).exists());
     }
