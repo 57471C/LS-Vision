@@ -2,7 +2,7 @@
 
 Desktop application for verifying fastener kits on the bench using computer vision.
 
-Built with Tauri 2, SvelteKit, TypeScript, and Rust. Version 0.3.2. Inference is ONNX Runtime in the Rust process. The camera, barcode decode, and BoM lookup run there too. The app does not start Python.
+Built with Tauri 2, SvelteKit, TypeScript, and Rust. Version 0.3.3. Inference is ONNX Runtime in the Rust process. The camera, barcode decode, and BoM lookup run there too. The app does not start Python.
 
 ## What it does
 
@@ -35,7 +35,7 @@ In Settings > Training, use Update model to copy an `.onnx` file into the app da
 
 ## Project status
 
-Version 0.3.2 runs inference, the camera, barcode decode, and BoM lookup in the Tauri process. There is no Python sidecar and no port 8008 client. A `.pt` model shows a warning instead of detecting.
+Version 0.3.3 runs inference, the camera, barcode decode, and BoM lookup in the Tauri process. There is no Python sidecar and no port 8008 client. A `.pt` model shows a warning instead of detecting.
 
 Recent additions:
 
