@@ -8,6 +8,7 @@ export type InspectView = {
 	status: string;
 	message?: string;
 	kitCode?: string;
+	jobCard?: string;
 	des?: string;
 	parts?: Part[];
 	kitsFound?: number;

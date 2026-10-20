@@ -36,6 +36,7 @@ pub struct ListedResult {
     pub passed: bool,
     pub kit_ic: String,
     pub description: String,
+    pub job_card: String,
     pub created_at: String,
     pub has_image: bool,
     pub detail: Value,
@@ -101,12 +102,43 @@ fn open_db(root: &Path) -> Result<Connection, String> {
                 description TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 image_path TEXT,
-                detail_json TEXT NOT NULL
+                detail_json TEXT NOT NULL,
+                job_card TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS results_created_at ON results (created_at);",
         )
         .map_err(db_err)?;
+    ensure_job_card_column(&connection)?;
     Ok(connection)
+}
+
+fn ensure_job_card_column(connection: &Connection) -> Result<(), String> {
+    let found = {
+        let mut statement = connection
+            .prepare("PRAGMA table_info(results)")
+            .map_err(db_err)?;
+        let names = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(db_err)?;
+        let mut present = false;
+        for name in names {
+            if name.map_err(db_err)?.eq_ignore_ascii_case("job_card") {
+                present = true;
+                break;
+            }
+        }
+        present
+    };
+    if found {
+        return Ok(());
+    }
+    connection
+        .execute(
+            "ALTER TABLE results ADD COLUMN job_card TEXT NOT NULL DEFAULT ''",
+            [],
+        )
+        .map_err(db_err)?;
+    Ok(())
 }
 
 fn jpeg_bytes(raw: &str) -> Result<Vec<u8>, String> {
@@ -163,6 +195,7 @@ pub(crate) fn save_in(
     passed: bool,
     kit_ic: &str,
     description: &str,
+    job_card: &str,
     image_base64: Option<&str>,
     detail: &Value,
     when: DateTime<Local>,
@@ -188,8 +221,10 @@ pub(crate) fn save_in(
         "{}".to_string()
     };
     let inserted = connection.execute(
-        "INSERT INTO results (passed, kit_ic, description, created_at, image_path, detail_json)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO results (
+            passed, kit_ic, description, created_at, image_path, detail_json, job_card
+         )
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             passed,
             clip_text(kit_ic, 200),
@@ -197,6 +232,7 @@ pub(crate) fn save_in(
             when.to_rfc3339(),
             image_path,
             detail_text,
+            clip_text(job_card, 80),
         ],
     );
     if let Err(err) = inserted {
@@ -218,7 +254,7 @@ pub(crate) fn list_in(root: &Path) -> Result<Vec<ListedResult>, String> {
     let connection = open_db(root)?;
     let mut statement = connection
         .prepare(
-            "SELECT id, passed, kit_ic, description, created_at, image_path, detail_json
+            "SELECT id, passed, kit_ic, description, created_at, image_path, detail_json, job_card
              FROM results
              ORDER BY created_at DESC, id DESC",
         )
@@ -227,6 +263,7 @@ pub(crate) fn list_in(root: &Path) -> Result<Vec<ListedResult>, String> {
         .query_map([], |row| {
             let image_path: Option<String> = row.get(5)?;
             let detail_text: String = row.get(6)?;
+            let job_card: String = row.get(7)?;
             let detail = serde_json::from_str(&detail_text).unwrap_or_else(|_| json!({}));
             let has_image = image_path
                 .as_deref()
@@ -237,6 +274,7 @@ pub(crate) fn list_in(root: &Path) -> Result<Vec<ListedResult>, String> {
                 passed: row.get::<_, i64>(1)? != 0,
                 kit_ic: row.get(2)?,
                 description: row.get(3)?,
+                job_card,
                 created_at: row.get(4)?,
                 has_image,
                 detail,
@@ -311,6 +349,7 @@ pub fn save_result(
     passed: bool,
     kit_ic: String,
     description: String,
+    job_card: Option<String>,
     image_base64: Option<String>,
     detail: Value,
 ) -> Result<SaveOutcome, String> {
@@ -323,6 +362,7 @@ pub fn save_result(
         passed,
         &kit_ic,
         &description,
+        job_card.as_deref().unwrap_or(""),
         image_base64.as_deref(),
         &detail,
         Local::now(),
@@ -372,8 +412,7 @@ mod tests {
     }
 
     fn tiny_jpeg() -> String {
-        let image: ImageBuffer<Rgb<u8>, Vec<u8>> =
-            ImageBuffer::from_pixel(1, 1, Rgb([12, 34, 56]));
+        let image: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_pixel(1, 1, Rgb([12, 34, 56]));
         let mut bytes = Vec::new();
         let encoder = JpegEncoder::new_with_quality(&mut bytes, 80);
         encoder
@@ -422,6 +461,7 @@ mod tests {
             true,
             "6PBBK001",
             "Accessory Kit",
+            "17834402",
             Some(&tiny_jpeg()),
             &detail,
             when(),
@@ -433,6 +473,7 @@ mod tests {
         assert!(listed[0].passed);
         assert_eq!(listed[0].kit_ic, "6PBBK001");
         assert_eq!(listed[0].description, "Accessory Kit");
+        assert_eq!(listed[0].job_card, "17834402");
         assert!(listed[0].has_image);
         assert_eq!(listed[0].detail["parts"][0]["ic"], "2BBMNM08");
         let image = image_in(&root, id).unwrap();
@@ -463,6 +504,54 @@ mod tests {
         delete_in(&root, id).unwrap();
         assert!(outside.is_file());
         assert!(list_in(&root).unwrap().is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn old_database_gains_a_job_card_column() {
+        let root = temp_root("migrate");
+        let connection = Connection::open(root.join(DB_FILE)).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    passed INTEGER NOT NULL,
+                    kit_ic TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    image_path TEXT,
+                    detail_json TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO results (passed, kit_ic, description, created_at, image_path, detail_json)
+                 VALUES (1, '6PBBK001', 'Kit', '2026-10-19T00:00:00+00:00', NULL, '{}')",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let listed = list_in(&root).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].job_card, "");
+        let id = save_in(
+            &root,
+            false,
+            "6PBBGR01",
+            "Rail",
+            "17834402",
+            None,
+            &json!({}),
+            when(),
+        )
+        .unwrap();
+        let saved = list_in(&root)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == id)
+            .unwrap();
+        assert_eq!(saved.job_card, "17834402");
         let _ = fs::remove_dir_all(root);
     }
 }

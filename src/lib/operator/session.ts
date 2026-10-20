@@ -337,6 +337,7 @@ function attachSession(
 			const outcome = await invoke<{ saved: boolean }>("save_result", {
 				passed: view.status === "pass",
 				kitIc: view.kitCode ?? "",
+				jobCard: view.jobCard ?? "",
 				description: view.des ?? "",
 				imageBase64: image,
 				detail: {
@@ -354,8 +355,9 @@ function attachSession(
 				},
 			});
 			if (outcome.saved) {
+				const job = view.jobCard?.trim();
 				writeConsole(
-					`Result saved: ${view.status} ${view.kitCode?.trim() || "(no kit)"}`,
+					`Result saved: ${view.status} ${view.kitCode?.trim() || "(no kit)"}${job ? ` job ${job}` : ""}`,
 				);
 			}
 		} catch (err: unknown) {
@@ -745,7 +747,7 @@ function attachSession(
 	async function lookupCode(code: string): Promise<InspectView> {
 		// API sends the trimmed job card. JSON and MSSQL send the field as typed.
 		const sent = op.bomSource === "api" ? code.trim() : code;
-		return traceBom(sent, async () => {
+		const view = await traceBom(sent, async () => {
 			if (op.bomSource === "api") {
 				const body = await invoke("post_bom_api", {
 					jobCardNumber: sent,
@@ -758,6 +760,7 @@ function attachSession(
 			}
 			return await invoke<InspectView>("inspect_bom", { barcode: sent });
 		});
+		return withJobCard(view, sent);
 	}
 
 	function stillWatches(index: number): boolean {
@@ -1607,6 +1610,67 @@ function attachSession(
 		return String(value).trim();
 	}
 
+	function jobCardText(row: Record<string, unknown>): string {
+		return apiText(row, [
+			"jobCard",
+			"jobCardNumber",
+			"job_card",
+			"job_card_number",
+			"jobCardNo",
+			"jc",
+		]).slice(0, 80);
+	}
+
+	function normalizeJobCard(raw: string): string {
+		const text = raw.trim();
+		if (!text) return "";
+		if (/^\d+$/.test(text)) {
+			const digits = text.replace(/^0+(?=\d)/, "");
+			return digits.length <= 18 ? digits : "";
+		}
+		return text.slice(0, 80);
+	}
+
+	function jobCardFromLabel(raw: string): string {
+		const text = stripOneTrailingSlash(raw.trim());
+		if (!text) return "";
+		if (text.startsWith("{")) {
+			try {
+				const parsed: unknown = JSON.parse(text);
+				if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+					const found = jobCardText(parsed as Record<string, unknown>);
+					if (found) return normalizeJobCard(found);
+				}
+			} catch {
+				// The barcode is not a JSON object.
+			}
+		}
+		const labelled = text.match(
+			/(?:^|[^a-z0-9])(?:job\s*card|jobcard|job|jc)\s*[:=#-]?\s*(\d{1,18})(?!\d)/i,
+		);
+		if (labelled?.[1]) return normalizeJobCard(labelled[1]);
+		const compact = text.replace(/\s+/g, "");
+		if (/^\d{1,18}$/.test(compact)) return normalizeJobCard(compact);
+		return "";
+	}
+
+	function withJobCard(view: InspectView, scanned: string): InspectView {
+		// The scanned label wins. The BoM field is used when the label has no job card.
+		const jobCard = jobCardFromLabel(scanned) || (view.jobCard ?? "").trim();
+		if (!jobCard || jobCard === view.jobCard) return view;
+		return { ...view, jobCard };
+	}
+
+	function keepBomJobCard(
+		view: InspectView,
+		row: Record<string, unknown>,
+	): InspectView {
+		if (view.jobCard?.trim()) return view;
+		const jobCard = jobCardText(row);
+		if (!jobCard) return view;
+		return { ...view, jobCard };
+	}
+
 	function apiQty(value: unknown): number {
 		if (typeof value === "number" && Number.isFinite(value)) return value;
 		if (
@@ -1640,10 +1704,12 @@ function attachSession(
 			});
 		}
 		const expected = apiField(row, ["expectedKitCount", "labelCount"]);
+		const jobCard = jobCardText(row);
 		return {
 			status: "pass",
 			message: "BoM loaded – 2 kit(s) on bench",
 			kitCode,
+			...(jobCard ? { jobCard } : {}),
 			des: apiText(row, ["des", "description", "kitName"]),
 			parts,
 			kitsFound: 2,
@@ -1692,17 +1758,28 @@ function attachSession(
 		const row = data as Record<string, unknown>;
 		const directCode = apiText(row, ["kitIC", "kitIc", "kitCode", "kit", "ic"]);
 		if (directCode && Array.isArray(apiField(row, ["parts"]))) {
-			return viewFromKit(directCode, row);
+			return keepBomJobCard(viewFromKit(directCode, row), row);
 		}
 		const kits = kitsKeyedByIc(row);
 		if (kits.length > 1) {
-			return { status: "fail", message: "BoM API returned more than one kit." };
+			return keepBomJobCard(
+				{ status: "fail", message: "BoM API returned more than one kit." },
+				row,
+			);
 		}
-		if (kits.length === 1) return viewFromKit(kits[0].kitCode, kits[0].job);
+		if (kits.length === 1) {
+			return keepBomJobCard(viewFromKit(kits[0].kitCode, kits[0].job), row);
+		}
 		if (directCode) {
-			return { status: "fail", message: "BoM API response has no parts." };
+			return keepBomJobCard(
+				{ status: "fail", message: "BoM API response has no parts." },
+				row,
+			);
 		}
-		return { status: "fail", message: "BoM API response has no kit IC." };
+		return keepBomJobCard(
+			{ status: "fail", message: "BoM API response has no kit IC." },
+			row,
+		);
 	}
 
 	async function runApiLookup() {

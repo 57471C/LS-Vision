@@ -24,6 +24,7 @@ export type SavedResult = {
 	id: number;
 	passed: boolean;
 	kitIc: string;
+	jobCard: string;
 	description: string;
 	createdAt: string;
 	hasImage: boolean;

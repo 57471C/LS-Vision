@@ -157,6 +157,17 @@ fn job_from_rows(header: &Map<String, Value>, parts: &[Map<String, Value>]) -> V
     json!({
         "des": row_text(header, &["des", "kitname", "kit_name", "description"]),
         "expectedKitCount": row_number(header, &["expectedkitcount", "expected_kit_count", "labelcount"]),
+        "jobCard": row_text(
+            header,
+            &[
+                "jobcard",
+                "jobcardnumber",
+                "job_card",
+                "job_card_number",
+                "jobcardno",
+                "jc",
+            ],
+        ),
         "parts": part_list,
     })
 }
@@ -203,6 +214,7 @@ fn pass(barcode: &str, job: &Value) -> Value {
         "expectedKitCount": job.get("expectedKitCount").cloned().unwrap_or(Value::Null),
         "parts": job.get("parts").cloned().unwrap_or_else(|| json!([])),
         "kitsFound": 2,
+        "jobCard": job.get("jobCard").cloned().unwrap_or(Value::String(String::new())),
     })
 }
 
@@ -451,5 +463,18 @@ mod tests {
         let message = scrub("login failed for secret-value", "secret-value");
         assert_eq!(message, "login failed for ********");
         assert!(!message.contains("secret-value"));
+    }
+
+    #[test]
+    fn header_job_card_is_kept_on_the_pass_view() {
+        let mut header = Map::new();
+        header.insert("KitName".into(), json!("Bolt bag"));
+        header.insert("JobCardNumber".into(), json!("17834402"));
+        let job = job_from_rows(&header, &[]);
+        assert_eq!(job["des"], "Bolt bag");
+        assert_eq!(job["jobCard"], "17834402");
+        let view = pass("6PBBK001", &job);
+        assert_eq!(view["kitCode"], "6PBBK001");
+        assert_eq!(view["jobCard"], "17834402");
     }
 }
