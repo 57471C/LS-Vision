@@ -1,6 +1,7 @@
 <script lang="ts">
 // biome-ignore-all lint/correctness/noUnusedVariables: Biome 2.4 does not treat Svelte template references as uses
 
+import { detectionCounts, inspectionVerdict } from "$lib/operator/verdict";
 import { useOperator } from "$lib/stores/operator";
 
 const { chooseAndDetect, operator } = useOperator();
@@ -36,15 +37,6 @@ type DetectedCount = {
 	count: number;
 };
 
-function detectionCounts(items: Detection[]): Record<string, number> {
-	const counts: Record<string, number> = {};
-	for (const item of items) {
-		if (!item.ic) continue;
-		counts[item.ic] = (counts[item.ic] ?? 0) + 1;
-	}
-	return counts;
-}
-
 function isLoadedBom(view: InspectView | null, bom: BomView | null): boolean {
 	return !!bom && !!view?.parts?.length && view.kitCode === bom.kitCode;
 }
@@ -65,11 +57,27 @@ function matchSummary(parts: Part[], items: Detection[]): string {
 	const counts = detectionCounts(items);
 	let matched = 0;
 	for (const part of parts) {
-		if ((counts[part.ic] ?? 0) === part.qty) matched += 1;
+		if ((counts[part.ic] ?? 0) >= part.qty) matched += 1;
 	}
 	const lines = parts.length === 1 ? "line" : "lines";
 	return `${matched} of ${parts.length} BoM ${lines} match`;
 }
+
+$: counts = detectionCounts($operator.detections);
+$: detectFailed =
+	$operator.detectState === "done" &&
+	!!$operator.detectMessage &&
+	$operator.detections.length === 0;
+$: verdict = $operator.result
+	? inspectionVerdict({
+			status: $operator.result.status,
+			bomLoaded: isLoadedBom($operator.result, $operator.bom),
+			detectState: $operator.detectState,
+			detectFailed,
+			parts: $operator.result.parts ?? [],
+			counts,
+		})
+	: "fail";
 </script>
 
 <section class="flex min-h-0 min-w-0 flex-col overflow-hidden border border-neutral-700 bg-neutral-900">
@@ -78,12 +86,14 @@ function matchSummary(parts: Part[], items: Detection[]): string {
 	</h2>
 	{#if $operator.result}
 		<p
-			class="shrink-0 px-4 py-4 text-4xl font-black uppercase leading-none tracking-widest {$operator.result.status ===
+			class="shrink-0 px-4 py-4 text-4xl font-black uppercase leading-none tracking-widest {verdict ===
 			'pass'
 				? 'bg-green-500 text-neutral-950'
-				: 'bg-red-600 text-white'}"
+				: verdict === 'incomplete'
+					? 'bg-amber-500 text-neutral-950'
+					: 'bg-red-600 text-white'}"
 		>
-			{$operator.result.status}
+			{verdict}
 		</p>
 		<div class="result-scroll flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4">
 			{#if $operator.result.kitCode}
@@ -113,11 +123,8 @@ function matchSummary(parts: Part[], items: Detection[]): string {
 				<p class="text-base text-neutral-200">{$operator.result.message}</p>
 			{/if}
 			{#if $operator.result.parts?.length}
-				{@const detectFailed =
-					$operator.detectState === "done" && !!$operator.detectMessage && $operator.detections.length === 0}
 				{@const showSeen =
 					$operator.detectState !== "idle" && isLoadedBom($operator.result, $operator.bom) && !detectFailed}
-				{@const counts = detectionCounts($operator.detections)}
 				<table class="w-full border-collapse text-left text-sm">
 					<thead>
 						<tr class="border-b border-neutral-600 text-[11px] uppercase tracking-widest text-neutral-400">
@@ -139,7 +146,7 @@ function matchSummary(parts: Part[], items: Detection[]): string {
 									<td
 										class="py-2 text-right font-semibold {$operator.detectState === 'running'
 											? 'text-neutral-500'
-											: (counts[part.ic] ?? 0) === part.qty
+											: (counts[part.ic] ?? 0) >= part.qty
 												? 'text-green-400'
 												: 'text-red-400'}"
 									>
@@ -153,6 +160,9 @@ function matchSummary(parts: Part[], items: Detection[]): string {
 				{#if showSeen && $operator.detectState === "done"}
 					<p class="text-sm text-neutral-300">{matchSummary($operator.result.parts, $operator.detections)}</p>
 				{/if}
+			{/if}
+			{#if verdict === "incomplete" && $operator.detectState !== "running"}
+				<p class="text-sm text-neutral-400">Part counts are not confirmed yet.</p>
 			{/if}
 			{#if $operator.detectState === "running"}
 				<p class="text-sm text-neutral-400">Detecting parts...</p>

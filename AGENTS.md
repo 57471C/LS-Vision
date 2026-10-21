@@ -19,7 +19,7 @@ LS-Vision is a Tauri 2 + SvelteKit desktop app for bench-top kit verification us
 - BoM lookup stays behind a simple interface so Settings can swap JSON, API, and MSSQL.
 - The operator Console button and drawer show only while admin is unlocked (`sessionStorage` key `ls-vision-settings-open`). Lines are still recorded when the page is locked. Locking admin closes the drawer.
 - Release builds enable the Tauri `devtools` feature, and the main window and camera preview set `devtools: true`. Ctrl+Shift+I is Tauri's shortcut. F12 calls the same inspector from `src/routes/+layout.svelte`.
-- Pass and fail inspections are stored in SQLite under LocalAppData (`results/results.sqlite`), or Documents when LocalAppData is missing. The row includes the job card number from the scanned label, or from the BoM when that lookup returns one. The snapshot JPEG is a file under `results/images`. The database stores that path. Settings > Capture has "Do not save Pass / Fail results", on by default (`skipResultSave`). When it is on, the row and the JPEG are not written. File names are `P-{kitIC}-{DDMMYY}-{HH-MM-SS}.jpg` and `F-{kitIC}-{DDMMYY}-{HH-MM-SS}.jpg`. Operators open `/results` from the operator header and from the top of the settings rail. Delete shows only while admin is unlocked and removes the row and the JPEG.
+- Pass and fail inspections are stored in SQLite under LocalAppData (`results/results.sqlite`), or Documents when LocalAppData is missing. When detection ran, the stored pass flag also requires every BoM line's seen count to meet or exceed the expected quantity. The row includes the job card number from the scanned label, or from the BoM when that lookup returns one. The snapshot JPEG is a file under `results/images`. The database stores that path. Settings > Capture has "Do not save Pass / Fail results", on by default (`skipResultSave`). When it is on, the row and the JPEG are not written. File names are `P-{kitIC}-{DDMMYY}-{HH-MM-SS}.jpg` and `F-{kitIC}-{DDMMYY}-{HH-MM-SS}.jpg`. Operators open `/results` from the operator header and from the top of the settings rail. Delete shows only while admin is unlocked and removes the row and the JPEG.
 
 ## Conventions
 
@@ -29,13 +29,14 @@ LS-Vision is a Tauri 2 + SvelteKit desktop app for bench-top kit verification us
 - Prefer explicit, readable code over clever abstractions at this stage.
 - When adding vision features, keep the Rust ONNX path. Do not add a Python runtime process or a call to port 8008.
 - The Windows installer targets Program Files (NSIS `perMachine`; the MSI already uses Program Files). Photos, snapshots, and logs go under LocalAppData, or Documents when LocalAppData is missing. Do not write them under Program Files. Training snapshots from the camera preview are the exception: they default to `Documents/ls-vision/training` even when LocalAppData exists, then a `dd-mm-yyyy` folder.
-- ONNX models live in the Tauri app data `models` folder (`%APPDATA%\studio.lean.ls-vision\models` on Windows) for both `npm run tauri dev` and the installed app. The active filename stays in `vision/config.local.json`. Settings > Training > Update model copies an `.onnx` file there and refuses a file that is not ONNX. The installer does not bundle `.onnx` files. A missing or failed model is reported on the operator page.
+- ONNX models live in the Tauri app data `models` folder (`%APPDATA%\studio.lean.ls-vision\models` on Windows) for both `npm run tauri dev` and the installed app. The active filename stays in `vision/config.local.json`. Settings > Training > Update model copies an `.onnx` file there, makes that file the active model, and shows the destination path or the copy error. A file that fails the ONNX header check is rejected with "Selected file is not a valid ONNX model". The installer does not bundle `.onnx` files. A missing or failed model is reported on the operator page.
+- Detection confidence is `confidence` in `vision/config.local.json`, from 0.15 to 0.80, default 0.45. Settings > Training saves it when it changes. `detect_image` uses it as the YOLO score threshold. Boxes at or below that score are dropped.
 
 ## Current behaviour
 
 1. Barcode read from the saved barcode ROI, on a paced live preview.
 2. BoM lookup from JSON, the job-card API, or MSSQL.
-3. Inspection result on the operator view, with a clear pass/fail.
+3. Inspection result on the operator view. PASS requires a loaded BoM and every BoM line's detected count at or above the expected quantity. A missing barcode, a missing BoM, or a short line is FAIL. Until detection finishes, the banner is incomplete. Kit found/expected stays an info line and does not set PASS.
 4. Full-resolution snapshot for detection, without freezing the preview canvas.
 
 See `plan.md` for the phased plan. Update this file if major architectural decisions change.

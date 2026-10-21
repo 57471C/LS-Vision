@@ -22,7 +22,9 @@ use serde_json::{Value, json};
 use crate::inference_ep::{self, Provider};
 use crate::local_config;
 
-const CONF_THRESHOLD: f32 = 0.25;
+const DEFAULT_CONFIDENCE: f32 = 0.45;
+const MIN_CONFIDENCE: f32 = 0.15;
+const MAX_CONFIDENCE: f32 = 0.80;
 const IOU_THRESHOLD: f32 = 0.7;
 const MAX_DET: usize = 300;
 const MAX_NMS: usize = 30_000;
@@ -188,6 +190,23 @@ fn clean_detect_roi(raw: &Value) -> Option<Roi> {
         w: round_places(width, 4),
         h: round_places(height, 4),
     })
+}
+
+/// Saved `confidence` in vision/config.local.json. Missing or invalid values use 0.45.
+fn confidence_value(document: &Value) -> f32 {
+    let Some(number) = document.get("confidence").and_then(|value| value.as_f64()) else {
+        return DEFAULT_CONFIDENCE;
+    };
+    if !number.is_finite() {
+        return DEFAULT_CONFIDENCE;
+    }
+    (number as f32).clamp(MIN_CONFIDENCE, MAX_CONFIDENCE)
+}
+
+fn configured_confidence(root: &Path) -> f32 {
+    local_config::load_document(root)
+        .map(|document| confidence_value(&document))
+        .unwrap_or(DEFAULT_CONFIDENCE)
 }
 
 fn configured_roi(root: &Path) -> Option<Roi> {
@@ -590,6 +609,7 @@ fn candidates_from_output(
     channels: usize,
     boxes: usize,
     bcn: bool,
+    conf_threshold: f32,
 ) -> Vec<Candidate> {
     let class_count = channels.saturating_sub(4);
     let mut found = Vec::new();
@@ -610,7 +630,7 @@ fn candidates_from_output(
                 best_class = class_id;
             }
         }
-        if !best_score.is_finite() || best_score <= CONF_THRESHOLD {
+        if !best_score.is_finite() || best_score <= conf_threshold {
             continue;
         }
         let half_w = w * 0.5;
@@ -633,6 +653,7 @@ fn detections_from_output(
     names: &[String],
     end_to_end: bool,
     frame: OutputFrame,
+    conf_threshold: f32,
 ) -> Result<Vec<Detection>, String> {
     if shape.len() != 3 || shape[0] < 1 {
         return Err("Detect failed: unexpected output shape".to_string());
@@ -654,9 +675,15 @@ fn detections_from_output(
     }
     let values = &values[..channels * boxes];
     let chosen = if end_to_end {
-        end_to_end_candidates(values, channels, boxes, bcn)
+        end_to_end_candidates(values, channels, boxes, bcn, conf_threshold)
     } else {
-        nms(candidates_from_output(values, channels, boxes, bcn))
+        nms(candidates_from_output(
+            values,
+            channels,
+            boxes,
+            bcn,
+            conf_threshold,
+        ))
     };
     let mut detections = Vec::with_capacity(chosen.len());
     for item in chosen {
@@ -688,6 +715,7 @@ fn end_to_end_candidates(
     channels: usize,
     boxes: usize,
     bcn: bool,
+    conf_threshold: f32,
 ) -> Vec<Candidate> {
     if channels < 6 {
         return Vec::new();
@@ -700,7 +728,7 @@ fn end_to_end_candidates(
         let y2 = score_at(values, bcn, channels, boxes, 3, box_index);
         let score = score_at(values, bcn, channels, boxes, 4, box_index);
         let class_id = score_at(values, bcn, channels, boxes, 5, box_index);
-        if !score.is_finite() || score <= CONF_THRESHOLD || class_id < 0.0 {
+        if !score.is_finite() || score <= conf_threshold || class_id < 0.0 {
             continue;
         }
         found.push(Candidate {
@@ -1134,6 +1162,7 @@ fn infer_detections(
     view_h: i32,
     origin_x: i32,
     origin_y: i32,
+    conf_threshold: f32,
 ) -> Result<Vec<Detection>, String> {
     let tensor = ort::value::Tensor::from_array(([1usize, 3, image_size, image_size], data))
         .map_err(|err| format!("Detect failed: {}", short_error(&err.to_string())))?;
@@ -1156,6 +1185,7 @@ fn infer_detections(
             origin_x,
             origin_y,
         },
+        conf_threshold,
     )
 }
 
@@ -1165,16 +1195,18 @@ fn run_model(
     width: u32,
     height: u32,
     roi: Option<&Roi>,
+    conf_threshold: f32,
 ) -> Result<Vec<Detection>, String> {
     let image_size = with_model(path, |model| Ok(model.image_size))?;
     let prepared = detect_view(rgb, width, height, roi, image_size)?;
-    infer_prepared(path, image_size, prepared)
+    infer_prepared(path, image_size, prepared, conf_threshold)
 }
 
 fn infer_prepared(
     path: &Path,
     image_size: usize,
     prepared: (Vec<f32>, i32, i32, i32, i32),
+    conf_threshold: f32,
 ) -> Result<Vec<Detection>, String> {
     let (data, view_w, view_h, origin_x, origin_y) = prepared;
     with_model(path, |model| {
@@ -1183,7 +1215,16 @@ fn infer_prepared(
         } else {
             Some(data.clone())
         };
-        match infer_detections(model, data, image_size, view_w, view_h, origin_x, origin_y) {
+        match infer_detections(
+            model,
+            data,
+            image_size,
+            view_w,
+            view_h,
+            origin_x,
+            origin_y,
+            conf_threshold,
+        ) {
             Ok(found) => Ok(found),
             Err(message) => {
                 let Some(retry) = retry else {
@@ -1205,15 +1246,29 @@ fn infer_prepared(
                         failed.label()
                     ),
                 );
-                infer_detections(model, retry, image_size, view_w, view_h, origin_x, origin_y)
+                infer_detections(
+                    model,
+                    retry,
+                    image_size,
+                    view_w,
+                    view_h,
+                    origin_x,
+                    origin_y,
+                    conf_threshold,
+                )
             }
         }
     })
 }
 
-fn detect_on_model(bytes: &[u8], path: &Path, roi: Option<&Roi>) -> Result<Value, String> {
+fn detect_on_model(
+    bytes: &[u8],
+    path: &Path,
+    roi: Option<&Roi>,
+    conf_threshold: f32,
+) -> Result<Value, String> {
     let (rgb, width, height) = decode_rgb(bytes)?;
-    let detections = run_model(path, &rgb, width, height, roi)?;
+    let detections = run_model(path, &rgb, width, height, roi, conf_threshold)?;
     let encoded = encode_jpeg(&rgb, width, height)?;
     Ok(json!({
         "detections": detections,
@@ -1245,7 +1300,8 @@ fn detect_image_now(image: Option<String>) -> Result<Value, String> {
         Err(message) => return Ok(failure(&message)),
     };
     let roi = configured_roi(&root);
-    match detect_on_model(&bytes, &path, roi.as_ref()) {
+    let confidence = configured_confidence(&root);
+    match detect_on_model(&bytes, &path, roi.as_ref(), confidence) {
         Ok(payload) => Ok(payload),
         Err(message) => Ok(failure(&model_status_message(&message))),
     }
@@ -1277,8 +1333,7 @@ pub async fn benchmark_detect() -> Result<DetectBenchmark, String> {
 fn run_benchmark() -> Result<DetectBenchmark, String> {
     let root = local_config::project_root()?;
     let model_path = active_onnx_path(&root)?;
-    benchmark_files(&model_path, &benchmark_image(&root)?)
-        .map_err(|err| model_status_message(&err))
+    benchmark_files(&model_path, &benchmark_image(&root)?).map_err(|err| model_status_message(&err))
 }
 
 fn benchmark_image(root: &Path) -> Result<PathBuf, String> {
@@ -1503,9 +1558,31 @@ mod tests {
             20.0, 20.0, 4.0, 4.0, 0.26, 0.1, // box 1
         ];
         // Layout (channels, boxes) = (6, 2) would be BCN. This slice is BNC, two rows.
-        let found = candidates_from_output(&values, 6, 2, false);
+        let found = candidates_from_output(&values, 6, 2, false, 0.25);
         assert_eq!(found.len(), 1);
         assert!((found[0].score - 0.26).abs() < 0.0001);
+    }
+
+    #[test]
+    fn confidence_defaults_to_0_45_and_clamps_to_the_slider_range() {
+        assert!((confidence_value(&Value::Null) - 0.45).abs() < 0.0001);
+        assert!((confidence_value(&json!({"confidence": 0.30})) - 0.30).abs() < 0.0001);
+        assert!((confidence_value(&json!({"confidence": 0.10})) - 0.15).abs() < 0.0001);
+        assert!((confidence_value(&json!({"confidence": 0.99})) - 0.80).abs() < 0.0001);
+        assert!((confidence_value(&json!({"confidence": "nope"})) - 0.45).abs() < 0.0001);
+    }
+
+    #[test]
+    fn saved_confidence_drops_boxes_at_or_below_it() {
+        let values = [
+            10.0, 10.0, 4.0, 4.0, 0.40, 0.1, // box 0
+            20.0, 20.0, 4.0, 4.0, 0.46, 0.1, // box 1
+        ];
+        let strict = candidates_from_output(&values, 6, 2, false, 0.45);
+        assert_eq!(strict.len(), 1);
+        assert!((strict[0].score - 0.46).abs() < 0.0001);
+        let loose = candidates_from_output(&values, 6, 2, false, 0.25);
+        assert_eq!(loose.len(), 2);
     }
 
     #[test]
@@ -1583,7 +1660,8 @@ mod tests {
             (2016, 1512, 1_263_775_576),
             "JPEG decode does not match cv2 on Example3.jpg"
         );
-        let payload = detect_on_model(&bytes, &model, None).unwrap();
+        // The fixture was exported at conf 0.25. Live detection uses the saved value.
+        let payload = detect_on_model(&bytes, &model, None, 0.25).unwrap();
         let got: Vec<Detection> = serde_json::from_value(payload["detections"].clone()).unwrap();
         let fixture = manifest.join("tests").join("example3-onnx-detections.json");
         let expected: Vec<Detection> =

@@ -13,6 +13,7 @@ import {
 	consoleStamp,
 	isCameraOpenError,
 } from "$lib/operator/console";
+import { detectionCounts, inspectionVerdict } from "$lib/operator/verdict";
 import {
 	type BarcodeRoi,
 	createOperatorViews,
@@ -304,15 +305,6 @@ function attachSession(
 		};
 	}
 
-	function detectionCounts(items: Detection[]): Record<string, number> {
-		const counts: Record<string, number> = {};
-		for (const item of items) {
-			if (!item.ic) continue;
-			counts[item.ic] = (counts[item.ic] ?? 0) + 1;
-		}
-		return counts;
-	}
-
 	async function recordResult(image: string | null, includeDetection: boolean) {
 		const view = op.result;
 		if (!view || (view.status !== "pass" && view.status !== "fail")) return;
@@ -326,6 +318,18 @@ function attachSession(
 			const counts =
 				includeDetection && !detectFailed ? detectionCounts(detections) : null;
 			const parts = view.parts ?? [];
+			const bomLoaded =
+				!!op.bom && parts.length > 0 && op.bom.kitCode === (view.kitCode ?? "");
+			const passed = includeDetection
+				? inspectionVerdict({
+						status: view.status,
+						bomLoaded,
+						detectState: "done",
+						detectFailed,
+						parts,
+						counts: counts ?? {},
+					}) === "pass"
+				: view.status === "pass";
 			const known = new Set(parts.map((part) => part.ic));
 			const extras =
 				counts === null
@@ -335,7 +339,7 @@ function attachSession(
 							.sort((left, right) => left[0].localeCompare(right[0]))
 							.map(([ic, count]) => ({ ic, count }));
 			const outcome = await invoke<{ saved: boolean }>("save_result", {
-				passed: view.status === "pass",
+				passed,
 				kitIc: view.kitCode ?? "",
 				jobCard: view.jobCard ?? "",
 				description: view.des ?? "",
@@ -357,7 +361,7 @@ function attachSession(
 			if (outcome.saved) {
 				const job = view.jobCard?.trim();
 				writeConsole(
-					`Result saved: ${view.status} ${view.kitCode?.trim() || "(no kit)"}${job ? ` job ${job}` : ""}`,
+					`Result saved: ${passed ? "pass" : "fail"} ${view.kitCode?.trim() || "(no kit)"}${job ? ` job ${job}` : ""}`,
 				);
 			}
 		} catch (err: unknown) {

@@ -24,3 +24,5 @@ vision/sidecar.log
 # Temporary frame saved by decode_barcode while barcode misses are being traced.
 vision/debug-barcode.jpg
 vision/barcode-debug.log
+# Model runs
+runs/
