@@ -294,7 +294,8 @@ onMount(() => {
 																<td class="py-2 text-right font-semibold">{part.qty}</td>
 																{#if partsOf(row).some((item) => item.seen !== null)}
 																	<td
-																		class="py-2 text-right font-semibold {part.seen === part.qty
+																		class="py-2 text-right font-semibold {part.seen !== null &&
+																		part.seen >= part.qty
 																			? 'text-green-400'
 																			: 'text-red-400'}"
 																	>

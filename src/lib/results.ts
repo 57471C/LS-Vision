@@ -117,7 +117,7 @@ export function matchSummary(parts: ResultPart[]): string {
 	if (!known.length) return "";
 	let matched = 0;
 	for (const part of known) {
-		if (part.seen === part.qty) matched += 1;
+		if (part.seen !== null && part.seen >= part.qty) matched += 1;
 	}
 	const lines = known.length === 1 ? "line" : "lines";
 	return `${matched} of ${known.length} BoM ${lines} match`;

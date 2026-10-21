@@ -202,6 +202,7 @@ fn default_config() -> Value {
         "detectRoi": null,
         "barcodeRoi": null,
         "model": "",
+        "confidence": 0.45,
         "inferenceEp": "directml",
         "trainingDir": "",
         "trainingImageName": "",
@@ -476,7 +477,7 @@ fn looks_like_onnx_model(path: &Path) -> Result<(), String> {
     if onnx_model_header(&header[..read]) {
         Ok(())
     } else {
-        Err("The selected file is not an ONNX model.".to_string())
+        Err("Selected file is not a valid ONNX model".to_string())
     }
 }
 
@@ -545,9 +546,42 @@ fn install_model_at(
 ) -> Result<ActiveModel, String> {
     let dest_name = onnx_destination_name(preferred);
     copy_model_file(models, source, &dest_name)?;
+    let dest = models.join(&dest_name);
+    let source_len = fs::metadata(source).map(|meta| meta.len()).unwrap_or(0);
+    let dest_len = fs::metadata(&dest).map(|meta| meta.len()).unwrap_or(0);
+    if !dest.is_file() || source_len == 0 || dest_len != source_len {
+        return Err(format!("The model was not copied to {}.", dest.display()));
+    }
     let mut saved = store_active_model(root, models, &dest_name)?;
-    saved.message = format!("Updated {dest_name}.");
+    let document = load_document(root)?;
+    let stored = document
+        .get("model")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    if !stored.eq_ignore_ascii_case(&dest_name) || !saved.active.eq_ignore_ascii_case(&dest_name) {
+        return Err(format!(
+            "Copied {} but it is not the active model.",
+            dest.display()
+        ));
+    }
+    saved.message = format!(
+        "Updated {}. Active model is {}.",
+        dest.display(),
+        saved.active
+    );
     Ok(saved)
+}
+
+/// A failed copy stays on the success payload. Settings reads `message`.
+fn report_model_update(
+    root: &Path,
+    models: &Path,
+    outcome: Result<ActiveModel, String>,
+) -> Result<ActiveModel, String> {
+    match outcome {
+        Ok(saved) => Ok(saved),
+        Err(err) => model_state(root, models, err),
+    }
 }
 
 #[tauri::command]
@@ -587,13 +621,20 @@ pub fn update_model(app: AppHandle, filename: String) -> Result<ActiveModel, Str
     let Some(picked) = picked else {
         return model_state(&root, &models, "No file selected.".to_string());
     };
-    let source = picked
-        .into_path()
-        .map_err(|_| "Could not read the selected file.".to_string())?;
+    let source = match picked.into_path() {
+        Ok(path) => path,
+        Err(_) => {
+            return model_state(
+                &root,
+                &models,
+                "Could not read the selected file.".to_string(),
+            );
+        }
+    };
     crate::detect::forget_session();
-    let saved = install_model_at(&root, &models, &source, &filename);
+    let outcome = install_model_at(&root, &models, &source, &filename);
     crate::detect::forget_session();
-    saved
+    report_model_update(&root, &models, outcome)
 }
 
 #[cfg(test)]
@@ -711,6 +752,7 @@ mod tests {
         let document = load_document(project.root()).unwrap();
         assert_eq!(document["source"], "json");
         assert_eq!(document["model"], "");
+        assert_eq!(document["confidence"], 0.45);
         assert_eq!(document["inferenceEp"], "directml");
         assert_eq!(document["trainingDir"], "");
         assert_eq!(document["trainingImageName"], "");
@@ -926,7 +968,13 @@ mod tests {
         let saved = install_model_at(project.root(), &models, &source, "kit.onnx").unwrap();
         assert_eq!(saved.model, "kit.onnx");
         assert_eq!(saved.active, "kit.onnx");
-        assert_eq!(saved.message, "Updated kit.onnx.");
+        assert_eq!(
+            saved.message,
+            format!(
+                "Updated {}. Active model is kit.onnx.",
+                models.join("kit.onnx").display()
+            )
+        );
         assert_eq!(fs::read(models.join("kit.onnx")).unwrap(), body);
         assert_eq!(fs::read(models.join("best.pt")).unwrap(), b"pt");
         assert_eq!(load_document(project.root()).unwrap()["model"], "kit.onnx");
@@ -950,7 +998,13 @@ mod tests {
         let saved = install_model_at(project.root(), &models, &source, "best.pt").unwrap();
         assert_eq!(saved.model, "best.onnx");
         assert_eq!(saved.active, "best.onnx");
-        assert_eq!(saved.message, "Updated best.onnx.");
+        assert_eq!(
+            saved.message,
+            format!(
+                "Updated {}. Active model is best.onnx.",
+                models.join("best.onnx").display()
+            )
+        );
         assert_eq!(fs::read(models.join("best.onnx")).unwrap(), body);
         assert_eq!(fs::read(models.join("best.pt")).unwrap(), b"pt");
     }
@@ -964,7 +1018,13 @@ mod tests {
         fs::write(&source, &body).unwrap();
         let saved = install_model_at(project.root(), &models, &source, "").unwrap();
         assert_eq!(saved.model, "best.onnx");
-        assert_eq!(saved.message, "Updated best.onnx.");
+        assert_eq!(
+            saved.message,
+            format!(
+                "Updated {}. Active model is best.onnx.",
+                models.join("best.onnx").display()
+            )
+        );
         assert_eq!(fs::read(models.join("best.onnx")).unwrap(), body);
     }
 
@@ -1001,7 +1061,14 @@ mod tests {
         let kept = onnx_bytes(b"keep");
         fs::write(models.join("best.onnx"), &kept).unwrap();
         let err = install_model_at(project.root(), &models, &source, "best.onnx").unwrap_err();
-        assert!(err.contains("not an ONNX model"), "{err}");
+        assert_eq!(err, "Selected file is not a valid ONNX model");
         assert_eq!(fs::read(models.join("best.onnx")).unwrap(), kept);
+        let reported = report_model_update(project.root(), &models, Err(err)).unwrap();
+        assert_eq!(reported.message, "Selected file is not a valid ONNX model");
+        assert_eq!(fs::read(models.join("best.onnx")).unwrap(), kept);
+        assert_ne!(
+            load_document(project.root()).unwrap()["model"],
+            "notes.onnx"
+        );
     }
 }

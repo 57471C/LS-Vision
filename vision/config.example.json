@@ -23,6 +23,7 @@
 	"detectRoi": null,
 	"barcodeRoi": null,
 	"model": "best.pt",
+	"confidence": 0.45,
 	"inferenceEp": "directml",
 	"trainingDir": "",
 	"trainingImageName": "",

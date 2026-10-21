@@ -73,6 +73,15 @@ let modelActive = "best.onnx";
 let modelNotice = "";
 let savingModel = false;
 let updatingModel = false;
+const CONFIDENCE_MIN = 0.15;
+const CONFIDENCE_MAX = 0.8;
+const CONFIDENCE_DEFAULT = 0.45;
+let confidence = CONFIDENCE_DEFAULT;
+let confidenceText = "0.45";
+let confidenceNotice = "";
+let confidenceTimer: ReturnType<typeof setTimeout> | null = null;
+let confidenceGeneration = 0;
+let confidenceChain: Promise<void> = Promise.resolve();
 let inferenceProviders: string[] = ["cpu"];
 let inferenceEp = "cpu";
 let inferenceActive = "cpu";
@@ -457,6 +466,117 @@ async function loadModel() {
 	} catch (err: unknown) {
 		modelNotice = invokeError(err, "Could not load the model list");
 	}
+	await loadConfidence();
+}
+
+function clampConfidence(value: number): number {
+	if (!Number.isFinite(value)) return CONFIDENCE_DEFAULT;
+	const clamped = Math.min(CONFIDENCE_MAX, Math.max(CONFIDENCE_MIN, value));
+	return Math.round(clamped * 100) / 100;
+}
+
+function showConfidence(value: number) {
+	confidence = clampConfidence(value);
+	confidenceText = confidence.toFixed(2);
+}
+
+function confidenceFill(): number {
+	return (
+		((confidence - CONFIDENCE_MIN) / (CONFIDENCE_MAX - CONFIDENCE_MIN)) * 100
+	);
+}
+
+function cancelConfidenceSave() {
+	if (confidenceTimer === null) return;
+	clearTimeout(confidenceTimer);
+	confidenceTimer = null;
+}
+
+function queueConfidenceSave() {
+	cancelConfidenceSave();
+	confidenceTimer = setTimeout(() => {
+		confidenceTimer = null;
+		const run = confidenceChain.then(persistConfidence, persistConfidence);
+		confidenceChain = run.then(
+			() => undefined,
+			() => undefined,
+		);
+	}, 200);
+}
+
+async function loadConfidence() {
+	const generation = confidenceGeneration;
+	try {
+		const data = await loadDocument();
+		if (generation !== confidenceGeneration) return;
+		showConfidence(
+			typeof data.confidence === "number"
+				? data.confidence
+				: CONFIDENCE_DEFAULT,
+		);
+	} catch (err: unknown) {
+		if (generation !== confidenceGeneration) return;
+		confidenceNotice = invokeError(
+			err,
+			"Could not load the confidence threshold",
+		);
+	}
+}
+
+async function persistConfidence() {
+	const generation = ++confidenceGeneration;
+	const next = confidence;
+	confidenceNotice = "";
+	try {
+		const current = await loadDocument();
+		if (generation !== confidenceGeneration || next !== confidence) return;
+		current.confidence = next;
+		await storeDocument(current);
+		if (generation !== confidenceGeneration) return;
+		confidenceNotice = `Saved. Confidence is ${next.toFixed(2)}.`;
+	} catch (err: unknown) {
+		if (generation !== confidenceGeneration) return;
+		confidenceNotice = invokeError(
+			err,
+			"Could not save the confidence threshold",
+		);
+	}
+}
+
+function slideConfidence(raw: string) {
+	showConfidence(Number(raw));
+	queueConfidenceSave();
+}
+
+function stepConfidence(delta: number) {
+	showConfidence(confidence + delta);
+	queueConfidenceSave();
+}
+
+function previewConfidence(raw: string) {
+	confidenceText = raw;
+	cancelConfidenceSave();
+}
+
+function commitConfidence() {
+	const parsed = Number(confidenceText);
+	if (!Number.isFinite(parsed)) {
+		confidenceText = confidence.toFixed(2);
+		return;
+	}
+	showConfidence(parsed);
+	queueConfidenceSave();
+}
+
+function modelNoticeClass(text: string): string {
+	if (
+		text.startsWith("Updated ") ||
+		text.startsWith("Saved.") ||
+		text === "No file selected."
+	) {
+		return "text-neutral-200";
+	}
+	return "text-red-300";
 }
 
 function inferenceLabel(id: string): string {
@@ -1666,6 +1786,7 @@ onMount(() => {
 
 onDestroy(() => {
 	cancelCameraApply();
+	cancelConfidenceSave();
 	previewChannel?.close();
 	previewChannel = null;
 });
@@ -2429,6 +2550,57 @@ onDestroy(() => {
 								<p class="text-sm text-neutral-400">
 									Models are stored in the app data models folder. Update model copies an .onnx file over the selected .onnx name, or over best.onnx. The next detection loads that file.
 								</p>
+								<div class="flex items-center gap-3">
+									<span class="w-28 shrink-0 text-sm font-medium normal-case tracking-normal text-neutral-100">
+										Confidence
+									</span>
+									<button
+										type="button"
+										class="inline-flex h-11 w-8 shrink-0 items-center justify-center text-lg text-neutral-300 hover:text-white"
+										aria-label="Decrease confidence"
+										on:click={() => stepConfidence(-0.01)}
+									>−</button>
+									<input
+										type="range"
+										class="camera-slider min-w-0 flex-1"
+										min={CONFIDENCE_MIN}
+										max={CONFIDENCE_MAX}
+										step="0.01"
+										value={confidence}
+										style="--fill: {confidenceFill()}%"
+										aria-label="Confidence threshold"
+										on:input={(event) => slideConfidence(event.currentTarget.value)}
+									/>
+									<button
+										type="button"
+										class="inline-flex h-11 w-8 shrink-0 items-center justify-center text-lg text-neutral-300 hover:text-white"
+										aria-label="Increase confidence"
+										on:click={() => stepConfidence(0.01)}
+									>+</button>
+									<input
+										type="text"
+										inputmode="decimal"
+										class="h-9 w-16 shrink-0 border border-neutral-600 bg-neutral-950 text-center font-mono text-sm text-neutral-100"
+										aria-label="Confidence value"
+										value={confidenceText}
+										on:input={(event) => previewConfidence(event.currentTarget.value)}
+										on:blur={commitConfidence}
+										on:keydown={(event) => {
+											if (event.key !== "Enter") return;
+											event.preventDefault();
+											commitConfidence();
+										}}
+									/>
+								</div>
+								<p class="text-sm text-neutral-200">
+									Current value <span class="font-mono text-neutral-100">{confidence.toFixed(2)}</span>
+								</p>
+								<p class="text-sm text-neutral-400">
+									Boxes at or below this score are dropped. Range 0.15 to 0.80. The next detection uses the saved value.
+								</p>
+								{#if confidenceNotice}
+									<p class="text-sm text-neutral-200">{confidenceNotice}</p>
+								{/if}
 							</fieldset>
 							<div class="flex flex-wrap gap-2">
 								<button
@@ -2451,7 +2623,7 @@ onDestroy(() => {
 								</button>
 							</div>
 							{#if modelNotice}
-								<p class="text-sm text-neutral-200">{modelNotice}</p>
+								<p class="break-all text-sm {modelNoticeClass(modelNotice)}">{modelNotice}</p>
 							{/if}
 						</form>
 						<form
