@@ -25,6 +25,17 @@ export function quantitiesMeet(
 	return parts.every((part) => (counts[part.ic] ?? 0) >= part.qty);
 }
 
+// A class is unexpected only when a BoM is loaded and the class is not on it.
+// Extra boxes of a listed class, including 2VDSWN02, are a quantity check.
+export function hasUnexpected(
+	items: { ic: string }[],
+	parts: { ic: string }[],
+): boolean {
+	if (!parts.length) return false;
+	const known = new Set(parts.map((part) => part.ic));
+	return items.some((item) => item.ic !== "" && !known.has(item.ic));
+}
+
 export function inspectionVerdict(args: {
 	status: string;
 	bomLoaded: boolean;
@@ -32,10 +43,16 @@ export function inspectionVerdict(args: {
 	detectFailed: boolean;
 	parts: Part[];
 	counts: Record<string, number>;
+	detections: { ic: string }[];
 }): InspectionVerdict {
 	if (args.status !== "pass" || !args.bomLoaded) return "fail";
 	if (args.detectState !== "done") return "incomplete";
-	if (args.detectFailed || !quantitiesMeet(args.parts, args.counts))
+	if (
+		args.detectFailed ||
+		!quantitiesMeet(args.parts, args.counts) ||
+		hasUnexpected(args.detections, args.parts)
+	) {
 		return "fail";
+	}
 	return "pass";
 }

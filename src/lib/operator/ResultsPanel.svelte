@@ -15,8 +15,6 @@ type InspectView = {
 	jobCard?: string;
 	des?: string;
 	parts?: Part[];
-	kitsFound?: number;
-	expectedKitCount?: number;
 	info?: string;
 };
 
@@ -53,6 +51,11 @@ function partsOutsideBom(
 		.map(([ic, count]) => ({ ic, count }));
 }
 
+function hideBenchNote(text: string | undefined): boolean {
+	if (!text) return true;
+	return text.includes("BoM loaded") || text.includes("kit(s) on bench");
+}
+
 function matchSummary(parts: Part[], items: Detection[]): string {
 	const counts = detectionCounts(items);
 	let matched = 0;
@@ -76,6 +79,7 @@ $: verdict = $operator.result
 			detectFailed,
 			parts: $operator.result.parts ?? [],
 			counts,
+			detections: $operator.detections,
 		})
 	: "fail";
 </script>
@@ -119,7 +123,7 @@ $: verdict = $operator.result
 			{#if $operator.result.des}
 				<p class="text-base text-neutral-300">{$operator.result.des}</p>
 			{/if}
-			{#if $operator.result.message}
+			{#if !hideBenchNote($operator.result.message)}
 				<p class="text-base text-neutral-200">{$operator.result.message}</p>
 			{/if}
 			{#if $operator.result.parts?.length}
@@ -194,13 +198,8 @@ $: verdict = $operator.result
 			{#if $operator.detectMessage}
 				<p class="text-sm text-red-300">{$operator.detectMessage}</p>
 			{/if}
-			{#if $operator.result.info}
+			{#if !hideBenchNote($operator.result.info)}
 				<p class="text-sm text-neutral-400">{$operator.result.info}</p>
-			{/if}
-			{#if $operator.result.kitsFound != null || $operator.result.expectedKitCount != null}
-				<p class="text-sm text-neutral-400">
-					Info only: {$operator.result.kitsFound ?? "—"} kit(s) found, {$operator.result.expectedKitCount ?? "—"} expected
-				</p>
 			{/if}
 		</div>
 	{:else}

@@ -328,6 +328,7 @@ function attachSession(
 						detectFailed,
 						parts,
 						counts: counts ?? {},
+						detections: includeDetection && !detectFailed ? detections : [],
 					}) === "pass"
 				: view.status === "pass";
 			const known = new Set(parts.map((part) => part.ic));
