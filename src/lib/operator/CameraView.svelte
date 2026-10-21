@@ -1,6 +1,11 @@
 <script lang="ts">
 // biome-ignore-all lint/correctness/noUnusedVariables: Biome 2.4 does not treat Svelte template references as uses
 
+import {
+	detectionCounts,
+	extraPartCount,
+	hasUnexpected,
+} from "$lib/operator/verdict";
 import { useOperator } from "$lib/stores/operator";
 
 const {
@@ -158,6 +163,17 @@ function detectionMarks(
 	}
 	return marks;
 }
+
+$: bannerParts = $operator.bom?.parts ?? [];
+$: bannerCounts = detectionCounts($operator.detections);
+$: extraParts =
+	$operator.detectState === "done"
+		? extraPartCount(bannerParts, bannerCounts)
+		: 0;
+$: wrongParts =
+	$operator.detectState === "done" &&
+	hasUnexpected($operator.detections, bannerParts);
+$: bannerCount = (wrongParts ? 1 : 0) + (extraParts > 0 ? 1 : 0);
 </script>
 
 <section class="flex min-h-0 min-w-0 flex-col overflow-hidden border border-neutral-700 bg-black">
@@ -373,9 +389,27 @@ function detectionMarks(
 					Detecting parts...
 				</p>
 			{/if}
+			{#if bannerCount > 0}
+				<div class="pointer-events-none absolute inset-x-0 bottom-0 z-30 flex flex-col">
+					{#if wrongParts}
+						<p class="flex h-14 items-center justify-center bg-red-600 px-4 text-center text-4xl font-black leading-none text-white">
+							Wrong parts detected
+						</p>
+					{/if}
+					{#if extraParts > 0}
+						<p class="flex h-14 items-center justify-center bg-amber-400 px-4 text-center text-4xl font-black leading-none text-neutral-950">
+							Too many parts ({extraParts} extra)
+						</p>
+					{/if}
+				</div>
+			{/if}
 			<button
 				type="button"
-				class="absolute bottom-3 right-3 z-40 inline-flex min-h-11 items-center border border-yellow-300 bg-yellow-400 px-4 text-sm font-semibold text-neutral-950"
+				class="absolute right-3 z-40 inline-flex min-h-11 items-center border border-yellow-300 bg-yellow-400 px-4 text-sm font-semibold text-neutral-950 {bannerCount === 2
+					? 'bottom-[7.75rem]'
+					: bannerCount === 1
+						? 'bottom-[4.25rem]'
+						: 'bottom-3'}"
 				on:click={resumeLiveFeed}
 			>
 				{$operator.feedOn ? "Resume live feed" : "Back to feed"}

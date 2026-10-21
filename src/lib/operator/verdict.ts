@@ -25,6 +25,19 @@ export function quantitiesMeet(
 	return parts.every((part) => (counts[part.ic] ?? 0) >= part.qty);
 }
 
+// Units seen above the BoM quantity. A listed class never counts as a wrong part.
+export function extraPartCount(
+	parts: { ic: string; qty: number }[],
+	counts: Record<string, number>,
+): number {
+	let extra = 0;
+	for (const part of parts) {
+		const over = (counts[part.ic] ?? 0) - part.qty;
+		if (over > 0) extra += over;
+	}
+	return extra;
+}
+
 // A class is unexpected only when a BoM is loaded and the class is not on it.
 // Extra boxes of a listed class, including 2VDSWN02, are a quantity check.
 export function hasUnexpected(
