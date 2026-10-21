@@ -42,6 +42,7 @@ type DetectionMark = {
 	labelY: number;
 	labelW: number;
 	labelH: number;
+	unexpected: boolean;
 };
 
 // OpenCV stored these as BGR.
@@ -86,6 +87,7 @@ function detectionMarks(
 		width: number;
 		height: number;
 	} | null,
+	bomParts: { ic: string }[] | null,
 ): DetectionMark[] {
 	// Positions are CSS pixels of the still. The viewBox matches that size,
 	// so the stroke and the label font do not grow when the still is scaled.
@@ -107,6 +109,7 @@ function detectionMarks(
 	const imageRight = originX + paneWidth * scale;
 	const imageBottom = originY + paneHeight * scale;
 	const marks: DetectionMark[] = [];
+	const known = bomParts ? new Set(bomParts.map((part) => part.ic)) : null;
 	const ordered = [...detections].sort((a, b) => a.confidence - b.confidence);
 	for (const [index, item] of ordered.entries()) {
 		const box = item.bbox;
@@ -150,6 +153,7 @@ function detectionMarks(
 			labelY,
 			labelW,
 			labelH,
+			unexpected: known !== null && item.ic !== "" && !known.has(item.ic),
 		});
 	}
 	return marks;
@@ -264,7 +268,7 @@ function detectionMarks(
 					{/if}
 				{/if}
 				{#if $operator.snapshot && $operator.paneWidth > 0 && $operator.paneHeight > 0 && $operator.detections.length > 0}
-					{@const marks = detectionMarks($operator.snapshot, $operator.paneWidth, $operator.paneHeight, $operator.frameWidth, $operator.frameHeight, $operator.detections, $zoom)}
+					{@const marks = detectionMarks($operator.snapshot, $operator.paneWidth, $operator.paneHeight, $operator.frameWidth, $operator.frameHeight, $operator.detections, $zoom, $operator.bom?.parts ?? null)}
 					{@const viewW = $zoom ? $zoom.width : $operator.frameWidth}
 					{@const viewH = $zoom ? $zoom.height : $operator.frameHeight}
 					{#if marks.length > 0 && viewW > 0 && viewH > 0}
@@ -277,21 +281,40 @@ function detectionMarks(
 							aria-hidden="true"
 						>
 							{#each marks as mark (mark.key)}
-								<rect
-									x={mark.x}
-									y={mark.y}
-									width={mark.w}
-									height={mark.h}
-									fill="none"
-									stroke={mark.color}
-									stroke-width={BOX_STROKE}
-								/>
+								{#if mark.unexpected}
+									<line
+										x1={mark.x}
+										y1={mark.y}
+										x2={mark.x + mark.w}
+										y2={mark.y + mark.h}
+										stroke="#dc2626"
+										stroke-width={BOX_STROKE}
+									/>
+									<line
+										x1={mark.x + mark.w}
+										y1={mark.y}
+										x2={mark.x}
+										y2={mark.y + mark.h}
+										stroke="#dc2626"
+										stroke-width={BOX_STROKE}
+									/>
+								{:else}
+									<rect
+										x={mark.x}
+										y={mark.y}
+										width={mark.w}
+										height={mark.h}
+										fill="none"
+										stroke={mark.color}
+										stroke-width={BOX_STROKE}
+									/>
+								{/if}
 								<rect
 									x={mark.labelX}
 									y={mark.labelY}
 									width={mark.labelW}
 									height={mark.labelH}
-									fill={mark.color}
+									fill={mark.unexpected ? "#dc2626" : mark.color}
 								/>
 								<text
 									x={mark.labelX + LABEL_PAD_X}
