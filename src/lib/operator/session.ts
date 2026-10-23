@@ -355,12 +355,14 @@ function attachSession(
 		includeDetection: boolean,
 		descriptions: Record<string, string> = {},
 	) {
+		if (op.testMode) return;
 		const view = op.result;
 		if (!view || (view.status !== "pass" && view.status !== "fail")) return;
 		const detections = includeDetection ? op.detections.slice() : [];
 		const detectMessage = includeDetection ? op.detectMessage : "";
 		try {
 			const config = await readConfig();
+			if (config.testMode === true) return;
 			if (config.skipResultSave !== false) return;
 			const detectFailed =
 				includeDetection && !!detectMessage && detections.length === 0;
@@ -391,30 +393,54 @@ function attachSession(
 								const des = descriptions[ic]?.trim() ?? "";
 								return des ? { ic, count, des } : { ic, count };
 							});
-			const outcome = await invoke<{ saved: boolean }>("save_result", {
+			const detail = {
+				message: view.message ?? "",
+				info: view.info ?? "",
+				kitsFound: view.kitsFound ?? null,
+				expectedKitCount: view.expectedKitCount ?? null,
+				parts: parts.map((part) => ({
+					ic: part.ic,
+					des: part.des,
+					qty: part.qty,
+					seen: counts ? (counts[part.ic] ?? 0) : null,
+				})),
+				extras,
+			};
+			const outcome = await invoke<{
+				saved: boolean;
+				createdAt?: string;
+				imagePath?: string;
+			}>("save_result", {
 				passed,
 				kitIc: view.kitCode ?? "",
 				jobCard: view.jobCard ?? "",
 				description: view.des ?? "",
 				imageBase64: image,
-				detail: {
-					message: view.message ?? "",
-					info: view.info ?? "",
-					kitsFound: view.kitsFound ?? null,
-					expectedKitCount: view.expectedKitCount ?? null,
-					parts: parts.map((part) => ({
-						ic: part.ic,
-						des: part.des,
-						qty: part.qty,
-						seen: counts ? (counts[part.ic] ?? 0) : null,
-					})),
-					extras,
-				},
+				detail,
 			});
-			if (outcome.saved) {
-				const job = view.jobCard?.trim();
+			if (!outcome.saved) return;
+			const job = view.jobCard?.trim();
+			writeConsole(
+				`Result saved: ${passed ? "pass" : "fail"} ${view.kitCode?.trim() || "(no kit)"}${job ? ` job ${job}` : ""}`,
+			);
+			const resultsPath =
+				typeof config.api?.resultsPath === "string"
+					? config.api.resultsPath.trim()
+					: "";
+			if (!resultsPath) return;
+			try {
+				await invoke("post_inspection_result", {
+					jobCard: view.jobCard ?? "",
+					timestamp: outcome.createdAt ?? "",
+					passed,
+					kitIc: view.kitCode ?? "",
+					description: view.des ?? "",
+					imagePath: outcome.imagePath ?? "",
+					detail,
+				});
+			} catch (postErr: unknown) {
 				writeConsole(
-					`Result saved: ${passed ? "pass" : "fail"} ${view.kitCode?.trim() || "(no kit)"}${job ? ` job ${job}` : ""}`,
+					`Result post failed: ${invokeError(postErr, "Could not post the result")}. The result is saved on this PC.`,
 				);
 			}
 		} catch (err: unknown) {
@@ -952,6 +978,7 @@ function attachSession(
 		skipResultSave?: unknown;
 		detectRoi?: unknown;
 		partRules?: unknown;
+		api?: { descriptionPath?: unknown; resultsPath?: unknown } | null;
 		camera?: { index?: unknown; displayFps?: unknown } | null;
 		erp?: { name?: unknown; url?: unknown } | null;
 	};

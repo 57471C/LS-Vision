@@ -1,11 +1,12 @@
 //! Saved pass and fail inspections.
 //!
-//! The row lives in SQLite. The snapshot is a JPEG next to that database.
-//! The row stores the file path, not the image bytes.
+//! The row lives in SQLite. The detection snapshot is recompressed to a JPEG
+//! next to that database. The row stores a relative path, not the image bytes.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use base64::Engine as Base64Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -20,6 +21,9 @@ use crate::local_config;
 
 const DB_FILE: &str = "results.sqlite";
 const IMAGE_DIR: &str = "images";
+const JPEG_QUALITY: u8 = 75;
+const MAX_EDGE: u32 = 1280;
+const POST_TIMEOUT: Duration = Duration::from_secs(15);
 
 static DB_LOCK: Mutex<()> = Mutex::new(());
 
@@ -27,6 +31,14 @@ static DB_LOCK: Mutex<()> = Mutex::new(());
 #[serde(rename_all = "camelCase")]
 pub struct SaveOutcome {
     pub saved: bool,
+    pub created_at: String,
+    pub image_path: String,
+}
+
+pub(crate) struct SavedInspection {
+    pub id: i64,
+    pub created_at: String,
+    pub image_path: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -42,24 +54,43 @@ pub struct ListedResult {
     pub detail: Value,
 }
 
-/// Missing, true, or a non-boolean value means do not save. Only `false` writes.
+/// Test mode skips the write. Otherwise a missing, true, or non-boolean
+/// `skipResultSave` means do not save. Only JSON `false` writes.
 pub(crate) fn saving_disabled(config: &Value) -> bool {
+    if config.get("testMode") == Some(&Value::Bool(true)) {
+        return true;
+    }
     match config.get("skipResultSave") {
         Some(Value::Bool(value)) => *value,
         _ => true,
     }
 }
 
-pub(crate) fn result_filename(passed: bool, kit_ic: &str, when: DateTime<Local>) -> String {
-    let mark = if passed { "P" } else { "F" };
-    format!(
-        "{mark}-{}-{}.jpg",
-        sanitize_kit_ic(kit_ic),
-        when.format("%d%m%y-%H-%M-%S")
-    )
+fn skipped_outcome() -> SaveOutcome {
+    SaveOutcome {
+        saved: false,
+        created_at: String::new(),
+        image_path: String::new(),
+    }
 }
 
-fn sanitize_kit_ic(raw: &str) -> String {
+/// `{job card}_{YYYYMMDD-HHMMSS}.jpg`. An empty job card uses the kit IC, then `result`.
+pub(crate) fn result_filename(job_card: &str, kit_ic: &str, when: DateTime<Local>) -> String {
+    let job = sanitize_token(job_card);
+    let stem = if !job.is_empty() {
+        job
+    } else {
+        let kit = sanitize_token(kit_ic);
+        if kit.is_empty() {
+            "result".to_string()
+        } else {
+            kit
+        }
+    };
+    format!("{stem}_{}.jpg", when.format("%Y%m%d-%H%M%S"))
+}
+
+fn sanitize_token(raw: &str) -> String {
     let mut cleaned = String::new();
     for ch in raw.chars() {
         if ch.is_control() || matches!(ch, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
@@ -67,11 +98,13 @@ fn sanitize_kit_ic(raw: &str) -> String {
         }
         cleaned.push(ch);
     }
-    let trimmed = cleaned.trim().trim_matches('.').trim();
-    if trimmed.is_empty() {
-        return "NONE".to_string();
-    }
-    trimmed.chars().take(80).collect()
+    cleaned
+        .trim()
+        .trim_matches('.')
+        .trim()
+        .chars()
+        .take(80)
+        .collect()
 }
 
 fn clip_text(raw: &str, limit: usize) -> String {
@@ -151,15 +184,17 @@ fn jpeg_bytes(raw: &str) -> Result<Vec<u8>, String> {
     let bytes = STANDARD
         .decode(compact)
         .map_err(|_| "Could not read the result image.".to_string())?;
-    if bytes.len() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF {
-        return Ok(bytes);
-    }
     let image = image::load_from_memory(&bytes)
         .map_err(|_| "Could not read the result image.".to_string())?;
-    let rgb = image.to_rgb8();
+    let scaled = if image.width().max(image.height()) > MAX_EDGE {
+        image.resize(MAX_EDGE, MAX_EDGE, image::imageops::FilterType::Triangle)
+    } else {
+        image
+    };
+    let rgb = scaled.to_rgb8();
     let (width, height) = rgb.dimensions();
     let mut out = Vec::new();
-    let encoder = JpegEncoder::new_with_quality(&mut out, 90);
+    let encoder = JpegEncoder::new_with_quality(&mut out, JPEG_QUALITY);
     encoder
         .write_image(rgb.as_raw(), width, height, ExtendedColorType::Rgb8)
         .map_err(|_| "Could not encode the result image.".to_string())?;
@@ -190,6 +225,14 @@ fn image_file(root: &Path, stored: &str) -> Option<PathBuf> {
     if path.is_file() { Some(path) } else { None }
 }
 
+fn stored_image_path(path: &Path) -> String {
+    let name = path
+        .file_name()
+        .and_then(|item| item.to_str())
+        .unwrap_or("result.jpg");
+    format!("{IMAGE_DIR}/{name}")
+}
+
 pub(crate) fn save_in(
     root: &Path,
     passed: bool,
@@ -199,21 +242,24 @@ pub(crate) fn save_in(
     image_base64: Option<&str>,
     detail: &Value,
     when: DateTime<Local>,
-) -> Result<i64, String> {
+) -> Result<SavedInspection, String> {
     let _guard = DB_LOCK
         .lock()
         .map_err(|_| "Results database is busy.".to_string())?;
     let connection = open_db(root)?;
+    let created_at = when.to_rfc3339();
+    let mut written: Option<PathBuf> = None;
     let mut image_path: Option<String> = None;
     if let Some(raw) = image_base64.filter(|value| !value.trim().is_empty()) {
         let bytes = jpeg_bytes(raw)?;
         let path = unique_path(
             &root.join(IMAGE_DIR),
-            &result_filename(passed, kit_ic, when),
+            &result_filename(job_card, kit_ic, when),
         );
         fs::write(&path, bytes)
             .map_err(|err| format!("Could not write the result image: {err}"))?;
-        image_path = Some(path.to_string_lossy().into_owned());
+        image_path = Some(stored_image_path(&path));
+        written = Some(path);
     }
     let detail_text = if detail.is_object() {
         serde_json::to_string(detail).unwrap_or_else(|_| "{}".to_string())
@@ -229,19 +275,23 @@ pub(crate) fn save_in(
             passed,
             clip_text(kit_ic, 200),
             clip_text(description, 500),
-            when.to_rfc3339(),
+            created_at,
             image_path,
             detail_text,
             clip_text(job_card, 80),
         ],
     );
     if let Err(err) = inserted {
-        if let Some(path) = image_path {
+        if let Some(path) = written {
             let _ = fs::remove_file(path);
         }
         return Err(db_err(err));
     }
-    Ok(connection.last_insert_rowid())
+    Ok(SavedInspection {
+        id: connection.last_insert_rowid(),
+        created_at,
+        image_path: image_path.unwrap_or_default(),
+    })
 }
 
 pub(crate) fn list_in(root: &Path) -> Result<Vec<ListedResult>, String> {
@@ -355,9 +405,10 @@ pub fn save_result(
 ) -> Result<SaveOutcome, String> {
     let config = local_config::load_document(&local_config::project_root()?)?;
     if saving_disabled(&config) {
-        return Ok(SaveOutcome { saved: false });
+        return Ok(skipped_outcome());
     }
-    save_in(
+    save_enabled(
+        &config,
         &results_root()?,
         passed,
         &kit_ic,
@@ -366,8 +417,148 @@ pub fn save_result(
         image_base64.as_deref(),
         &detail,
         Local::now(),
+    )
+}
+
+fn outcome_of(saved: SavedInspection) -> SaveOutcome {
+    let _row = saved.id;
+    SaveOutcome {
+        saved: true,
+        created_at: saved.created_at,
+        image_path: saved.image_path,
+    }
+}
+
+/// Writes when saving is enabled. A disabled config leaves the folder untouched.
+pub(crate) fn save_enabled(
+    config: &Value,
+    root: &Path,
+    passed: bool,
+    kit_ic: &str,
+    description: &str,
+    job_card: &str,
+    image_base64: Option<&str>,
+    detail: &Value,
+    when: DateTime<Local>,
+) -> Result<SaveOutcome, String> {
+    if saving_disabled(config) {
+        return Ok(skipped_outcome());
+    }
+    let saved = save_in(
+        root,
+        passed,
+        kit_ic,
+        description,
+        job_card,
+        image_base64,
+        detail,
+        when,
     )?;
-    Ok(SaveOutcome { saved: true })
+    Ok(outcome_of(saved))
+}
+
+fn image_base64_in(root: &Path, stored: &str) -> Result<String, String> {
+    let stored = stored.trim();
+    if stored.is_empty() {
+        return Ok(String::new());
+    }
+    let Some(path) = image_file(root, stored) else {
+        return Ok(String::new());
+    };
+    let bytes = fs::read(path).map_err(|err| format!("Could not read the result image: {err}"))?;
+    Ok(STANDARD.encode(bytes))
+}
+
+pub(crate) fn inspection_body(
+    job_card: &str,
+    timestamp: &str,
+    passed: bool,
+    kit_ic: &str,
+    description: &str,
+    image_path: &str,
+    image_base64: &str,
+    detail: &Value,
+) -> Value {
+    let mut body = json!({
+        "jobCard": clip_text(job_card, 80),
+        "timestamp": timestamp.trim(),
+        "passed": passed,
+        "kitIc": clip_text(kit_ic, 200),
+        "description": clip_text(description, 500),
+        "imagePath": image_path.trim(),
+        "detail": if detail.is_object() { detail.clone() } else { json!({}) },
+    });
+    if !image_base64.is_empty() {
+        body["imageBase64"] = json!(image_base64);
+    }
+    body
+}
+
+fn results_path(config: &Value) -> String {
+    config
+        .get("api")
+        .and_then(|value| value.get("resultsPath"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+/// Posts one new result. Test mode, a disabled save, and a blank path do nothing.
+pub(crate) fn post_if_enabled(
+    config: &Value,
+    root: &Path,
+    job_card: &str,
+    timestamp: &str,
+    passed: bool,
+    kit_ic: &str,
+    description: &str,
+    image_path: &str,
+    detail: &Value,
+) -> Result<(), String> {
+    if saving_disabled(config) || results_path(config).is_empty() {
+        return Ok(());
+    }
+    let image_base64 = image_base64_in(root, image_path)?;
+    let body = inspection_body(
+        job_card,
+        timestamp,
+        passed,
+        kit_ic,
+        description,
+        image_path,
+        &image_base64,
+        detail,
+    );
+    let bytes = serde_json::to_vec(&body).map_err(|_| "Could not build the result.".to_string())?;
+    crate::bom::post_api_path(config, "resultsPath", &bytes, POST_TIMEOUT)
+}
+
+#[tauri::command]
+pub fn post_inspection_result(
+    job_card: String,
+    timestamp: String,
+    passed: bool,
+    kit_ic: String,
+    description: String,
+    image_path: Option<String>,
+    detail: Value,
+) -> Result<(), String> {
+    let config = local_config::load_document(&local_config::project_root()?)?;
+    if saving_disabled(&config) || results_path(&config).is_empty() {
+        return Ok(());
+    }
+    post_if_enabled(
+        &config,
+        &results_root()?,
+        &job_card,
+        &timestamp,
+        passed,
+        &kit_ic,
+        &description,
+        image_path.as_deref().unwrap_or(""),
+        &detail,
+    )
 }
 
 #[tauri::command]
@@ -389,7 +580,14 @@ pub fn result_image(id: i64) -> Result<String, String> {
 mod tests {
     use super::*;
     use chrono::TimeZone;
-    use image::{ImageBuffer, ImageEncoder, Rgb};
+    use image::codecs::jpeg::JpegEncoder;
+    use image::codecs::png::PngEncoder;
+    use image::{ExtendedColorType, ImageBuffer, ImageEncoder, Rgb};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
 
     fn when() -> DateTime<Local> {
         Local
@@ -422,23 +620,23 @@ mod tests {
     }
 
     #[test]
-    fn filename_uses_pass_fail_kit_and_local_stamp() {
+    fn filename_uses_the_job_card_and_local_stamp() {
         let stamp = when();
         assert_eq!(
-            result_filename(true, "6PBBK001", stamp),
-            "P-6PBBK001-191026-14-05-03.jpg"
+            result_filename("17834402", "6PBBK001", stamp),
+            "17834402_20261019-140503.jpg"
         );
         assert_eq!(
-            result_filename(false, "6PBBK001", stamp),
-            "F-6PBBK001-191026-14-05-03.jpg"
+            result_filename("a/b:c*", "6PBBK001", stamp),
+            "abc_20261019-140503.jpg"
         );
         assert_eq!(
-            result_filename(false, "a/b:c*", stamp),
-            "F-abc-191026-14-05-03.jpg"
+            result_filename("  ", "6PBBK001", stamp),
+            "6PBBK001_20261019-140503.jpg"
         );
         assert_eq!(
-            result_filename(false, "  ", stamp),
-            "F-NONE-191026-14-05-03.jpg"
+            result_filename("  ", "  ", stamp),
+            "result_20261019-140503.jpg"
         );
     }
 
@@ -448,6 +646,15 @@ mod tests {
         assert!(saving_disabled(&json!({ "skipResultSave": true })));
         assert!(saving_disabled(&json!({ "skipResultSave": "no" })));
         assert!(!saving_disabled(&json!({ "skipResultSave": false })));
+        assert!(saving_disabled(
+            &json!({ "skipResultSave": false, "testMode": true })
+        ));
+        assert!(!saving_disabled(
+            &json!({ "skipResultSave": false, "testMode": false })
+        ));
+        assert!(!saving_disabled(
+            &json!({ "skipResultSave": false, "testMode": "yes" })
+        ));
     }
 
     #[test]
@@ -456,7 +663,7 @@ mod tests {
         let detail = json!({
             "parts": [{ "ic": "2BBMNM08", "des": "Nut", "qty": 2, "seen": 2 }]
         });
-        let id = save_in(
+        let saved = save_in(
             &root,
             true,
             "6PBBK001",
@@ -467,6 +674,19 @@ mod tests {
             when(),
         )
         .unwrap();
+        let id = saved.id;
+        assert_eq!(saved.image_path, "images/17834402_20261019-140503.jpg");
+        assert_eq!(saved.created_at, when().to_rfc3339());
+        let connection = Connection::open(root.join(DB_FILE)).unwrap();
+        let stored_path: String = connection
+            .query_row(
+                "SELECT image_path FROM results WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(connection);
+        assert_eq!(stored_path, "images/17834402_20261019-140503.jpg");
         let listed = list_in(&root).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, id);
@@ -478,8 +698,10 @@ mod tests {
         assert_eq!(listed[0].detail["parts"][0]["ic"], "2BBMNM08");
         let image = image_in(&root, id).unwrap();
         assert!(image.starts_with("data:image/jpeg;base64,"));
-        let stored = root.join(IMAGE_DIR).join("P-6PBBK001-191026-14-05-03.jpg");
+        let stored = root.join(IMAGE_DIR).join("17834402_20261019-140503.jpg");
         assert!(stored.is_file());
+        let bytes = fs::read(&stored).unwrap();
+        assert!(bytes.starts_with(&[0xFF, 0xD8, 0xFF]));
         delete_in(&root, id).unwrap();
         assert!(!stored.exists());
         assert!(list_in(&root).unwrap().is_empty());
@@ -535,7 +757,7 @@ mod tests {
         let listed = list_in(&root).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].job_card, "");
-        let id = save_in(
+        let inserted = save_in(
             &root,
             false,
             "6PBBGR01",
@@ -546,12 +768,245 @@ mod tests {
             when(),
         )
         .unwrap();
+        assert!(inserted.image_path.is_empty());
         let saved = list_in(&root)
             .unwrap()
             .into_iter()
-            .find(|row| row.id == id)
+            .find(|row| row.id == inserted.id)
             .unwrap();
         assert_eq!(saved.job_card, "17834402");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn wide_png() -> String {
+        let image: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_fn(2000, 800, |x, y| {
+            Rgb([(x % 255) as u8, (y % 255) as u8, 40])
+        });
+        let mut bytes = Vec::new();
+        PngEncoder::new(&mut bytes)
+            .write_image(image.as_raw(), 2000, 800, ExtendedColorType::Rgb8)
+            .unwrap();
+        STANDARD.encode(bytes)
+    }
+
+    fn wide_jpeg() -> String {
+        let image: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_fn(1800, 900, |x, y| {
+            Rgb([20, (x % 255) as u8, (y % 255) as u8])
+        });
+        let mut bytes = Vec::new();
+        JpegEncoder::new_with_quality(&mut bytes, 90)
+            .write_image(image.as_raw(), 1800, 900, ExtendedColorType::Rgb8)
+            .unwrap();
+        STANDARD.encode(bytes)
+    }
+
+    fn assert_capped_jpeg(bytes: &[u8]) {
+        assert!(bytes.starts_with(&[0xFF, 0xD8, 0xFF]));
+        let decoded = image::load_from_memory(bytes).unwrap();
+        assert!(decoded.width() <= MAX_EDGE);
+        assert!(decoded.height() <= MAX_EDGE);
+        assert_eq!(decoded.width().max(decoded.height()), MAX_EDGE);
+    }
+
+    #[test]
+    fn wide_images_are_recompressed_under_the_long_edge_cap() {
+        assert_capped_jpeg(&jpeg_bytes(&wide_png()).unwrap());
+        assert_capped_jpeg(&jpeg_bytes(&wide_jpeg()).unwrap());
+    }
+
+    #[test]
+    fn test_mode_and_skip_write_nothing() {
+        let root = temp_root("skip");
+        let detail = json!({});
+        for config in [
+            json!({ "skipResultSave": false, "testMode": true }),
+            json!({ "skipResultSave": true, "testMode": false }),
+            json!({ "testMode": false }),
+        ] {
+            let outcome = save_enabled(
+                &config,
+                &root,
+                false,
+                "6PBBK001",
+                "Kit",
+                "17834402",
+                Some(&tiny_jpeg()),
+                &detail,
+                when(),
+            )
+            .unwrap();
+            assert!(!outcome.saved);
+            assert!(outcome.image_path.is_empty());
+            assert!(outcome.created_at.is_empty());
+            assert!(!root.join(DB_FILE).exists());
+            assert!(!root.join(IMAGE_DIR).exists());
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn request_ready(buf: &[u8]) -> bool {
+        let Some(split) = buf.windows(4).position(|window| window == b"\r\n\r\n") else {
+            return false;
+        };
+        let Ok(head) = std::str::from_utf8(&buf[..split]) else {
+            return true;
+        };
+        let length = head.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.eq_ignore_ascii_case("content-length") {
+                value.trim().parse::<usize>().ok()
+            } else {
+                None
+            }
+        });
+        match length {
+            Some(length) => buf.len() >= split + 4 + length,
+            None => true,
+        }
+    }
+
+    fn capture_post() -> (u16, mpsc::Receiver<Vec<u8>>) {
+        let (tx, rx) = mpsc::channel();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let Ok((mut sock, _)) = listener.accept() else {
+                return;
+            };
+            let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut received = Vec::new();
+            let mut buf = [0u8; 8192];
+            loop {
+                match sock.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        received.extend_from_slice(&buf[..n]);
+                        if request_ready(&received) {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let response =
+                b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let _ = sock.write_all(response);
+            let _ = tx.send(received);
+        });
+        (port, rx)
+    }
+
+    #[test]
+    fn post_sends_the_saved_result_and_the_compressed_image() {
+        let root = temp_root("post");
+        let detail = json!({
+            "parts": [{ "ic": "2BBMNM08", "qty": 1, "seen": 1 }],
+            "extras": []
+        });
+        let saved = save_in(
+            &root,
+            true,
+            "6PBBK001",
+            "Accessory Kit",
+            "17834402",
+            Some(&wide_png()),
+            &detail,
+            when(),
+        )
+        .unwrap();
+        let (port, received) = capture_post();
+        let config = json!({
+            "skipResultSave": false,
+            "testMode": false,
+            "api": {
+                "baseUrl": format!("http://127.0.0.1:{port}"),
+                "path": "/GetBoltBagParts",
+                "key": "test-key",
+                "resultsPath": "/VisionAppApi/SubmitResult"
+            }
+        });
+        post_if_enabled(
+            &config,
+            &root,
+            "17834402",
+            &saved.created_at,
+            true,
+            "6PBBK001",
+            "Accessory Kit",
+            &saved.image_path,
+            &detail,
+        )
+        .unwrap();
+        let bytes = received.recv_timeout(Duration::from_secs(2)).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.starts_with("POST /VisionAppApi/SubmitResult HTTP/1.1\r\n"));
+        assert!(text.contains("X-Api-Key: test-key\r\n"));
+        assert!(!text.contains("GetBoltBagParts"));
+        assert!(!text.contains("jobCardNumber"));
+        let body = text.split("\r\n\r\n").nth(1).unwrap();
+        let payload: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(payload["jobCard"], "17834402");
+        assert_eq!(payload["timestamp"], saved.created_at);
+        assert_eq!(payload["passed"], true);
+        assert_eq!(payload["kitIc"], "6PBBK001");
+        assert_eq!(payload["description"], "Accessory Kit");
+        assert_eq!(payload["imagePath"], saved.image_path);
+        assert_eq!(payload["detail"]["parts"][0]["seen"], 1);
+        assert!(payload.get("id").is_none());
+        let image = STANDARD
+            .decode(payload["imageBase64"].as_str().unwrap())
+            .unwrap();
+        assert_capped_jpeg(&image);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_blank_path_and_test_mode_do_not_post() {
+        let root = temp_root("nopost");
+        let detail = json!({});
+        let closed = json!({
+            "skipResultSave": false,
+            "testMode": false,
+            "api": {
+                "baseUrl": "http://127.0.0.1:9",
+                "path": "/GetBoltBagParts",
+                "key": "secret-key",
+                "resultsPath": ""
+            }
+        });
+        post_if_enabled(
+            &closed,
+            &root,
+            "17834402",
+            "2026-10-19T14:05:03+11:00",
+            false,
+            "6PBBK001",
+            "Kit",
+            "",
+            &detail,
+        )
+        .unwrap();
+        let testing = json!({
+            "skipResultSave": false,
+            "testMode": true,
+            "api": {
+                "baseUrl": "http://127.0.0.1:9",
+                "key": "secret-key",
+                "resultsPath": "/VisionAppApi/SubmitResult"
+            }
+        });
+        post_if_enabled(
+            &testing,
+            &root,
+            "17834402",
+            "2026-10-19T14:05:03+11:00",
+            false,
+            "6PBBK001",
+            "Kit",
+            "images/17834402_20261019-140503.jpg",
+            &detail,
+        )
+        .unwrap();
         let _ = fs::remove_dir_all(root);
     }
 }

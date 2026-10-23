@@ -40,6 +40,7 @@ Example: parent `Hinge_Plate`, child `P02_Logo`, condition `contains`, result `2
 
 - BoM source: JSON (`vision/sample-bom.json`), API (base URL, path, and API key; the barcode is the job card number), or MSSQL (Windows Authentication by default, SQL authentication optional).
 - **Description endpoint**: optional path stored as `api.descriptionPath`. The default is `/VisionAppApi/ListInventoryDescription`. Leave it blank to show an unexpected code by itself. A value is posted, with the API base URL and API key, when a detected code is not on the loaded BoM. The returned description is shown on the Not in BoM list.
+- Results endpoint, optional and blank by default. Example: `/VisionAppApi/SubmitResult`. A saved inspection is posted to the API base URL plus this path, with the API key. Leave it blank to keep the result on this PC only. Test mode does not post.
 - ERP button name and URL. Empty name and URL hides the operator button.
 
 The operator page reloads the barcode ROI, Test mode, scan interval, BoM source, and ERP button when the window focuses.
