@@ -1,7 +1,8 @@
 //! ONNX detection for the operator page.
 //!
-//! `detect_image` returns the same JSON as POST /detect: `detections` of
-//! `{ ic, confidence, bbox }` and `image_base64` of the original frame.
+//! `detect_image` reads the latest raw frame. It returns `detections` of
+//! `{ ic, confidence, bbox }` and the model's `classes`. The overlay draws
+//! those boxes on the preview still, so this command does not encode a JPEG.
 //! This command reads `.onnx` only. A `.pt` name is a training file; the page warns and does not detect.
 //!
 //! Boxes are checked against Ultralytics `YOLO(best.onnx)`, not `YOLO(best.pt)`.
@@ -12,13 +13,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use base64::Engine as Base64Engine;
-use base64::engine::general_purpose::STANDARD;
-use image::codecs::jpeg::JpegEncoder;
-use image::{ExtendedColorType, ImageEncoder};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::frame::{FrameState, RawFrame};
 use crate::inference_ep::{self, Provider};
 use crate::local_config;
 
@@ -32,7 +30,6 @@ const MAX_WH: f32 = 7680.0;
 const DEFAULT_IMAGE_SIZE: usize = 640;
 const PAD_VALUE: u8 = 114;
 const INTER_RESIZE_COEF_SCALE: i32 = 2048;
-const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_PIXELS: usize = 40_000_000;
 const MODEL_MISSING: &str = "Model is missing.";
 const MODEL_FAILED: &str = "Model failed to load.";
@@ -904,29 +901,6 @@ fn end_to_end_candidates(
     found
 }
 
-fn payload_bytes(text: &str) -> Result<Vec<u8>, String> {
-    let text = text.trim();
-    let encoded = if let Some(rest) = text.strip_prefix("data:") {
-        let (_, data) = rest
-            .split_once(',')
-            .ok_or_else(|| "Could not read the image".to_string())?;
-        data
-    } else {
-        text
-    };
-    let compact: String = encoded.chars().filter(|ch| !ch.is_whitespace()).collect();
-    if compact.is_empty() {
-        return Err("Could not read the image".to_string());
-    }
-    let bytes = STANDARD
-        .decode(compact.as_bytes())
-        .map_err(|_| "Could not read the image".to_string())?;
-    if bytes.is_empty() || bytes.len() > MAX_IMAGE_BYTES {
-        return Err("Could not read the image".to_string());
-    }
-    Ok(bytes)
-}
-
 fn decode_rgb(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
     if bytes.len() >= 2 && bytes[0] == 0xff && bytes[1] == 0xd8 {
         return decode_jpeg(bytes);
@@ -974,15 +948,6 @@ fn decode_with_image(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
     let (width, height) = rgb.dimensions();
     reject_size(width, height)?;
     Ok((rgb.into_raw(), width, height))
-}
-
-fn encode_jpeg(rgb: &[u8], width: u32, height: u32) -> Result<String, String> {
-    let mut bytes = Vec::new();
-    let encoder = JpegEncoder::new_with_quality(&mut bytes, 80);
-    encoder
-        .write_image(rgb, width, height, ExtendedColorType::Rgb8)
-        .map_err(|_| "Could not encode the image".to_string())?;
-    Ok(STANDARD.encode(bytes))
 }
 
 fn file_name(path: &Path) -> String {
@@ -1421,6 +1386,7 @@ fn infer_prepared(
     })
 }
 
+#[cfg(test)]
 fn detect_on_model(
     bytes: &[u8],
     path: &Path,
@@ -1428,24 +1394,32 @@ fn detect_on_model(
     conf_threshold: f32,
 ) -> Result<Value, String> {
     let (rgb, width, height) = decode_rgb(bytes)?;
-    let (detections, classes) =
-        run_model(path, &rgb, width, height, roi, conf_threshold)?;
-    let encoded = encode_jpeg(&rgb, width, height)?;
+    let (detections, classes) = run_model(path, &rgb, width, height, roi, conf_threshold)?;
     Ok(json!({
         "detections": detections,
         "classes": classes,
-        "image_base64": encoded,
     }))
 }
 
-#[tauri::command]
-pub async fn detect_image(image: Option<String>) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || detect_image_now(image))
-        .await
-        .map_err(|_| "Detect failed".to_string())?
+fn raw_rgb(frame: &RawFrame) -> Result<(&[u8], u32, u32), String> {
+    if frame.channels != 3 || frame.width == 0 || frame.height == 0 {
+        return Err("Could not read the image".to_string());
+    }
+    let pixels = (frame.width as usize).saturating_mul(frame.height as usize);
+    if pixels == 0 || pixels > MAX_PIXELS {
+        return Err("Could not read the image".to_string());
+    }
+    let expected = pixels.saturating_mul(3);
+    if frame.data.len() < expected {
+        return Err("Could not read the image".to_string());
+    }
+    Ok((&frame.data[..expected], frame.width, frame.height))
 }
 
-fn detect_image_now(image: Option<String>) -> Result<Value, String> {
+fn detect_raw(frame: Option<RawFrame>) -> Result<Value, String> {
+    let Some(frame) = frame else {
+        return Ok(failure("No frame"));
+    };
     let root = match local_config::project_root() {
         Ok(root) => root,
         Err(message) => return Ok(failure(&message)),
@@ -1454,19 +1428,30 @@ fn detect_image_now(image: Option<String>) -> Result<Value, String> {
         Ok(path) => path,
         Err(message) => return Ok(failure(&model_status_message(&message))),
     };
-    let Some(text) = image.filter(|value| !value.trim().is_empty()) else {
-        return Ok(failure("No image and no snapshot"));
-    };
-    let bytes = match payload_bytes(&text) {
-        Ok(bytes) => bytes,
+    let (rgb, width, height) = match raw_rgb(&frame) {
+        Ok(rgb) => rgb,
         Err(message) => return Ok(failure(&message)),
     };
     let roi = configured_roi(&root);
     let confidence = configured_confidence(&root);
-    match detect_on_model(&bytes, &path, roi.as_ref(), confidence) {
-        Ok(payload) => Ok(payload),
+    match run_model(&path, rgb, width, height, roi.as_ref(), confidence) {
+        Ok((detections, classes)) => Ok(json!({
+            "detections": detections,
+            "classes": classes,
+        })),
         Err(message) => Ok(failure(&model_status_message(&message))),
     }
+}
+
+#[tauri::command]
+pub async fn detect_image(state: tauri::State<'_, FrameState>) -> Result<Value, String> {
+    let frame = {
+        let guard = state.latest.lock().unwrap_or_else(|err| err.into_inner());
+        guard.clone()
+    };
+    tauri::async_runtime::spawn_blocking(move || detect_raw(frame))
+        .await
+        .map_err(|_| "Detect failed".to_string())?
 }
 
 const BENCHMARK_RUNS: usize = 5;

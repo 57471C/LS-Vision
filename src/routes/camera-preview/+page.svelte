@@ -662,6 +662,26 @@ function readDetections(value: unknown): DetectMark[] {
 	return marks;
 }
 
+function scaleMarks(
+	marks: DetectMark[],
+	fromW: number,
+	fromH: number,
+	toW: number,
+	toH: number,
+): DetectMark[] {
+	if (fromW < 1 || fromH < 1 || toW < 1 || toH < 1) return marks;
+	if (fromW === toW && fromH === toH) return marks;
+	const sx = toW / fromW;
+	const sy = toH / fromH;
+	return marks.map((mark) => ({
+		...mark,
+		x: mark.x * sx,
+		y: mark.y * sy,
+		w: mark.w * sx,
+		h: mark.h * sy,
+	}));
+}
+
 function clearDetect() {
 	detectGeneration += 1;
 	detectBusy = false;
@@ -701,7 +721,17 @@ async function runDetect() {
 	detectBusy = true;
 	detectNote = "";
 	try {
-		const body = await invoke<DetectBody>("detect_image", { image });
+		const snap = await invoke<PreviewBody>("capture_snapshot", {
+			index: camera,
+		});
+		if (closed || gen !== detectGeneration || camera !== index) return;
+		if (snap.status === "fail") {
+			detectImage = "";
+			detectMarks = [];
+			detectNote = snap.message || "No frame.";
+			return;
+		}
+		const body = await invoke<DetectBody>("detect_image");
 		if (closed || gen !== detectGeneration || camera !== index) return;
 		const message = typeof body.message === "string" ? body.message.trim() : "";
 		if (message) {
@@ -717,10 +747,18 @@ async function runDetect() {
 			}
 			return;
 		}
+		const fullW = typeof snap.width === "number" ? snap.width : width;
+		const fullH = typeof snap.height === "number" ? snap.height : height;
 		detectImage = image;
 		detectW = width;
 		detectH = height;
-		detectMarks = readDetections(body.detections);
+		detectMarks = scaleMarks(
+			readDetections(body.detections),
+			fullW,
+			fullH,
+			width,
+			height,
+		);
 		detectNote = "";
 	} catch (err: unknown) {
 		if (closed || gen !== detectGeneration) return;
@@ -739,14 +777,18 @@ async function takeSnapshot() {
 	snapshotMessage = "";
 	try {
 		const body = await invoke<PreviewBody>("capture_snapshot", { index });
-		if (body.status === "fail" || !body.image) {
+		if (body.status === "fail") {
 			snapshotSaved = body.message || "The camera did not open.";
+			return;
+		}
+		if (!lastFrame) {
+			snapshotSaved = "No preview frame.";
 			return;
 		}
 		const suggestion = await invoke<TrainingSuggestion>(
 			"suggest_training_filename",
 		);
-		snapshotImage = body.image;
+		snapshotImage = lastFrame;
 		snapshotName = suggestion.name?.trim() || "image";
 		snapshotFolder = suggestion.folder?.trim() || "";
 		snapshotDay = suggestion.day?.trim() || "";

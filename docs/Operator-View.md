@@ -11,15 +11,15 @@ The main screen used on the bench.
 
 ## Barcode and snapshot
 
-- With Test mode off, the countdown reads a full-resolution still (`capture_snapshot`) when it reaches 0. That still is a separate camera handle, so the preview canvas keeps drawing through the capture.
-- The page crops the still to the saved barcode ROI when one is set, then decodes QR with the native detector, then ZXing, then Rust (`decode_barcode`, QR and Code 39). One trailing slash is removed.
-- A code that matches the BoM holds that still over the canvas and runs detection on it. Boxes and IC labels are drawn on top of the still. The preview slot was not cleared by the snapshot.
+- With Test mode off, the countdown reads a full-resolution raw frame (`capture_snapshot`) when it reaches 0. That still is a separate camera handle, so the preview canvas keeps drawing through the capture.
+- Rust crops that frame to the saved barcode ROI when one is set. The page first tries the native detector and ZXing on the preview JPEG, then Rust (`decode_barcode`, QR and Code 39). A crop whose long edge is over 1920 pixels is halved until it fits, and that smaller image is read first. One trailing slash is removed.
+- A code that matches the BoM holds the current preview JPEG over the canvas and runs detection on the raw frame. Boxes and IC labels are drawn on top of that preview. The preview slot was not cleared by the snapshot.
 - **Decode QR / Barcode** uses the same decode path on demand.
 - A miss, or a code that is not in the BoM, leaves the live view in place.
 
 ## Test mode
 
-When Test mode is on, the countdown does not read the camera. The button reads **Use typed code**. A passing lookup asks for an image file and detects on that file.
+When Test mode is on, the countdown does not read the camera. The button reads **Use typed code**. A passing lookup asks for an image file and shows that file. Detection runs on the latest raw camera frame.
 
 ## Results
 

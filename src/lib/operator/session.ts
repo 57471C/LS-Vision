@@ -72,8 +72,20 @@ function attachSession(
 		snapshot?: boolean;
 		barcode?: string;
 		image?: string;
+		width?: number;
+		height?: number;
+		timestamp_ms?: number;
 		jobCardNumber?: string;
 	};
+
+	let previewImage = "";
+	let previewWidth = 0;
+	let previewHeight = 0;
+	let heldPreviewW = 0;
+	let heldPreviewH = 0;
+	let heldRawW = 0;
+	let heldRawH = 0;
+	let scaleToPreview = false;
 
 	const DEFAULT_SCAN_SECONDS = 8;
 	// Settings unlock is the admin flag for this tab. It is not stored in config.
@@ -331,23 +343,58 @@ function attachSession(
 		return `data:image/jpeg;base64,${text.replace(/\s+/g, "")}`;
 	}
 
-	async function requestDetections(body: { image?: string }): Promise<{
+	async function requestDetections(): Promise<{
 		detections?: unknown;
 		classes?: unknown;
 		image_base64?: unknown;
 		message?: unknown;
 	}> {
-		// .onnx runs in Rust. A .pt file is the training checkpoint and is not detected.
+		// .onnx runs in Rust on the latest raw frame. A .pt file is not detected.
 		if (op.modelName.toLowerCase().endsWith(".onnx")) {
-			return await invoke("detect_image", {
-				image: body.image ?? null,
-			});
+			return await invoke("detect_image");
 		}
 		return {
 			detections: [],
-			image_base64: null,
 			message: `${op.modelName} is a .pt file. Choose an .onnx model to detect parts.`,
 		};
+	}
+
+	function noteRawSize(frame: WatchBody) {
+		if (typeof frame.width === "number" && frame.width > 0) heldRawW = frame.width;
+		if (typeof frame.height === "number" && frame.height > 0)
+			heldRawH = frame.height;
+	}
+
+	// Boxes come back in full-frame pixels. The held still is the preview JPEG.
+	function fitDetections(items: Detection[]): Detection[] {
+		if (
+			!scaleToPreview ||
+			heldRawW < 1 ||
+			heldRawH < 1 ||
+			heldPreviewW < 1 ||
+			heldPreviewH < 1
+		) {
+			return items;
+		}
+		if (heldRawW === heldPreviewW && heldRawH === heldPreviewH) return items;
+		const sx = heldPreviewW / heldRawW;
+		const sy = heldPreviewH / heldRawH;
+		return items.map((item) => {
+			if (item.bbox.length < 4) return item;
+			const [x1, y1, x2, y2] = item.bbox;
+			return {
+				...item,
+				bbox: [x1 * sx, y1 * sy, x2 * sx, y2 * sy],
+			};
+		});
+	}
+
+	function holdPreviewStill(kitCode: string): number | null {
+		if (!previewImage) return null;
+		scaleToPreview = true;
+		heldPreviewW = previewWidth;
+		heldPreviewH = previewHeight;
+		return holdStill(previewImage, kitCode);
 	}
 
 	async function recordResult(
@@ -522,7 +569,7 @@ function attachSession(
 		}
 	}
 
-	async function runDetect(generation: number, body: { image?: string }) {
+	async function runDetect(generation: number) {
 		if (generation !== detectGeneration) return;
 		const viewAtStart = op.result;
 		op.detectState = "running";
@@ -530,10 +577,10 @@ function attachSession(
 		op.partDescriptions = {};
 		op.detectMessage = "";
 		try {
-			const payload = await requestDetections(body);
+			const payload = await requestDetections();
 			if (generation !== detectGeneration || !pageAlive) return;
 			const composed = await composeDetections(
-				asDetections(payload.detections),
+				fitDetections(asDetections(payload.detections)),
 				modelClassList(payload.classes),
 			);
 			if (generation !== detectGeneration || !pageAlive) return;
@@ -571,7 +618,7 @@ function attachSession(
 				void finishDetection(
 					generation,
 					viewAtStart,
-					op.snapshot?.image ?? body.image ?? null,
+					op.snapshot?.image ?? null,
 					outside,
 				);
 			}
@@ -581,7 +628,7 @@ function attachSession(
 			noteModelFromDetect(op.detectMessage);
 			op.detectState = "done";
 			if (op.result === viewAtStart) {
-				void recordResult(op.snapshot?.image ?? body.image ?? null, true);
+				void recordResult(op.snapshot?.image ?? null, true);
 			}
 		}
 	}
@@ -706,25 +753,25 @@ function attachSession(
 		}
 	}
 
-	async function decodeCameraImage(image: string): Promise<RustDecode> {
-		const frame = await cropBarcodeImage(image);
-		const fromNative = await readNative(frame);
-		if (fromNative) {
-			op.barcodeDecoder = "native";
-			console.info("barcode detector native");
-			writeConsole(`Barcode decoded: ${fromNative} (JS)`);
-			return { status: "pass", barcode: fromNative };
+	async function decodeCameraImage(preview: string): Promise<RustDecode> {
+		if (preview) {
+			const frame = await cropBarcodeImage(preview);
+			const fromNative = await readNative(frame);
+			if (fromNative) {
+				op.barcodeDecoder = "native";
+				console.info("barcode detector native");
+				writeConsole(`Barcode decoded: ${fromNative} (JS)`);
+				return { status: "pass", barcode: fromNative };
+			}
+			const fromZxing = await readZxing(frame);
+			if (fromZxing) {
+				op.barcodeDecoder = "js";
+				console.info("barcode detector zxing");
+				writeConsole(`Barcode decoded: ${fromZxing} (JS)`);
+				return { status: "pass", barcode: fromZxing };
+			}
 		}
-		const fromZxing = await readZxing(frame);
-		if (fromZxing) {
-			op.barcodeDecoder = "js";
-			console.info("barcode detector zxing");
-			writeConsole(`Barcode decoded: ${fromZxing} (JS)`);
-			return { status: "pass", barcode: fromZxing };
-		}
-		const decoded = await invoke<RustDecode>("decode_barcode", {
-			image: frame,
-		});
+		const decoded = await invoke<RustDecode>("decode_barcode");
 		const code = decodedText(decoded);
 		if (code) {
 			op.barcodeDecoder = "rust";
@@ -808,6 +855,9 @@ function attachSession(
 			const context = node.getContext("2d", { alpha: false });
 			if (!context) return false;
 			context.drawImage(bitmap, 0, 0);
+			previewImage = url;
+			previewWidth = bitmap.width;
+			previewHeight = bitmap.height;
 			op.livePainted = true;
 			return true;
 		} finally {
@@ -950,9 +1000,10 @@ function attachSession(
 			}
 			if (op.testMode) return;
 			const frame = await readFrame(index);
-			if (!stillWatches(index) || !frame.image) return;
+			if (!stillWatches(index) || frame.status === "fail") return;
+			noteRawSize(frame);
 			await yieldToPaint();
-			const decoded = await decodeCameraImage(frame.image);
+			const decoded = await decodeCameraImage(previewImage);
 			const code = decodedText(decoded);
 			if (!stillWatches(index) || !code) return;
 			const view = await lookupCode(code);
@@ -962,8 +1013,13 @@ function attachSession(
 			op.result = view;
 			storeBom(view);
 			await yieldToPaint();
-			const generation = holdStill(frame.image, kitCode);
-			void runDetect(generation, { image: frame.image });
+			const generation = holdPreviewStill(kitCode);
+			if (generation === null) {
+				detectGeneration += 1;
+				void runDetect(detectGeneration);
+			} else {
+				void runDetect(generation);
+			}
 		} catch {
 			// A missed poll leaves the last still and the last BoM result.
 		} finally {
@@ -1614,7 +1670,7 @@ function attachSession(
 		if (!op.snapshot?.source || !pageAlive) return;
 		detectGeneration += 1;
 		const generation = detectGeneration;
-		void runDetect(generation, { image: op.snapshot.source });
+		void runDetect(generation);
 	}
 
 	function chooseImageFile(): Promise<File | null> {
@@ -1670,8 +1726,14 @@ function attachSession(
 		try {
 			const dataUrl = await readImageFile(file);
 			if (!pageAlive || !op.bom || op.bom.kitCode !== kitCode) return;
+			try {
+				noteRawSize(await readFrame(op.cameraIndex));
+			} catch {
+				// Detection reports a missing camera frame. The chosen file stays the still.
+			}
+			scaleToPreview = false;
 			const generation = holdStill(dataUrl, kitCode);
-			await runDetect(generation, { image: dataUrl });
+			await runDetect(generation);
 		} catch (err: unknown) {
 			if (!pageAlive) return;
 			op.detectMessage = errorMessage(err, "Could not read the image");
@@ -2017,28 +2079,9 @@ function attachSession(
 		try {
 			const frame = await readFrame(op.cameraIndex);
 			if (!pageAlive) return;
-			if (!frame.image) {
-				// A frame without a JPEG still keeps a code when the body has one.
-				// The native QR detector reads a JPEG first, then ZXing, then Rust.
-				if (frame.barcode) {
-					op.barcode = frame.barcode;
-					dropBom();
-					op.result = {
-						status: "fail",
-						message: frame.message || "Barcode not found in BoM",
-					};
-					void recordResult(null, false);
-					return;
-				}
-				op.result = {
-					status: "fail",
-					message: frame.message || "No frame",
-				};
-				void recordResult(null, false);
-				return;
-			}
+			noteRawSize(frame);
 			await yieldToPaint();
-			const decoded = await decodeCameraImage(frame.image);
+			const decoded = await decodeCameraImage(previewImage);
 			if (!pageAlive) return;
 			const code = decodedText(decoded);
 			if (!code) {
@@ -2046,7 +2089,7 @@ function attachSession(
 					status: "fail",
 					message: decoded.message || "No code detected",
 				};
-				void recordResult(frame.image, false);
+				void recordResult(previewImage || null, false);
 				return;
 			}
 			const view = await lookupCode(code);
@@ -2057,12 +2100,17 @@ function attachSession(
 				op.barcode = op.bomSource === "api" ? code : kitCode;
 				storeBom(view);
 				await yieldToPaint();
-				const generation = holdStill(frame.image, kitCode);
-				void runDetect(generation, { image: frame.image });
+				const generation = holdPreviewStill(kitCode);
+				if (generation === null) {
+					detectGeneration += 1;
+					void runDetect(detectGeneration);
+				} else {
+					void runDetect(generation);
+				}
 			} else {
 				op.barcode = code;
 				dropBom();
-				void recordResult(frame.image, false);
+				void recordResult(previewImage || null, false);
 			}
 		} catch (err: unknown) {
 			op.result = {
