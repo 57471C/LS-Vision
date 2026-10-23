@@ -205,23 +205,67 @@ fn confidence_value(document: &Value) -> f32 {
     (number as f32).clamp(MIN_CONFIDENCE, MAX_CONFIDENCE)
 }
 
+/// `enabled` defaults to true when the field is missing or not a boolean.
+fn slot_is_enabled(raw: &Value) -> bool {
+    raw.get("enabled").and_then(Value::as_bool).unwrap_or(true)
+}
+
 /// Saved part-detection regions, slot 1 through 4.
 ///
 /// `detectRois` is the list when that key is an array, and a null entry is
-/// skipped. A file that only has `detectRoi` still uses that box as slot 1.
+/// skipped. A box with `enabled: false` is skipped too. A file that only has
+/// `detectRoi` still uses that box as slot 1.
 fn slots_from_document(document: &Value) -> Vec<(i32, Roi)> {
     if let Some(list) = document.get("detectRois").and_then(Value::as_array) {
         let mut slots = Vec::new();
         for (index, item) in list.iter().take(4).enumerate() {
             if let Some(roi) = clean_detect_roi(item) {
-                slots.push((index as i32 + 1, roi));
+                if slot_is_enabled(item) {
+                    slots.push((index as i32 + 1, roi));
+                }
             }
         }
         return slots;
     }
-    match document.get("detectRoi").and_then(clean_detect_roi) {
-        Some(roi) => vec![(1, roi)],
+    match document.get("detectRoi") {
+        Some(raw) => match clean_detect_roi(raw) {
+            Some(roi) if slot_is_enabled(raw) => vec![(1, roi)],
+            _ => Vec::new(),
+        },
         None => Vec::new(),
+    }
+}
+
+/// True when a box is saved, including a box the operator has turned off.
+fn any_saved_detect_roi(document: &Value) -> bool {
+    if let Some(list) = document.get("detectRois").and_then(Value::as_array) {
+        return list
+            .iter()
+            .take(4)
+            .any(|item| clean_detect_roi(item).is_some());
+    }
+    document
+        .get("detectRoi")
+        .and_then(clean_detect_roi)
+        .is_some()
+}
+
+enum DetectPlan {
+    FullFrame,
+    Idle,
+    Slots(Vec<(i32, Roi)>),
+}
+
+/// No saved box uses the full frame. Saved boxes that are all off detect nothing.
+fn detect_plan(document: &Value) -> DetectPlan {
+    let slots = slots_from_document(document);
+    if !slots.is_empty() {
+        return DetectPlan::Slots(slots);
+    }
+    if any_saved_detect_roi(document) {
+        DetectPlan::Idle
+    } else {
+        DetectPlan::FullFrame
     }
 }
 
@@ -1467,20 +1511,25 @@ fn detect_pixels(rgb: &[u8], width: u32, height: u32) -> Result<Value, String> {
         .as_ref()
         .map(confidence_value)
         .unwrap_or(DEFAULT_CONFIDENCE);
-    let slots = document
+    let plan = document
         .as_ref()
-        .map(slots_from_document)
-        .unwrap_or_default();
+        .map(detect_plan)
+        .unwrap_or(DetectPlan::FullFrame);
     // No slot is the full frame, in the same object the page already reads.
-    if slots.is_empty() {
-        return match run_model(&path, rgb, width, height, None, confidence) {
-            Ok((detections, classes)) => Ok(json!({
-                "detections": detections,
-                "classes": classes,
-            })),
-            Err(message) => Ok(failure(&model_status_message(&message))),
-        };
-    }
+    // Saved slots that are all off return an empty list, not the full frame.
+    let slots = match plan {
+        DetectPlan::FullFrame => {
+            return match run_model(&path, rgb, width, height, None, confidence) {
+                Ok((detections, classes)) => Ok(json!({
+                    "detections": detections,
+                    "classes": classes,
+                })),
+                Err(message) => Ok(failure(&model_status_message(&message))),
+            };
+        }
+        DetectPlan::Idle => return Ok(json!([])),
+        DetectPlan::Slots(slots) => slots,
+    };
     let mut rows = Vec::with_capacity(slots.len());
     for (slot, roi) in slots {
         match run_model(&path, rgb, width, height, Some(&roi), confidence) {
@@ -1968,6 +2017,32 @@ mod tests {
         }));
         assert_eq!(only_second.len(), 1);
         assert_eq!(only_second[0].0, 2);
+        let enabled = slots_from_document(&json!({
+            "detectRois": [
+                { "x": 0.1, "y": 0.1, "w": 0.2, "h": 0.2, "enabled": false },
+                { "x": 0.4, "y": 0.4, "w": 0.2, "h": 0.2, "enabled": true },
+                { "x": 0.6, "y": 0.1, "w": 0.2, "h": 0.2 }
+            ]
+        }));
+        assert_eq!(
+            enabled.iter().map(|(slot, _)| *slot).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert!(matches!(
+            detect_plan(&json!({
+                "detectRois": [
+                    { "x": 0.1, "y": 0.1, "w": 0.2, "h": 0.2, "enabled": false },
+                    null,
+                    null,
+                    null
+                ]
+            })),
+            DetectPlan::Idle
+        ));
+        assert!(matches!(
+            detect_plan(&json!({ "detectRois": [null, null, null, null] })),
+            DetectPlan::FullFrame
+        ));
     }
 
     #[test]

@@ -13,9 +13,11 @@ import {
 	settingsForCamera,
 } from "$lib/camera-settings";
 import {
+	compactClearedSlot,
 	type DetectRoi,
 	parseDetectRoi,
 	parseDetectRois,
+	withSlotEnabled,
 } from "$lib/detect-rois";
 import {
 	PART_LABEL_LIMIT,
@@ -333,6 +335,7 @@ function readRoiFields(): DetectRoi | null {
 		y: round4(roiY),
 		w: round4(roiW),
 		h: round4(roiH),
+		enabled: roi?.enabled !== false,
 	};
 	if (next.x < 0 || next.y < 0 || next.w < 0.01 || next.h < 0.01) return null;
 	if (next.w > 1 || next.h > 1) return null;
@@ -998,6 +1001,17 @@ async function saveErp() {
 	}
 }
 
+let roiWrite: Promise<void> = Promise.resolve();
+
+function enqueueRoi(task: () => Promise<void>): Promise<void> {
+	const job = roiWrite.then(task, task);
+	roiWrite = job.then(
+		() => undefined,
+		() => undefined,
+	);
+	return job;
+}
+
 async function postRoi(next: DetectRoi | null) {
 	const index = Number(roiSlot);
 	if (!Number.isInteger(index) || index < 1 || index > 4) {
@@ -1007,20 +1021,64 @@ async function postRoi(next: DetectRoi | null) {
 	savingRoi = true;
 	roiNotice = "";
 	try {
-		const current = await loadDocument();
-		const slots = parseDetectRois(current.detectRois, current.detectRoi);
-		slots[index - 1] = next;
-		current.detectRois = slots;
-		current.detectRoi = slots[0];
-		await storeDocument(current);
-		roiSlots = slots;
-		fillRoi(asRoi(next));
-		roiNotice = "Saved";
+		await enqueueRoi(async () => {
+			const current = await loadDocument();
+			const slots = parseDetectRois(current.detectRois, current.detectRoi);
+			const stored =
+				next === null
+					? compactClearedSlot(slots, index)
+					: slots.map((item, itemIndex) =>
+							itemIndex === index - 1
+								? { ...next, enabled: item?.enabled ?? true }
+								: item,
+						);
+			current.detectRois = stored;
+			current.detectRoi = stored[0];
+			await storeDocument(current);
+			roiSlots = stored;
+			if (next === null) showRoiSlot();
+			else fillRoi(asRoi(stored[index - 1]));
+			roiNotice = "Saved";
+		});
 	} catch (err: unknown) {
 		roiNotice = invokeError(err, "Could not save the ROI");
 	} finally {
 		savingRoi = false;
 	}
+}
+
+function toggleSavedSlot(slot: number) {
+	const current = roiSlots[slot - 1];
+	if (!current) return;
+	const enabled = !current.enabled;
+	roiSlots = withSlotEnabled(roiSlots, slot, enabled);
+	if (roi && Number(roiSlot) === slot) roi = { ...roi, enabled };
+	void enqueueRoi(async () => {
+		const document = await loadDocument();
+		const slots = withSlotEnabled(
+			parseDetectRois(document.detectRois, document.detectRoi),
+			slot,
+			enabled,
+		);
+		document.detectRois = slots;
+		document.detectRoi = slots[0];
+		await storeDocument(document);
+		roiSlots = slots;
+		if (Number(roiSlot) === slot) {
+			const saved = slots[slot - 1];
+			if (saved && roi) roi = { ...roi, enabled: saved.enabled };
+		}
+		roiNotice = "Saved";
+	}).catch((err: unknown) => {
+		roiNotice = invokeError(err, "Could not save the ROI");
+		void loadRoi();
+	});
+}
+
+function slotSquareClass(box: DetectRoi | null): string {
+	if (!box) return "border-neutral-700 bg-neutral-800 text-neutral-500";
+	if (box.enabled) return "border-green-400 bg-green-500 text-neutral-950";
+	return "border-red-500 bg-red-600 text-white";
 }
 
 function roiFieldsEmpty(): boolean {
@@ -2644,6 +2702,32 @@ onDestroy(() => {
 								<legend class="text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
 									Part detection
 								</legend>
+								<div class="flex items-center gap-1" role="group" aria-label="Detect slots">
+									{#each [1, 2, 3, 4] as slot (slot)}
+										{@const box = roiSlots[slot - 1]}
+										{#if box}
+											<button
+												type="button"
+												class="inline-flex h-9 w-9 cursor-pointer items-center justify-center border text-sm font-semibold {slotSquareClass(box)}"
+												aria-pressed={box.enabled}
+												aria-label="Slot {slot}"
+												on:click={() => toggleSavedSlot(slot)}
+											>
+												{slot}
+											</button>
+										{:else}
+											<span
+												class="inline-flex h-9 w-9 cursor-default items-center justify-center border border-neutral-700 bg-neutral-800 text-sm font-semibold text-neutral-500"
+												aria-hidden="true"
+											>
+												{slot}
+											</span>
+										{/if}
+									{/each}
+								</div>
+								<p class="text-sm text-neutral-400">
+									Grey has no box. Green is on. Red is off. A new box starts on.
+								</p>
 								<label class="flex w-28 flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
 									Slot
 									<select
