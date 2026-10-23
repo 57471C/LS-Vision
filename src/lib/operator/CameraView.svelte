@@ -33,6 +33,7 @@ type Detection = {
 	ic: string;
 	confidence: number;
 	bbox: number[];
+	consumed?: boolean;
 };
 
 type DetectionMark = {
@@ -48,6 +49,7 @@ type DetectionMark = {
 	labelW: number;
 	labelH: number;
 	unexpected: boolean;
+	child: boolean;
 };
 
 // OpenCV stored these as BGR.
@@ -62,6 +64,7 @@ const PART_COLORS = [
 	"rgb(255, 100, 0)",
 ];
 const BOX_STROKE = 2;
+const CHILD_STROKE = 1;
 const LABEL_FONT = 12;
 const LABEL_PAD_X = 4;
 const LABEL_PAD_Y = 3;
@@ -93,6 +96,7 @@ function detectionMarks(
 		height: number;
 	} | null,
 	bomParts: { ic: string }[] | null,
+	admin: boolean,
 ): DetectionMark[] {
 	// Positions are CSS pixels of the still. The viewBox matches that size,
 	// so the stroke and the label font do not grow when the still is scaled.
@@ -117,6 +121,8 @@ function detectionMarks(
 	const known = bomParts ? new Set(bomParts.map((part) => part.ic)) : null;
 	const ordered = [...detections].sort((a, b) => a.confidence - b.confidence);
 	for (const [index, item] of ordered.entries()) {
+		// Operators do not see a child that a matching rule already used.
+		if (item.consumed && !admin) continue;
 		const box = item.bbox;
 		if (box.length < 4) continue;
 		const [rawX1, rawY1, rawX2, rawY2] = box;
@@ -158,7 +164,12 @@ function detectionMarks(
 			labelY,
 			labelW,
 			labelH,
-			unexpected: known !== null && item.ic !== "" && !known.has(item.ic),
+			unexpected:
+				!item.consumed &&
+				known !== null &&
+				item.ic !== "" &&
+				!known.has(item.ic),
+			child: item.consumed === true,
 		});
 	}
 	return marks;
@@ -284,7 +295,7 @@ $: bannerCount = (wrongParts ? 1 : 0) + (extraParts > 0 ? 1 : 0);
 					{/if}
 				{/if}
 				{#if $operator.snapshot && $operator.paneWidth > 0 && $operator.paneHeight > 0 && $operator.detections.length > 0}
-					{@const marks = detectionMarks($operator.snapshot, $operator.paneWidth, $operator.paneHeight, $operator.frameWidth, $operator.frameHeight, $operator.detections, $zoom, $operator.bom?.parts ?? null)}
+					{@const marks = detectionMarks($operator.snapshot, $operator.paneWidth, $operator.paneHeight, $operator.frameWidth, $operator.frameHeight, $operator.detections, $zoom, $operator.bom?.parts ?? null, $operator.admin)}
 					{@const viewW = $zoom ? $zoom.width : $operator.frameWidth}
 					{@const viewH = $zoom ? $zoom.height : $operator.frameHeight}
 					{#if marks.length > 0 && viewW > 0 && viewH > 0}
@@ -297,52 +308,78 @@ $: bannerCount = (wrongParts ? 1 : 0) + (extraParts > 0 ? 1 : 0);
 							aria-hidden="true"
 						>
 							{#each marks as mark (mark.key)}
-								{#if mark.unexpected}
-									<line
-										x1={mark.x}
-										y1={mark.y}
-										x2={mark.x + mark.w}
-										y2={mark.y + mark.h}
-										stroke="#dc2626"
-										stroke-width={BOX_STROKE}
-									/>
-									<line
-										x1={mark.x + mark.w}
-										y1={mark.y}
-										x2={mark.x}
-										y2={mark.y + mark.h}
-										stroke="#dc2626"
-										stroke-width={BOX_STROKE}
-									/>
-								{:else}
+								{#if mark.child}
 									<rect
 										x={mark.x}
 										y={mark.y}
 										width={mark.w}
 										height={mark.h}
 										fill="none"
-										stroke={mark.color}
-										stroke-width={BOX_STROKE}
+										stroke="#d4d4d4"
+										stroke-opacity="0.55"
+										stroke-width={CHILD_STROKE}
+										data-part-role="child"
 									/>
+									<text
+										x={mark.x + LABEL_PAD_X}
+										y={mark.y + LABEL_FONT}
+										fill="#d4d4d4"
+										fill-opacity="0.7"
+										font-size={LABEL_FONT}
+										font-family="ui-monospace, monospace"
+										font-weight="600"
+										data-part-role="child"
+									>
+										{mark.ic}
+									</text>
+								{:else}
+									{#if mark.unexpected}
+										<line
+											x1={mark.x}
+											y1={mark.y}
+											x2={mark.x + mark.w}
+											y2={mark.y + mark.h}
+											stroke="#dc2626"
+											stroke-width={BOX_STROKE}
+										/>
+										<line
+											x1={mark.x + mark.w}
+											y1={mark.y}
+											x2={mark.x}
+											y2={mark.y + mark.h}
+											stroke="#dc2626"
+											stroke-width={BOX_STROKE}
+										/>
+									{:else}
+										<rect
+											x={mark.x}
+											y={mark.y}
+											width={mark.w}
+											height={mark.h}
+											fill="none"
+											stroke={mark.color}
+											stroke-width={BOX_STROKE}
+										/>
+									{/if}
+									<rect
+										x={mark.labelX}
+										y={mark.labelY}
+										width={mark.labelW}
+										height={mark.labelH}
+										fill={mark.unexpected ? "#dc2626" : mark.color}
+									/>
+									<text
+										x={mark.labelX + LABEL_PAD_X}
+										y={mark.labelY + mark.labelH / 2}
+										fill="#ffffff"
+										font-size={LABEL_FONT}
+										font-family="ui-monospace, monospace"
+										font-weight="600"
+										dominant-baseline="central"
+									>
+										{mark.ic}
+									</text>
 								{/if}
-								<rect
-									x={mark.labelX}
-									y={mark.labelY}
-									width={mark.labelW}
-									height={mark.labelH}
-									fill={mark.unexpected ? "#dc2626" : mark.color}
-								/>
-								<text
-									x={mark.labelX + LABEL_PAD_X}
-									y={mark.labelY + mark.labelH / 2}
-									fill="#ffffff"
-									font-size={LABEL_FONT}
-									font-family="ui-monospace, monospace"
-									font-weight="600"
-									dominant-baseline="central"
-								>
-									{mark.ic}
-								</text>
 							{/each}
 						</svg>
 					{/if}

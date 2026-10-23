@@ -297,6 +297,7 @@ function attachSession(
 	}
 
 	// Rename parents before the counts, the overlay, and the saved result.
+	// A consumed child stays on the list for the admin outline and is left out of the BoM count.
 	// The model list from detect_image is left as the trained class names.
 	// checked is false when this detect did not return a class list.
 	async function composeDetections(

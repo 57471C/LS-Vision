@@ -2,10 +2,15 @@
 // node scripts/part-composition.test.ts
 
 import {
+	detectionCounts,
+	extraPartCount,
+	hasUnexpected,
+} from "../src/lib/operator/verdict.ts";
+import {
 	applyPartRules,
-	parsePartRules,
 	type PartBox,
 	type PartRule,
+	parsePartRules,
 } from "../src/lib/part-composition.ts";
 
 const hingeRules: PartRule[] = [
@@ -23,11 +28,7 @@ const hingeRules: PartRule[] = [
 	},
 ];
 
-function box(
-	ic: string,
-	bbox: number[],
-	confidence = 0.9,
-): PartBox {
+function box(ic: string, bbox: number[], confidence = 0.9): PartBox {
 	return { ic, confidence, bbox };
 }
 
@@ -60,8 +61,15 @@ check(
 	composed.detections[0]?.ic,
 );
 check(
-	"logo stays P02_Logo",
-	composed.detections[1]?.ic === "P02_Logo",
+	"logo stays P02_Logo and is marked consumed",
+	composed.detections[1]?.ic === "P02_Logo" &&
+		composed.detections[1]?.consumed === true,
+);
+check(
+	"the rewritten plate and the other boxes are not consumed",
+	composed.detections[0]?.consumed !== true &&
+		composed.detections[2]?.consumed !== true &&
+		composed.detections[3]?.consumed !== true,
 );
 check(
 	"plate without a logo becomes 2QHP01",
@@ -92,8 +100,7 @@ check(
 const reversed = applyPartRules(snapshot, [hingeRules[1], hingeRules[0]]);
 check(
 	"first match still yields 2QHP02 and 2QHP01 when no-child is listed first",
-	classes(reversed.detections).join(",") ===
-		"2QHP02,P02_Logo,2QHP01,2BBMNM08",
+	classes(reversed.detections).join(",") === "2QHP02,P02_Logo,2QHP01,2BBMNM08",
 	classes(reversed.detections).join(","),
 );
 
@@ -126,22 +133,20 @@ check(
 );
 
 const outside = applyPartRules(
-	[
-		box("Hinge_Plate", [0, 0, 100, 80]),
-		box("P02_Logo", [150, 0, 170, 20]),
-	],
+	[box("Hinge_Plate", [0, 0, 100, 80]), box("P02_Logo", [150, 0, 170, 20])],
 	hingeRules,
 );
 check(
 	"a logo whose center is outside the plate is no child",
 	classes(outside.detections).join(",") === "2QHP01,P02_Logo",
 );
+check(
+	"a logo outside the plate is not consumed",
+	outside.detections[1]?.consumed !== true,
+);
 
 const onEdge = applyPartRules(
-	[
-		box("Hinge_Plate", [0, 0, 100, 80]),
-		box("P02_Logo", [90, 70, 110, 90]),
-	],
+	[box("Hinge_Plate", [0, 0, 100, 80]), box("P02_Logo", [90, 70, 110, 90])],
 	hingeRules,
 );
 check(
@@ -156,10 +161,7 @@ check(
 		empty.log.length === 0,
 );
 
-const missed = applyPartRules(
-	[box("bolt", [0, 0, 10, 10])],
-	hingeRules,
-);
+const missed = applyPartRules([box("bolt", [0, 0, 10, 10])], hingeRules);
 check(
 	"a detect with no parent logs that nothing matched",
 	missed.detections[0]?.ic === "bolt" &&
@@ -189,7 +191,12 @@ const parsed = parsePartRules([
 		result: "2QHP01",
 	},
 	{ parent: "", child: "P02_Logo", condition: "contains", result: "X" },
-	{ parent: "Hinge_Plate", child: "P02_Logo", condition: "overlaps", result: "X" },
+	{
+		parent: "Hinge_Plate",
+		child: "P02_Logo",
+		condition: "overlaps",
+		result: "X",
+	},
 	"nope",
 ]);
 check(
@@ -199,7 +206,10 @@ check(
 		parsed[0]?.parent === "Hinge_Plate" &&
 		parsed[1]?.condition === "no-child",
 );
-check("a missing list parses as no rules", parsePartRules(undefined).length === 0);
+check(
+	"a missing list parses as no rules",
+	parsePartRules(undefined).length === 0,
+);
 
 const chained = applyPartRules(
 	[box("Hinge_Plate", [0, 0, 100, 80]), box("P02_Logo", [10, 10, 30, 30])],
@@ -259,7 +269,9 @@ check(
 	"a missing parent is skipped and the valid rule still renames the plate",
 	mixed.detections[0]?.ic === "2QHP02" &&
 		mixed.detections[2]?.ic === "Hinge_Plate" &&
-		!mixed.detections.some((item) => item.ic === "SKIPPED_IC" || item.ic === "2QHP99"),
+		!mixed.detections.some(
+			(item) => item.ic === "SKIPPED_IC" || item.ic === "2QHP99",
+		),
 	mixed.detections.map((item) => item.ic).join(","),
 );
 check(
@@ -323,6 +335,65 @@ check(
 	blankApplied.detections.map((item) => item.ic).join(",") ===
 		"2QHP01,Hinge_Plate,bolt",
 	blankApplied.detections.map((item) => item.ic).join(","),
+);
+
+const split = applyPartRules(
+	[
+		box("Hinge_Plate", [0, 0, 100, 80]),
+		box("P02_Logo", [10, 10, 30, 30]),
+		box("P02_Logo", [150, 0, 170, 20]),
+	],
+	[hingeRules[0]],
+);
+const splitParts = [
+	{ ic: "2QHP02", des: "plate", qty: 1 },
+	{ ic: "P02_Logo", des: "logo", qty: 1 },
+];
+const splitCounts = detectionCounts(split.detections);
+check(
+	"only the logo inside the matched plate is consumed",
+	split.detections[0]?.ic === "2QHP02" &&
+		split.detections[1]?.consumed === true &&
+		split.detections[2]?.consumed !== true,
+);
+check(
+	"the outside logo still counts and the inside logo does not",
+	splitCounts["2QHP02"] === 1 && splitCounts.P02_Logo === 1,
+	JSON.stringify(splitCounts),
+);
+check(
+	"a consumed logo is not an extra or an unexpected part",
+	extraPartCount(splitParts, splitCounts) === 0 &&
+		!hasUnexpected(split.detections, splitParts),
+);
+
+const twins = applyPartRules(
+	[
+		box("Hinge_Plate", [0, 0, 100, 80]),
+		box("P02_Logo", [10, 10, 30, 30]),
+		box("P02_Logo", [40, 40, 60, 60]),
+	],
+	[hingeRules[0]],
+);
+const twinCounts = detectionCounts(twins.detections);
+check(
+	"both logos inside the plate are consumed",
+	twins.detections[1]?.consumed === true &&
+		twins.detections[2]?.consumed === true,
+);
+check(
+	"two consumed logos are left out of the BoM count",
+	twinCounts.P02_Logo === undefined &&
+		twinCounts["2QHP02"] === 1 &&
+		extraPartCount(
+			[
+				{ ic: "2QHP02", qty: 1 },
+				{ ic: "P02_Logo", qty: 1 },
+			],
+			twinCounts,
+		) === 0 &&
+		!hasUnexpected(twins.detections, [{ ic: "2QHP02" }]),
+	JSON.stringify(twinCounts),
 );
 
 if (failed > 0) {
