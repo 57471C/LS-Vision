@@ -36,6 +36,7 @@ pub fn run() {
             local_config::update_model,
             bom::load_bom_json,
             bom::post_bom_api,
+            bom::post_inventory_descriptions,
             bom::inspect_bom,
             barcode::decode_barcode,
             camera::list_cameras,

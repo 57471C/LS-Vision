@@ -33,6 +33,7 @@ type Detection = {
 type DetectedCount = {
 	ic: string;
 	count: number;
+	des: string;
 };
 
 function isLoadedBom(view: InspectView | null, bom: BomView | null): boolean {
@@ -42,13 +43,14 @@ function isLoadedBom(view: InspectView | null, bom: BomView | null): boolean {
 function partsOutsideBom(
 	items: Detection[],
 	parts: Part[] | null,
+	descriptions: Record<string, string>,
 ): DetectedCount[] {
 	const counts = detectionCounts(items);
 	const known = new Set((parts ?? []).map((part) => part.ic));
 	return Object.entries(counts)
 		.filter(([ic]) => !known.has(ic))
 		.sort((a, b) => a[0].localeCompare(b[0]))
-		.map(([ic, count]) => ({ ic, count }));
+		.map(([ic, count]) => ({ ic, count, des: descriptions[ic] ?? "" }));
 }
 
 function hideBenchNote(text: string | undefined): boolean {
@@ -172,8 +174,13 @@ $: verdict = $operator.result
 				<p class="text-sm text-neutral-400">Detecting parts...</p>
 			{/if}
 			{#if $operator.detectState === "done"}
-				{@const extras = partsOutsideBom($operator.detections, $operator.bom?.parts ?? null)}
+				{@const extras = partsOutsideBom(
+					$operator.detections,
+					$operator.bom?.parts ?? null,
+					$operator.partDescriptions,
+				)}
 				{#if extras.length}
+					{@const showDes = !!$operator.bom && extras.some((row) => row.des)}
 					<h3 class="text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
 						{$operator.bom ? "Not in BoM" : "Detected parts"}
 					</h3>
@@ -181,6 +188,9 @@ $: verdict = $operator.result
 						<thead>
 							<tr class="border-b border-neutral-600 text-[11px] uppercase tracking-widest text-neutral-400">
 								<th class="py-2 pr-3 font-semibold">IC</th>
+								{#if showDes}
+									<th class="py-2 pr-3 font-semibold">Description</th>
+								{/if}
 								<th class="py-2 text-right font-semibold">Count</th>
 							</tr>
 						</thead>
@@ -188,6 +198,9 @@ $: verdict = $operator.result
 							{#each extras as row (row.ic)}
 								<tr class="border-b border-neutral-800">
 									<td class="py-2 pr-3 font-mono font-medium">{row.ic}</td>
+									{#if showDes}
+										<td class="py-2 pr-3 text-neutral-200">{row.des}</td>
+									{/if}
 									<td class="py-2 text-right font-semibold">{row.count}</td>
 								</tr>
 							{/each}

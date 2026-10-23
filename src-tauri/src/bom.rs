@@ -1,4 +1,4 @@
-//! JSON BoM file load, the job-card API POST, and MSSQL inspect.
+//! JSON BoM file load, the job-card API POST, inventory descriptions, and MSSQL inspect.
 //! `inspect_bom` reads the saved source and runs the SQL file when that source is MSSQL.
 //! These commands do not open a camera.
 
@@ -37,6 +37,13 @@ pub fn post_bom_api(job_card_number: String) -> Result<Value, String> {
     let root = local_config::project_root()?;
     let config = local_config::load_document(&root)?;
     post_job_card(&config, &job_card_number, API_TIMEOUT)
+}
+
+#[tauri::command]
+pub fn post_inventory_descriptions(ic_list: Vec<String>) -> Result<Value, String> {
+    let root = local_config::project_root()?;
+    let config = local_config::load_document(&root)?;
+    post_descriptions(&config, &ic_list, API_TIMEOUT)
 }
 
 fn sample_bom_path(root: &Path) -> std::path::PathBuf {
@@ -535,6 +542,203 @@ fn post_job_card(config: &Value, job_card: &str, timeout: Duration) -> Result<Va
     interpret(response.status, &response.body, &key)
 }
 
+const DEFAULT_DESCRIPTION_PATH: &str = "/VisionAppApi/ListInventoryDescription";
+const DESCRIPTION_PATH_LIMIT: usize = 200;
+
+fn description_path(config: &Value) -> Result<Option<String>, String> {
+    let Some(api) = config.get("api").and_then(|value| value.as_object()) else {
+        return Ok(Some(DEFAULT_DESCRIPTION_PATH.to_string()));
+    };
+    let Some(value) = api.get("descriptionPath") else {
+        return Ok(Some(DEFAULT_DESCRIPTION_PATH.to_string()));
+    };
+    let Some(text) = value.as_str() else {
+        return Ok(Some(DEFAULT_DESCRIPTION_PATH.to_string()));
+    };
+    let path = text.trim();
+    if path.is_empty() {
+        return Ok(None);
+    }
+    if path.len() > DESCRIPTION_PATH_LIMIT
+        || path
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte == b' ')
+        || path.contains("://")
+    {
+        return Err("Description endpoint is not a valid path.".to_string());
+    }
+    Ok(Some(path.to_string()))
+}
+
+fn inventory_codes(ic_list: &[String]) -> Vec<String> {
+    let mut codes = Vec::new();
+    for raw in ic_list {
+        let ic = raw.trim();
+        if ic.is_empty() || ic.len() > 80 || codes.iter().any(|saved| saved == ic) {
+            continue;
+        }
+        codes.push(ic.to_string());
+        if codes.len() == 100 {
+            break;
+        }
+    }
+    codes
+}
+
+fn ci_get<'a>(object: &'a serde_json::Map<String, Value>, names: &[&str]) -> Option<&'a Value> {
+    for name in names {
+        if let Some((_, value)) = object
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn ci_text(object: &serde_json::Map<String, Value>, names: &[&str]) -> String {
+    ci_get(object, names).map(scalar_text).unwrap_or_default()
+}
+
+fn push_description(items: &mut Vec<Value>, ic: &str, des: &str) {
+    let ic = ic.trim();
+    let des = des.trim();
+    if ic.is_empty() || des.is_empty() {
+        return;
+    }
+    if items
+        .iter()
+        .any(|item| item.get("ic").and_then(|value| value.as_str()) == Some(ic))
+    {
+        return;
+    }
+    items.push(serde_json::json!({ "ic": ic, "des": des }));
+}
+
+fn rows_from_array(list: &[Value], items: &mut Vec<Value>) {
+    for row in list {
+        let Some(object) = row.as_object() else {
+            continue;
+        };
+        push_description(
+            items,
+            &ci_text(object, &["ic", "cc"]),
+            &ci_text(object, &["des", "description"]),
+        );
+    }
+}
+
+fn rows_from_map(object: &serde_json::Map<String, Value>, items: &mut Vec<Value>) {
+    for (key, value) in object {
+        if [
+            "status", "message", "error", "data", "title", "detail", "success",
+        ]
+        .iter()
+        .any(|name| key.eq_ignore_ascii_case(name))
+        {
+            continue;
+        }
+        let des = match value {
+            Value::String(text) => text.clone(),
+            Value::Object(row) => ci_text(row, &["des", "description"]),
+            _ => String::new(),
+        };
+        push_description(items, key, &des);
+    }
+}
+
+fn description_list(payload: &Value) -> Option<&Vec<Value>> {
+    if let Some(list) = payload.as_array() {
+        return Some(list);
+    }
+    let object = payload.as_object()?;
+    if let Some(data) = ci_get(object, &["data"]) {
+        if let Some(list) = data.as_array() {
+            return Some(list);
+        }
+        if let Some(inner) = data.as_object() {
+            for name in ["items", "list", "inventory", "results", "rows"] {
+                if let Some(list) = ci_get(inner, &[name]).and_then(Value::as_array) {
+                    return Some(list);
+                }
+            }
+        }
+    }
+    for name in ["items", "list", "inventory", "results", "rows"] {
+        if let Some(list) = ci_get(object, &[name]).and_then(Value::as_array) {
+            return Some(list);
+        }
+    }
+    None
+}
+
+fn description_items(payload: &Value) -> Vec<Value> {
+    let mut items = Vec::new();
+    if let Some(list) = description_list(payload) {
+        rows_from_array(list, &mut items);
+        return items;
+    }
+    if let Some(object) = payload.as_object()
+        && let Some(data) = ci_get(object, &["data"]).and_then(Value::as_object)
+    {
+        rows_from_map(data, &mut items);
+        if !items.is_empty() {
+            return items;
+        }
+    }
+    if let Some(object) = payload.as_object() {
+        rows_from_map(object, &mut items);
+    }
+    items
+}
+
+fn interpret_descriptions(status: u16, body: &[u8], key: &str) -> Result<Vec<Value>, String> {
+    if status != 200 {
+        let detail = error_detail(body, key);
+        if detail.is_empty() {
+            return Err(format!("Inventory descriptions returned HTTP {status}."));
+        }
+        return Err(format!(
+            "Inventory descriptions returned HTTP {status}. {detail}"
+        ));
+    }
+    let payload: Value = serde_json::from_slice(body)
+        .map_err(|_| "Inventory descriptions returned invalid JSON.".to_string())?;
+    Ok(description_items(&payload))
+}
+
+fn post_descriptions(
+    config: &Value,
+    ic_list: &[String],
+    timeout: Duration,
+) -> Result<Value, String> {
+    let Some(path) = description_path(config)? else {
+        return Ok(serde_json::json!({ "items": [] }));
+    };
+    let key = api_text(config, "key");
+    let base_url = api_text(config, "baseUrl");
+    if key.is_empty() || base_url.is_empty() {
+        return Ok(serde_json::json!({ "items": [] }));
+    }
+    if !header_safe(&key) {
+        return Err(
+            "Could not load inventory descriptions. The API key is not a single line.".to_string(),
+        );
+    }
+    let url = validated_endpoint(&base_url, &path)?;
+    let codes = inventory_codes(ic_list);
+    if codes.is_empty() {
+        return Ok(serde_json::json!({ "items": [] }));
+    }
+    let body = serde_json::to_vec(&serde_json::json!({ "icList": codes }))
+        .map_err(|_| "Could not load inventory descriptions.".to_string())?;
+    let response = exchange(&url, &key, &body, timeout)
+        .map_err(|err| format!("Could not load inventory descriptions. {err}"))?;
+    let items = interpret_descriptions(response.status, &response.body, &key)?;
+    Ok(serde_json::json!({ "items": items }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -884,5 +1088,107 @@ mod tests {
             "vision/sample-bom.json must be a JSON object."
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_blank_description_path_does_not_call_the_api() {
+        let mut saved = config("not a url", "/GetBoltBagParts", "secret");
+        saved["api"]["descriptionPath"] = Value::String(String::new());
+        let value = post_descriptions(&saved, &["2QHP02".to_string()], API_TIMEOUT).unwrap();
+        assert_eq!(value["items"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn missing_api_credentials_leave_descriptions_empty() {
+        let value = post_descriptions(
+            &config("", "", ""),
+            &["2QHP02".to_string()],
+            Duration::from_millis(50),
+        )
+        .unwrap();
+        assert_eq!(value["items"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn descriptions_read_des_from_the_data_list() {
+        let items = description_items(&serde_json::json!({
+            "status": "pass",
+            "data": [
+                { "IC": "2QHP02", "Des": "Hinge plate" },
+                { "IC": "P02_Logo", "Des": "  " },
+                { "ic": "2QHP02", "des": "ignored" },
+                { "cc": "6PBB33", "description": "Bolt" }
+            ]
+        }));
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["ic"], "2QHP02");
+        assert_eq!(items[0]["des"], "Hinge plate");
+        assert_eq!(items[1]["ic"], "6PBB33");
+        assert_eq!(items[1]["des"], "Bolt");
+    }
+
+    #[test]
+    fn descriptions_post_the_default_path_and_the_saved_key() {
+        let body =
+            r#"{"data":[{"IC":"2QHP02","Des":"Hinge plate"},{"IC":"OTHER","Description":"Bolt"}]}"#;
+        let (port, received) = spawn_server(http_response(200, "OK", "", body));
+        let value = post_descriptions(
+            &config(
+                &format!("http://127.0.0.1:{port}"),
+                "/GetBoltBagParts",
+                "test-key",
+            ),
+            &[
+                "2QHP02".to_string(),
+                " 2QHP02 ".to_string(),
+                String::new(),
+                "OTHER".to_string(),
+            ],
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(value["items"][0]["des"], "Hinge plate");
+        assert_eq!(value["items"][1]["des"], "Bolt");
+        let bytes = received.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(contains_bytes(
+            &bytes,
+            b"POST /VisionAppApi/ListInventoryDescription HTTP/1.1\r\n"
+        ));
+        assert!(contains_bytes(&bytes, b"X-Api-Key: test-key\r\n"));
+        assert!(contains_bytes(&bytes, br#"{"icList":["2QHP02","OTHER"]}"#));
+        assert!(!contains_bytes(&bytes, b"jobCardNumber"));
+        assert!(!contains_bytes(&bytes, b"/GetBoltBagParts"));
+    }
+
+    #[test]
+    fn a_saved_description_path_replaces_the_default() {
+        let body = r#"[{"ic":"2QHP02","Des":"Hinge plate"}]"#;
+        let (port, received) = spawn_server(http_response(200, "OK", "", body));
+        let mut saved = config(&format!("http://127.0.0.1:{port}"), "/bom", "test-key");
+        saved["api"]["descriptionPath"] = Value::String("/custom/List".to_string());
+        let value =
+            post_descriptions(&saved, &["2QHP02".to_string()], Duration::from_secs(2)).unwrap();
+        assert_eq!(value["items"][0]["des"], "Hinge plate");
+        let bytes = received.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(contains_bytes(&bytes, b"POST /custom/List HTTP/1.1\r\n"));
+    }
+
+    #[test]
+    fn a_failed_description_call_hides_the_api_key() {
+        let (port, _) = spawn_server(http_response(
+            500,
+            "Error",
+            "",
+            r#"{"message":"denied test-key"}"#,
+        ));
+        let err = post_descriptions(
+            &config(&format!("http://127.0.0.1:{port}"), "/bom", "test-key"),
+            &["2QHP02".to_string()],
+            Duration::from_secs(2),
+        )
+        .unwrap_err();
+        assert!(err.contains("HTTP 500"), "{err}");
+        assert!(err.contains("denied"), "{err}");
+        assert!(!err.contains("test-key"), "{err}");
     }
 }

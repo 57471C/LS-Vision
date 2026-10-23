@@ -9,7 +9,7 @@ export type ResultPart = {
 	seen: number | null;
 };
 
-export type ResultExtra = { ic: string; count: number };
+export type ResultExtra = { ic: string; count: number; des?: string };
 
 export type ResultDetail = {
 	message?: string;
