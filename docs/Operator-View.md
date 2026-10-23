@@ -19,7 +19,7 @@ The main screen used on the bench.
 
 ## Test mode
 
-When Test mode is on, the countdown does not read the camera. The button reads **Use typed code**. A passing lookup asks for an image file and shows that file. Detection runs on the latest raw camera frame.
+When Test mode is on, the countdown does not read the camera. The button reads **Use typed code**. A passing lookup asks for an image file and shows that file. Detection runs on that file.
 
 ## Results
 

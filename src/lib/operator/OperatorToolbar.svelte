@@ -14,8 +14,15 @@ const {
 	operator,
 	runInspect,
 	saveCameraIndex,
+	setDetectSlot,
 	toggleFeed,
 } = useOperator();
+
+function detectSlotChanged(event: Event) {
+	const target = event.currentTarget;
+	if (!(target instanceof HTMLSelectElement)) return;
+	setDetectSlot(Number(target.value));
+}
 
 function cameraChanged(event: Event) {
 	const target = event.currentTarget;
@@ -74,6 +81,20 @@ function cameraChanged(event: Event) {
 		{$operator.feedBusy ? "Please wait" : $operator.feedOn ? "Stop feed" : "Start feed"}
 	</button>
 	{#if $operator.admin}
+		<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+			Slot
+			<select
+				class="min-h-11 border border-neutral-600 bg-neutral-950 px-3 font-mono text-base normal-case tracking-normal text-neutral-100"
+				value={String($operator.detectSlot || "")}
+				on:change={detectSlotChanged}
+			>
+				<option value=""></option>
+				<option value="1">1</option>
+				<option value="2">2</option>
+				<option value="3">3</option>
+				<option value="4">4</option>
+			</select>
+		</label>
 		<button
 			type="button"
 			class="inline-flex min-h-11 items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100 disabled:text-neutral-500"
@@ -86,7 +107,9 @@ function cameraChanged(event: Event) {
 			type="button"
 			class="inline-flex min-h-11 items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100 disabled:text-neutral-500"
 			on:click={clearDetectRoi}
-			disabled={$operator.savingRoi || !$operator.detectRoi}
+			disabled={$operator.savingRoi ||
+				$operator.detectSlot < 1 ||
+				!$operator.detectRois[$operator.detectSlot - 1]}
 		>
 			Clear ROI
 		</button>

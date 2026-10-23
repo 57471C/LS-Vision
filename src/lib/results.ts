@@ -29,6 +29,7 @@ export type SavedResult = {
 	createdAt: string;
 	hasImage: boolean;
 	detail: ResultDetail;
+	slot: number;
 };
 
 export type ResultBuckets = {

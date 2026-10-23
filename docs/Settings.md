@@ -14,7 +14,7 @@ Settings are stored in `vision/config.local.json` (gitignored). The unlock passw
 
 - **Test mode**: after a kit IC loads, the operator page asks for an image file instead of reading the camera.
 - **Barcode scan**: whole seconds from 1 to 60. The default is 8. This is the operator countdown.
-- **Part detection**: a region of the frame (`detectRoi`: `x`, `y`, `w`, `h` as fractions from 0 to 1). Detection crops to it. Clear removes it.
+- **Part detection**: up to four regions (`detectRois`, each `x`, `y`, `w`, `h` as fractions from 0 to 1). The Slot dropdown chooses which region the fields edit. Blank leaves the fields idle. An empty slot is skipped. With no slots saved, detection uses the full image. `detectRoi` is slot 1. Save and Clear change only the selected slot.
 - **Barcode**: a region of the frame (`barcodeRoi`: `x`, `y`, `width`, `height` as fractions from 0 to 1). The operator crop uses the same object. With no region, decode uses the full frame. The operator page can also draw this region on the live feed when Settings is unlocked.
 
 ## Inference EP

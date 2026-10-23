@@ -1,8 +1,10 @@
 //! ONNX detection for the operator page.
 //!
-//! `detect_image` reads the latest raw frame. It returns `detections` of
+//! `detect_image` reads the latest raw frame. A test-mode file is the
+//! exception: that call passes the chosen image, and the same letterbox
+//! path runs on those pixels. It returns `detections` of
 //! `{ ic, confidence, bbox }` and the model's `classes`. The overlay draws
-//! those boxes on the preview still, so this command does not encode a JPEG.
+//! those boxes on the still, so this command does not encode a JPEG.
 //! This command reads `.onnx` only. A `.pt` name is a training file; the page warns and does not detect.
 //!
 //! Boxes are checked against Ultralytics `YOLO(best.onnx)`, not `YOLO(best.pt)`.
@@ -13,6 +15,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use base64::Engine as Base64Engine;
+use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -31,6 +35,7 @@ const DEFAULT_IMAGE_SIZE: usize = 640;
 const PAD_VALUE: u8 = 114;
 const INTER_RESIZE_COEF_SCALE: i32 = 2048;
 const MAX_PIXELS: usize = 40_000_000;
+const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 const MODEL_MISSING: &str = "Model is missing.";
 const MODEL_FAILED: &str = "Model failed to load.";
 
@@ -200,15 +205,24 @@ fn confidence_value(document: &Value) -> f32 {
     (number as f32).clamp(MIN_CONFIDENCE, MAX_CONFIDENCE)
 }
 
-fn configured_confidence(root: &Path) -> f32 {
-    local_config::load_document(root)
-        .map(|document| confidence_value(&document))
-        .unwrap_or(DEFAULT_CONFIDENCE)
-}
-
-fn configured_roi(root: &Path) -> Option<Roi> {
-    let document = local_config::load_document(root).ok()?;
-    document.get("detectRoi").and_then(clean_detect_roi)
+/// Saved part-detection regions, slot 1 through 4.
+///
+/// `detectRois` is the list when that key is an array, and a null entry is
+/// skipped. A file that only has `detectRoi` still uses that box as slot 1.
+fn slots_from_document(document: &Value) -> Vec<(i32, Roi)> {
+    if let Some(list) = document.get("detectRois").and_then(Value::as_array) {
+        let mut slots = Vec::new();
+        for (index, item) in list.iter().take(4).enumerate() {
+            if let Some(roi) = clean_detect_roi(item) {
+                slots.push((index as i32 + 1, roi));
+            }
+        }
+        return slots;
+    }
+    match document.get("detectRoi").and_then(clean_detect_roi) {
+        Some(roi) => vec![(1, roi)],
+        None => Vec::new(),
+    }
 }
 
 fn roi_slice(width: usize, height: usize, roi: &Roi) -> (usize, usize, usize, usize) {
@@ -1401,6 +1415,29 @@ fn detect_on_model(
     }))
 }
 
+fn payload_bytes(text: &str) -> Result<Vec<u8>, String> {
+    let text = text.trim();
+    let encoded = if let Some(rest) = text.strip_prefix("data:") {
+        let (_, data) = rest
+            .split_once(',')
+            .ok_or_else(|| "Could not read the image".to_string())?;
+        data
+    } else {
+        text
+    };
+    let compact: String = encoded.chars().filter(|ch| !ch.is_whitespace()).collect();
+    if compact.is_empty() {
+        return Err("Could not read the image".to_string());
+    }
+    let bytes = STANDARD
+        .decode(compact.as_bytes())
+        .map_err(|_| "Could not read the image".to_string())?;
+    if bytes.is_empty() || bytes.len() > MAX_IMAGE_BYTES {
+        return Err("Could not read the image".to_string());
+    }
+    Ok(bytes)
+}
+
 fn raw_rgb(frame: &RawFrame) -> Result<(&[u8], u32, u32), String> {
     if frame.channels != 3 || frame.width == 0 || frame.height == 0 {
         return Err("Could not read the image".to_string());
@@ -1416,10 +1453,7 @@ fn raw_rgb(frame: &RawFrame) -> Result<(&[u8], u32, u32), String> {
     Ok((&frame.data[..expected], frame.width, frame.height))
 }
 
-fn detect_raw(frame: Option<RawFrame>) -> Result<Value, String> {
-    let Some(frame) = frame else {
-        return Ok(failure("No frame"));
-    };
+fn detect_pixels(rgb: &[u8], width: u32, height: u32) -> Result<Value, String> {
     let root = match local_config::project_root() {
         Ok(root) => root,
         Err(message) => return Ok(failure(&message)),
@@ -1428,23 +1462,74 @@ fn detect_raw(frame: Option<RawFrame>) -> Result<Value, String> {
         Ok(path) => path,
         Err(message) => return Ok(failure(&model_status_message(&message))),
     };
+    let document = local_config::load_document(&root).ok();
+    let confidence = document
+        .as_ref()
+        .map(confidence_value)
+        .unwrap_or(DEFAULT_CONFIDENCE);
+    let slots = document
+        .as_ref()
+        .map(slots_from_document)
+        .unwrap_or_default();
+    // No slot is the full frame, in the same object the page already reads.
+    if slots.is_empty() {
+        return match run_model(&path, rgb, width, height, None, confidence) {
+            Ok((detections, classes)) => Ok(json!({
+                "detections": detections,
+                "classes": classes,
+            })),
+            Err(message) => Ok(failure(&model_status_message(&message))),
+        };
+    }
+    let mut rows = Vec::with_capacity(slots.len());
+    for (slot, roi) in slots {
+        match run_model(&path, rgb, width, height, Some(&roi), confidence) {
+            Ok((detections, classes)) => rows.push(json!({
+                "slot": slot,
+                "detections": detections,
+                "classes": classes,
+            })),
+            Err(message) => return Ok(failure(&model_status_message(&message))),
+        }
+    }
+    Ok(Value::Array(rows))
+}
+
+fn detect_raw(frame: Option<RawFrame>) -> Result<Value, String> {
+    let Some(frame) = frame else {
+        return Ok(failure("No frame"));
+    };
     let (rgb, width, height) = match raw_rgb(&frame) {
         Ok(rgb) => rgb,
         Err(message) => return Ok(failure(&message)),
     };
-    let roi = configured_roi(&root);
-    let confidence = configured_confidence(&root);
-    match run_model(&path, rgb, width, height, roi.as_ref(), confidence) {
-        Ok((detections, classes)) => Ok(json!({
-            "detections": detections,
-            "classes": classes,
-        })),
-        Err(message) => Ok(failure(&model_status_message(&message))),
-    }
+    detect_pixels(rgb, width, height)
+}
+
+fn detect_encoded(text: &str) -> Result<Value, String> {
+    let bytes = match payload_bytes(text) {
+        Ok(bytes) => bytes,
+        Err(message) => return Ok(failure(&message)),
+    };
+    let (rgb, width, height) = match decode_rgb(&bytes) {
+        Ok(decoded) => decoded,
+        Err(message) => return Ok(failure(&message)),
+    };
+    detect_pixels(&rgb, width, height)
 }
 
 #[tauri::command]
-pub async fn detect_image(state: tauri::State<'_, FrameState>) -> Result<Value, String> {
+pub async fn detect_image(
+    state: tauri::State<'_, FrameState>,
+    image: Option<String>,
+) -> Result<Value, String> {
+    // Test mode passes the chosen file. A live detect leaves this empty and
+    // uses the raw frame stored by capture_snapshot.
+    if let Some(text) = image.filter(|value| !value.trim().is_empty()) {
+        return tauri::async_runtime::spawn_blocking(move || detect_encoded(&text))
+            .await
+            .map_err(|_| "Detect failed".to_string())?;
+    }
     let frame = {
         let guard = state.latest.lock().unwrap_or_else(|err| err.into_inner());
         guard.clone()
@@ -1856,6 +1941,36 @@ mod tests {
     }
 
     #[test]
+    fn detect_slots_keep_a_single_roi_and_skip_blanks() {
+        assert!(slots_from_document(&json!({})).is_empty());
+        assert!(slots_from_document(&json!({ "detectRoi": null })).is_empty());
+        let one = slots_from_document(&json!({
+            "detectRoi": { "x": 0.1, "y": 0.2, "w": 0.3, "h": 0.4 }
+        }));
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].0, 1);
+        assert_eq!(one[0].1.x, 0.1);
+        let many = slots_from_document(&json!({
+            "detectRois": [
+                { "x": 0.0, "y": 0.0, "w": 0.2, "h": 0.2 },
+                null,
+                { "x": 0.5, "y": 0.5, "w": 0.2, "h": 0.2 },
+                { "x": true, "y": 0.0, "w": 0.2, "h": 0.2 }
+            ],
+            "detectRoi": { "x": 0.0, "y": 0.0, "w": 0.5, "h": 0.5 }
+        }));
+        assert_eq!(
+            many.iter().map(|(slot, _)| *slot).collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        let only_second = slots_from_document(&json!({
+            "detectRois": [null, { "x": 0.2, "y": 0.2, "w": 0.2, "h": 0.2 }, null, null]
+        }));
+        assert_eq!(only_second.len(), 1);
+        assert_eq!(only_second[0].0, 2);
+    }
+
+    #[test]
     fn linear_resize_matches_the_opencv_tiny_golden() {
         let mut src = vec![0u8; 4 * 4 * 3];
         for (index, byte) in src.iter_mut().enumerate() {
@@ -1868,6 +1983,14 @@ mod tests {
                 6, 7, 8, 11, 12, 13, 15, 16, 17, 30, 31, 32, 35, 36, 37, 39, 40, 41
             ]
         );
+    }
+
+    #[test]
+    fn payload_bytes_reads_a_data_url() {
+        let bytes = payload_bytes("data:image/jpeg;base64,AQID").unwrap();
+        assert_eq!(bytes, vec![1, 2, 3]);
+        assert!(payload_bytes("  ").is_err());
+        assert!(payload_bytes("data:image/jpeg;base64,@@@").is_err());
     }
 
     #[test]

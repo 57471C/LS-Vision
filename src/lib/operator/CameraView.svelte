@@ -1,6 +1,7 @@
 <script lang="ts">
 // biome-ignore-all lint/correctness/noUnusedVariables: Biome 2.4 does not treat Svelte template references as uses
 
+import { type DetectRoi, slotColor } from "$lib/detect-rois";
 import {
 	detectionCounts,
 	extraPartCount,
@@ -175,15 +176,46 @@ function detectionMarks(
 	return marks;
 }
 
+function paintedSlots(
+	slots: readonly (DetectRoi | null)[],
+): { slot: number; roi: DetectRoi }[] {
+	const found: { slot: number; roi: DetectRoi }[] = [];
+	slots.forEach((roi, index) => {
+		if (roi) found.push({ slot: index + 1, roi });
+	});
+	return found;
+}
+
 $: bannerParts = $operator.bom?.parts ?? [];
 $: bannerCounts = detectionCounts($operator.detections);
 $: extraParts =
-	$operator.detectState === "done"
-		? extraPartCount(bannerParts, bannerCounts)
-		: 0;
+	$operator.detectState !== "done"
+		? 0
+		: $operator.slotResults.length > 0
+			? $operator.slotResults.reduce((max, slot) => {
+					return Math.max(
+						max,
+						extraPartCount(bannerParts, detectionCounts(slot.detections)),
+					);
+				}, 0)
+			: extraPartCount(bannerParts, bannerCounts);
 $: wrongParts =
 	$operator.detectState === "done" &&
-	hasUnexpected($operator.detections, bannerParts);
+	($operator.slotResults.length > 0
+		? $operator.slotResults.some((slot) =>
+				hasUnexpected(slot.detections, bannerParts),
+			)
+		: hasUnexpected($operator.detections, bannerParts));
+$: draftSlot = slotColor($operator.detectSlot);
+$: draftStyle = $operator.draftMark
+	? `left:${$operator.draftMark.left}px;top:${$operator.draftMark.top}px;width:${$operator.draftMark.width}px;height:${$operator.draftMark.height}px;box-sizing:border-box;border:${
+			$operator.barcodeDrawing
+				? "3px dotted #fde68a"
+				: `3px solid ${draftSlot.bright}`
+		};background:${
+			$operator.barcodeDrawing ? "rgba(253,230,138,0.2)" : draftSlot.fill
+		};box-shadow:0 0 0 1px #0a0a0a;`
+	: "";
 $: bannerCount = (wrongParts ? 1 : 0) + (extraParts > 0 ? 1 : 0);
 </script>
 
@@ -232,46 +264,73 @@ $: bannerCount = (wrongParts ? 1 : 0) + (extraParts > 0 ? 1 : 0);
 						on:load={imageLoaded}
 					/>
 				{/if}
-				{#if ($operator.snapshot || $cameraFeedOn) && $operator.paneWidth > 0 && $operator.paneHeight > 0 && !$operator.drawing && $operator.detectRoi}
-					{@const x = $operator.detectRoi.x * $operator.paneWidth}
-					{@const y = $operator.detectRoi.y * $operator.paneHeight}
-					{@const w = $operator.detectRoi.w * $operator.paneWidth}
-					{@const h = $operator.detectRoi.h * $operator.paneHeight}
-					<svg
-						class="pointer-events-none absolute inset-0 z-10 h-full w-full"
-						viewBox="0 0 {$operator.paneWidth} {$operator.paneHeight}"
-						preserveAspectRatio={$zoom ? "none" : "xMidYMid meet"}
-					>
-						<rect x="0" y="0" width={$operator.paneWidth} height={y} fill="black" fill-opacity="0.45" />
-						<rect
-							x="0"
-							y={y + h}
-							width={$operator.paneWidth}
-							height={$operator.paneHeight - (y + h)}
-							fill="black"
-							fill-opacity="0.45"
-						/>
-						<rect x="0" y={y} width={x} height={h} fill="black" fill-opacity="0.45" />
-						<rect
-							x={x + w}
-							y={y}
-							width={$operator.paneWidth - (x + w)}
-							height={h}
-							fill="black"
-							fill-opacity="0.45"
-						/>
-						<rect
-							x={x}
-							y={y}
-							width={w}
-							height={h}
-							fill="none"
-							stroke="#fde68a"
-							stroke-opacity="0.75"
-							stroke-width="2"
-							vector-effect="non-scaling-stroke"
-						/>
-					</svg>
+				{#if ($operator.snapshot || $cameraFeedOn) && $operator.paneWidth > 0 && $operator.paneHeight > 0}
+					{@const slots = paintedSlots($operator.detectRois)}
+					{#if slots.length > 0}
+						<svg
+							class="pointer-events-none absolute inset-0 z-10 h-full w-full"
+							viewBox="0 0 {$operator.paneWidth} {$operator.paneHeight}"
+							preserveAspectRatio={$zoom ? "none" : "xMidYMid meet"}
+						>
+							{#if slots.length === 1 && $zoom}
+								{@const only = slots[0].roi}
+								{@const x = only.x * $operator.paneWidth}
+								{@const y = only.y * $operator.paneHeight}
+								{@const w = only.w * $operator.paneWidth}
+								{@const h = only.h * $operator.paneHeight}
+								<rect x="0" y="0" width={$operator.paneWidth} height={y} fill="black" fill-opacity="0.45" />
+								<rect
+									x="0"
+									y={y + h}
+									width={$operator.paneWidth}
+									height={$operator.paneHeight - (y + h)}
+									fill="black"
+									fill-opacity="0.45"
+								/>
+								<rect x="0" y={y} width={x} height={h} fill="black" fill-opacity="0.45" />
+								<rect
+									x={x + w}
+									y={y}
+									width={$operator.paneWidth - (x + w)}
+									height={h}
+									fill="black"
+									fill-opacity="0.45"
+								/>
+							{/if}
+							{#each slots as item (item.slot)}
+								{@const x = item.roi.x * $operator.paneWidth}
+								{@const y = item.roi.y * $operator.paneHeight}
+								{@const w = item.roi.w * $operator.paneWidth}
+								{@const h = item.roi.h * $operator.paneHeight}
+								{@const color = slotColor(item.slot)}
+								{@const active = item.slot === $operator.detectSlot}
+								<rect
+									x={x}
+									y={y}
+									width={w}
+									height={h}
+									fill="none"
+									stroke={active ? color.bright : color.stroke}
+									stroke-opacity={active ? 1 : 0.9}
+									stroke-width={active ? 3 : 2}
+									stroke-dasharray={active ? undefined : "6 4"}
+									vector-effect="non-scaling-stroke"
+								/>
+								<rect x={x} y={y} width="18" height="16" fill={color.stroke} />
+								<text
+									x={x + 9}
+									y={y + 12}
+									fill="#0a0a0a"
+									font-size="11"
+									font-family="ui-monospace, monospace"
+									font-weight="700"
+									text-anchor="middle"
+								>
+									{item.slot}
+								</text>
+							{/each}
+						</svg>
+					{/if}
 				{/if}
 				{#if !$operator.snapshot && !$operator.drawing && !$operator.barcodeDrawing && $cameraFeedOn && $operator.paneWidth > 0 && $operator.paneHeight > 0}
 					{@const box = $barcodeOverlay}
@@ -403,21 +462,18 @@ $: bannerCount = (wrongParts ? 1 : 0) + (extraParts > 0 ? 1 : 0);
 		{/if}
 		{#if $operator.snapshot}
 			<div
-				class="pointer-events-none absolute left-3 top-3 z-20 bg-neutral-950/80 {$operator.detectRoi &&
-				!$operator.drawing
+				class="pointer-events-none absolute left-3 top-3 z-20 bg-neutral-950/80 {$zoom
 					? 'px-2 py-1'
 					: 'px-3 py-2'}"
 			>
 				<p
-					class="font-mono font-semibold leading-none text-white {$operator.detectRoi && !$operator.drawing
+					class="font-mono font-semibold leading-none text-white {$zoom
 						? 'text-sm'
 						: 'text-3xl'}"
 				>
 					{$operator.snapshot.kitCode}
 				</p>
-				<p
-					class="mt-1 text-neutral-300 {$operator.detectRoi && !$operator.drawing ? 'text-[11px]' : 'text-sm'}"
-				>
+				<p class="mt-1 text-neutral-300 {$zoom ? 'text-[11px]' : 'text-sm'}">
 					Taken {$operator.snapshot.takenAt}
 				</p>
 			</div>
@@ -463,13 +519,10 @@ $: bannerCount = (wrongParts ? 1 : 0) + (extraParts > 0 ? 1 : 0);
 			<p class="pointer-events-none absolute left-3 top-3 z-40 bg-neutral-950/80 px-3 py-2 text-sm text-amber-200">
 				{$operator.barcodeDrawing
 					? "Drag a rectangle on the camera."
-					: "Drag a rectangle on the snapshot."}
+					: `Drag a rectangle for slot ${$operator.detectSlot}.`}
 			</p>
 			{#if $operator.draftMark}
-				<div
-					class="pointer-events-none absolute z-50"
-					style="left:{$operator.draftMark.left}px;top:{$operator.draftMark.top}px;width:{$operator.draftMark.width}px;height:{$operator.draftMark.height}px;box-sizing:border-box;border:3px dotted #fde68a;background:rgba(253,230,138,0.2);box-shadow:0 0 0 1px #0a0a0a;"
-				></div>
+				<div class="pointer-events-none absolute z-50" style={draftStyle}></div>
 			{/if}
 		{/if}
 	</div>

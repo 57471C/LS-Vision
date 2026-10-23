@@ -1,6 +1,13 @@
 import { getContext, setContext } from "svelte";
 import { derived, type Readable, type Writable } from "svelte/store";
+import {
+	type DetectRoi,
+	emptyDetectRois,
+	soleDetectRoi,
+} from "$lib/detect-rois";
 import type { ConsoleLine } from "$lib/operator/console";
+
+export type { DetectRoi };
 
 export type Part = { ic: string; des: string; qty: number };
 
@@ -25,13 +32,6 @@ export type SnapshotView = {
 	detected?: boolean;
 };
 
-export type DetectRoi = {
-	x: number;
-	y: number;
-	w: number;
-	h: number;
-};
-
 export type BarcodeRoi = {
 	x: number;
 	y: number;
@@ -46,6 +46,11 @@ export type Detection = {
 	bbox: number[];
 	// Set when a matching part rule used this box as its child.
 	consumed?: boolean;
+};
+
+export type SlotDetections = {
+	slot: number;
+	detections: Detection[];
 };
 
 export type BomView = {
@@ -92,6 +97,9 @@ export type OperatorState = {
 	testMode: boolean;
 	admin: boolean;
 	detectRoi: DetectRoi | null;
+	detectRois: (DetectRoi | null)[];
+	detectSlot: number;
+	slotResults: SlotDetections[];
 	barcodeRoi: BarcodeRoi | null;
 	draftMark: DraftMark | null;
 	drawing: boolean;
@@ -144,6 +152,9 @@ export function initialOperator(): OperatorState {
 		testMode: false,
 		admin: false,
 		detectRoi: null,
+		detectRois: emptyDetectRois(),
+		detectSlot: 0,
+		slotResults: [],
 		barcodeRoi: null,
 		draftMark: null,
 		drawing: false,
@@ -179,13 +190,15 @@ export function initialOperator(): OperatorState {
 
 function zoomFrame(
 	drawing: boolean,
-	detectRoi: DetectRoi | null,
+	detectRois: readonly (DetectRoi | null)[],
 	paneWidth: number,
 	paneHeight: number,
 	frameWidth: number,
 	frameHeight: number,
 ): ZoomFrame | null {
 	// While drawing, keep the whole still so the new box can start anywhere.
+	// More than one saved slot stays on the full frame so every box is visible.
+	const detectRoi = soleDetectRoi(detectRois);
 	if (drawing || !detectRoi) return null;
 	if (paneWidth < 1 || paneHeight < 1 || frameWidth < 1 || frameHeight < 1)
 		return null;
@@ -247,6 +260,7 @@ export type OperatorSession = {
 	toggleFeed: () => void;
 	beginSetRoi: () => void;
 	clearDetectRoi: () => void;
+	setDetectSlot: (slot: number) => void;
 	beginSetBarcodeRoi: () => void;
 	clearBarcodeRoi: () => void;
 	openErp: () => Promise<void>;
@@ -297,7 +311,7 @@ export function createOperatorViews(operator: Writable<OperatorState>) {
 	const zoom = derived(operator, (state) =>
 		zoomFrame(
 			state.drawing,
-			state.detectRoi,
+			state.detectRois,
 			state.paneWidth,
 			state.paneHeight,
 			state.frameWidth,
