@@ -191,7 +191,8 @@ fn default_config() -> Value {
             "baseUrl": "",
             "path": "",
             "key": "",
-            "descriptionPath": "/VisionAppApi/ListInventoryDescription"
+            "descriptionPath": "/VisionAppApi/ListInventoryDescription",
+            "resultsPath": ""
         },
         "erp": {
             "name": "",

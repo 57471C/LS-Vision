@@ -18,7 +18,6 @@ const SAMPLE_BOM: &str = "sample-bom.json";
 const API_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
-const TIMEOUT_MESSAGE: &str = "The BoM API did not respond in time.";
 
 #[tauri::command]
 pub fn load_bom_json() -> Result<Value, String> {
@@ -227,12 +226,16 @@ fn is_timeout(err: &std::io::Error) -> bool {
     )
 }
 
-fn map_io(err: std::io::Error, key: &str) -> String {
+fn timeout_message(service: &str) -> String {
+    format!("The {service} did not respond in time.")
+}
+
+fn map_io(err: std::io::Error, key: &str, service: &str) -> String {
     if is_timeout(&err) {
-        return TIMEOUT_MESSAGE.to_string();
+        return timeout_message(service);
     }
     if err.kind() == std::io::ErrorKind::UnexpectedEof {
-        return "Could not reach the BoM API. The connection closed before a response.".to_string();
+        return format!("Could not reach the {service}. The connection closed before a response.");
     }
     let text = scrub(&err.to_string(), key);
     let text = if text.trim().is_empty() {
@@ -240,16 +243,16 @@ fn map_io(err: std::io::Error, key: &str) -> String {
     } else {
         text
     };
-    format!("Could not reach the BoM API. {text}")
+    format!("Could not reach the {service}. {text}")
 }
 
-fn map_tls(err: &native_tls::Error, key: &str) -> String {
+fn map_tls(err: &native_tls::Error, key: &str, service: &str) -> String {
     let mut source = err.source();
     while let Some(item) = source {
         if let Some(io_err) = item.downcast_ref::<std::io::Error>()
             && is_timeout(io_err)
         {
-            return TIMEOUT_MESSAGE.to_string();
+            return timeout_message(service);
         }
         source = item.source();
     }
@@ -259,7 +262,7 @@ fn map_tls(err: &native_tls::Error, key: &str) -> String {
     } else {
         text
     };
-    format!("Could not reach the BoM API. {text}")
+    format!("Could not reach the {service}. {text}")
 }
 
 enum ReadFail {
@@ -269,16 +272,16 @@ enum ReadFail {
     TooLarge,
 }
 
-fn map_read(err: ReadFail, key: &str) -> String {
+fn map_read(err: ReadFail, key: &str, service: &str) -> String {
     match err {
-        ReadFail::Io(err) => map_io(err, key),
+        ReadFail::Io(err) => map_io(err, key, service),
         ReadFail::Closed => {
-            "Could not reach the BoM API. The connection closed before a response.".to_string()
+            format!("Could not reach the {service}. The connection closed before a response.")
         }
         ReadFail::Invalid => {
-            "Could not reach the BoM API. The response was not valid HTTP.".to_string()
+            format!("Could not reach the {service}. The response was not valid HTTP.")
         }
-        ReadFail::TooLarge => "BoM API response is too large.".to_string(),
+        ReadFail::TooLarge => format!("{service} response is too large."),
     }
 }
 
@@ -492,34 +495,41 @@ fn write_and_read<S: Read + Write>(
     url: &Url,
     key: &str,
     body: &[u8],
+    service: &str,
 ) -> Result<RawHttp, String> {
     stream
         .write_all(&build_request(url, key, body))
-        .map_err(|err| map_io(err, key))?;
-    stream.flush().map_err(|err| map_io(err, key))?;
-    read_response(stream).map_err(|err| map_read(err, key))
+        .map_err(|err| map_io(err, key, service))?;
+    stream.flush().map_err(|err| map_io(err, key, service))?;
+    read_response(stream).map_err(|err| map_read(err, key, service))
 }
 
-fn exchange(url: &Url, key: &str, body: &[u8], timeout: Duration) -> Result<RawHttp, String> {
-    let tcp = connect_tcp(url, timeout).map_err(|err| map_io(err, key))?;
+fn exchange(
+    url: &Url,
+    key: &str,
+    body: &[u8],
+    timeout: Duration,
+    service: &str,
+) -> Result<RawHttp, String> {
+    let tcp = connect_tcp(url, timeout).map_err(|err| map_io(err, key, service))?;
     tcp.set_read_timeout(Some(timeout))
-        .map_err(|err| map_io(err, key))?;
+        .map_err(|err| map_io(err, key, service))?;
     tcp.set_write_timeout(Some(timeout))
-        .map_err(|err| map_io(err, key))?;
+        .map_err(|err| map_io(err, key, service))?;
     let _ = tcp.set_nodelay(true);
     if url.scheme() == "https" {
         let connector = native_tls::TlsConnector::builder()
             .build()
-            .map_err(|err| map_tls(&err, key))?;
+            .map_err(|err| map_tls(&err, key, service))?;
         let host = url.host_str().unwrap_or("");
         let mut tls = connector.connect(host, tcp).map_err(|err| match err {
-            native_tls::HandshakeError::WouldBlock(_) => TIMEOUT_MESSAGE.to_string(),
-            native_tls::HandshakeError::Failure(err) => map_tls(&err, key),
+            native_tls::HandshakeError::WouldBlock(_) => timeout_message(service),
+            native_tls::HandshakeError::Failure(err) => map_tls(&err, key, service),
         })?;
-        write_and_read(&mut tls, url, key, body)
+        write_and_read(&mut tls, url, key, body, service)
     } else {
         let mut tcp = tcp;
-        write_and_read(&mut tcp, url, key, body)
+        write_and_read(&mut tcp, url, key, body, service)
     }
 }
 
@@ -537,7 +547,7 @@ fn post_job_card(config: &Value, job_card: &str, timeout: Duration) -> Result<Va
     let url = validated_endpoint(&base_url, &path)?;
     let body = serde_json::to_vec(&serde_json::json!({ "jobCardNumber": number }))
         .map_err(|_| "BoM API lookup failed.".to_string())?;
-    let response = exchange(&url, &key, &body, timeout)?;
+    let response = exchange(&url, &key, &body, timeout, "BoM API")?;
     // A 3xx is returned as that status. The key is not sent to another host.
     interpret(response.status, &response.body, &key)
 }
@@ -733,10 +743,47 @@ fn post_descriptions(
     }
     let body = serde_json::to_vec(&serde_json::json!({ "icList": codes }))
         .map_err(|_| "Could not load inventory descriptions.".to_string())?;
-    let response = exchange(&url, &key, &body, timeout)
+    let response = exchange(&url, &key, &body, timeout, "BoM API")
         .map_err(|err| format!("Could not load inventory descriptions. {err}"))?;
     let items = interpret_descriptions(response.status, &response.body, &key)?;
     Ok(serde_json::json!({ "items": items }))
+}
+
+/// POST `api[path_key]` with the saved base URL and API key.
+/// An empty path does not connect. Success is any HTTP 2xx. This does not update a row.
+pub(crate) fn post_api_path(
+    config: &Value,
+    path_key: &str,
+    body: &[u8],
+    timeout: Duration,
+) -> Result<(), String> {
+    let path = api_text(config, path_key);
+    if path.is_empty() {
+        return Ok(());
+    }
+    let key = api_text(config, "key");
+    if key.is_empty() {
+        return Err("API key is not set. Add it in Settings.".to_string());
+    }
+    if !header_safe(&key) {
+        return Err(
+            "Could not reach the results API. The API key is not a single line.".to_string(),
+        );
+    }
+    let base_url = api_text(config, "baseUrl");
+    let url = validated_endpoint(&base_url, &path)?;
+    let response = exchange(&url, &key, body, timeout, "results API")?;
+    if (200..300).contains(&response.status) {
+        return Ok(());
+    }
+    let detail = error_detail(&response.body, &key);
+    if detail.is_empty() {
+        return Err(format!("Results API returned HTTP {}.", response.status));
+    }
+    Err(format!(
+        "Results API returned HTTP {}. {detail}",
+        response.status
+    ))
 }
 
 #[cfg(test)]
@@ -1008,7 +1055,7 @@ mod tests {
             Duration::from_millis(200),
         )
         .unwrap_err();
-        assert_eq!(err, TIMEOUT_MESSAGE);
+        assert_eq!(err, "The BoM API did not respond in time.");
     }
 
     #[test]
@@ -1019,6 +1066,7 @@ mod tests {
                 "connection failed test-key",
             ),
             "test-key",
+            "BoM API",
         );
         assert_eq!(
             err,
@@ -1190,5 +1238,91 @@ mod tests {
         assert!(err.contains("HTTP 500"), "{err}");
         assert!(err.contains("denied"), "{err}");
         assert!(!err.contains("test-key"), "{err}");
+    }
+
+    fn results_config(base: &str, path: &str) -> Value {
+        serde_json::json!({
+            "api": {
+                "baseUrl": base,
+                "path": "/GetBoltBagParts",
+                "key": "secret-key",
+                "resultsPath": path
+            }
+        })
+    }
+
+    #[test]
+    fn a_blank_results_path_does_not_connect() {
+        post_api_path(
+            &results_config("http://127.0.0.1:9", ""),
+            "resultsPath",
+            b"{}",
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        post_api_path(
+            &results_config("http://127.0.0.1:9", "   "),
+            "resultsPath",
+            b"{}",
+            Duration::from_secs(2),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn results_post_uses_the_results_path_and_accepts_created() {
+        let (port, received) = spawn_server(http_response(201, "Created", "", ""));
+        let payload = br#"{"jobCard":"17834402","passed":false,"kitIc":"6PBBK001"}"#;
+        post_api_path(
+            &results_config(
+                &format!("http://127.0.0.1:{port}"),
+                "/VisionAppApi/SubmitResult",
+            ),
+            "resultsPath",
+            payload,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let bytes = received.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(contains_bytes(
+            &bytes,
+            b"POST /VisionAppApi/SubmitResult HTTP/1.1\r\n"
+        ));
+        assert!(contains_bytes(&bytes, b"X-Api-Key: secret-key\r\n"));
+        assert!(contains_bytes(&bytes, payload));
+        assert!(!contains_bytes(&bytes, b"GetBoltBagParts"));
+        assert!(!contains_bytes(&bytes, b"jobCardNumber"));
+
+        let (port, _) = spawn_server(http_response(204, "No Content", "", ""));
+        post_api_path(
+            &results_config(&format!("http://127.0.0.1:{port}"), "/submit"),
+            "resultsPath",
+            b"{}",
+            Duration::from_secs(2),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn results_post_reports_http_errors_and_scrubs_the_key() {
+        let (port, _) = spawn_server(http_response(
+            500,
+            "Error",
+            "",
+            r#"{"message":"nope secret-key"}"#,
+        ));
+        let err = post_api_path(
+            &results_config(
+                &format!("http://127.0.0.1:{port}"),
+                "/VisionAppApi/SubmitResult",
+            ),
+            "resultsPath",
+            b"{}",
+            Duration::from_secs(2),
+        )
+        .unwrap_err();
+        assert_eq!(err, "Results API returned HTTP 500. nope ********");
+        assert!(!err.contains("secret-key"));
+        assert!(!err.contains("BoM API"));
     }
 }

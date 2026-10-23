@@ -56,6 +56,7 @@ pub fn run() {
             inference_ep::inference_status,
             inference_ep::set_inference_ep,
             results::save_result,
+            results::post_inspection_result,
             results::list_results,
             results::delete_result,
             results::result_image

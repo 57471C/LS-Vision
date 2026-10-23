@@ -50,6 +50,7 @@ let apiBaseUrl = "";
 let apiPath = "";
 let apiKey = "";
 let apiDescriptionPath = DEFAULT_DESCRIPTION_PATH;
+let resultsPath = "";
 let notice = "";
 let saving = false;
 let erpName = "";
@@ -230,12 +231,16 @@ function readSource(value: unknown): BomSource {
 
 function readApi(value: unknown) {
 	apiDescriptionPath = DEFAULT_DESCRIPTION_PATH;
-	if (!value || typeof value !== "object") return;
+	if (!value || typeof value !== "object") {
+		resultsPath = "";
+		return;
+	}
 	const api = value as {
 		baseUrl?: unknown;
 		path?: unknown;
 		key?: unknown;
 		descriptionPath?: unknown;
+		resultsPath?: unknown;
 	};
 	if (typeof api.baseUrl === "string") apiBaseUrl = api.baseUrl;
 	if (typeof api.path === "string") apiPath = api.path;
@@ -244,6 +249,7 @@ function readApi(value: unknown) {
 		apiDescriptionPath =
 			typeof api.descriptionPath === "string" ? api.descriptionPath : "";
 	}
+	resultsPath = typeof api.resultsPath === "string" ? api.resultsPath : "";
 }
 
 function descriptionPathError(value: string): string {
@@ -251,6 +257,15 @@ function descriptionPathError(value: string): string {
 	if (!path) return "";
 	if (path.length > 200 || /\s/.test(path) || path.includes("://")) {
 		return "Enter a path such as /VisionAppApi/ListInventoryDescription.";
+	}
+	return "";
+}
+
+function resultsPathError(value: string): string {
+	const path = value.trim();
+	if (!path) return "";
+	if (path.length > 200 || /\s/.test(path) || path.includes("://")) {
+		return "Enter a path such as /VisionAppApi/SubmitResult.";
 	}
 	return "";
 }
@@ -1063,6 +1078,11 @@ async function saveSource() {
 			"Username and password are required for SQL Server Authentication.";
 		return;
 	}
+	const resultsProblem = resultsPathError(resultsPath);
+	if (resultsProblem) {
+		notice = resultsProblem;
+		return;
+	}
 	if (source === "api") {
 		const problem = apiBaseUrlError(apiBaseUrl);
 		if (problem) {
@@ -1087,6 +1107,12 @@ async function saveSource() {
 				? (current.mssql as Record<string, unknown>)
 				: {};
 		const driver = stringField(mssqlCurrent.driver).trim();
+		const apiCurrent =
+			current.api &&
+			typeof current.api === "object" &&
+			!Array.isArray(current.api)
+				? (current.api as Record<string, unknown>)
+				: {};
 		const saved = await invokeRust<BomDocument>("save_local_config", {
 			config: {
 				...current,
@@ -1101,10 +1127,12 @@ async function saveSource() {
 					password: auth === "windows" ? "" : mssqlPassword,
 				},
 				api: {
+					...apiCurrent,
 					baseUrl: apiBaseUrl.trim(),
 					path: apiPath.trim(),
 					key: apiKey.trim(),
 					descriptionPath: apiDescriptionPath.trim(),
+					resultsPath: resultsPath.trim(),
 				},
 			},
 		});
@@ -3212,6 +3240,20 @@ onDestroy(() => {
 							</label>
 							<p class="text-sm text-neutral-400">
 								Optional. Unexpected codes are posted to this path on the API base URL, with the API key. The description is shown on the Not in BoM list. Leave blank to show the code only.
+							</p>
+
+							<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+								Results endpoint
+								<input
+									id="results-endpoint"
+									class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
+									bind:value={resultsPath}
+									autocomplete="off"
+									placeholder="/VisionAppApi/SubmitResult"
+								/>
+							</label>
+							<p class="text-sm text-neutral-400">
+								Optional. Each saved inspection is posted here with the API base URL and API key. Leave blank to keep the result on this PC only.
 							</p>
 
 							<div class="flex flex-wrap items-center gap-2">
