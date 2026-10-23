@@ -9,10 +9,14 @@ import { tick } from "svelte";
 import { get, writable } from "svelte/store";
 import { activateCamera, readDisplayFps } from "$lib/camera-settings";
 import {
+	compactClearedSlot,
 	detectSlotNumber,
 	panelsForSlots,
 	parseDetectRoi,
 	parseDetectRois,
+	reindexSlotResults,
+	withAllSlotsDisabled,
+	withSlotEnabled,
 } from "$lib/detect-rois";
 import {
 	appendConsoleLine,
@@ -636,12 +640,18 @@ function attachSession(
 		};
 	}
 
-	async function runDetect(generation: number, image?: string) {
+	async function runDetect(
+		generation: number,
+		image?: string,
+		keepPanels = false,
+	) {
 		if (generation !== detectGeneration) return;
 		const viewAtStart = op.result;
 		op.detectState = "running";
-		op.detections = [];
-		op.slotResults = [];
+		if (!keepPanels) {
+			op.detections = [];
+			op.slotResults = [];
+		}
 		op.partDescriptions = {};
 		op.detectMessage = "";
 		try {
@@ -1581,6 +1591,7 @@ function attachSession(
 			y: Math.min(start.y, end.y),
 			w: Math.abs(end.x - start.x),
 			h: Math.abs(end.y - start.y),
+			enabled: true,
 		};
 	}
 
@@ -1641,6 +1652,7 @@ function attachSession(
 			y: round(roi.y),
 			w: round(roi.w),
 			h: round(roi.h),
+			enabled: roi.enabled !== false,
 		};
 	}
 
@@ -1657,17 +1669,24 @@ function attachSession(
 		try {
 			const config = await invoke<Record<string, unknown>>("load_local_config");
 			const slots = parseDetectRois(config.detectRois, config.detectRoi);
-			const next = roi ? roundRoi(roi) : null;
-			slots[slot - 1] = next;
-			config.detectRois = slots;
-			config.detectRoi = slots[0];
+			const previous = slots[slot - 1];
+			const next = roi
+				? { ...roundRoi(roi), enabled: previous?.enabled ?? true }
+				: null;
+			const stored =
+				next === null
+					? compactClearedSlot(slots, slot)
+					: slots.map((item, index) => (index === slot - 1 ? next : item));
+			config.detectRois = stored;
+			config.detectRoi = stored[0];
 			await invoke("save_local_config", { config });
-			applyDetectRois(slots.map((item) => asRoi(item)));
+			applyDetectRois(stored.map((item) => asRoi(item)));
+			if (next === null) applyClearedSlotResults(slot);
 			op.draftMark = null;
 			op.drawing = false;
 			roiDrag = null;
 			op.roiMessage = next ? `Saved slot ${slot}.` : `Cleared slot ${slot}.`;
-			rerunDetect();
+			rerunDetect(next === null);
 		} catch (err: unknown) {
 			op.roiMessage = errorMessage(err, "Could not save the ROI");
 		} finally {
@@ -1680,6 +1699,42 @@ function attachSession(
 		if (detectSlotNumber(op.detectSlot) === null) return;
 		cancelRoiDraw();
 		void saveDetectRoi(null);
+	}
+
+	let detectRoiWrite: Promise<void> = Promise.resolve();
+
+	function queueDetectRoiWrite(slots: (DetectRoi | null)[]) {
+		const snapshot = slots.map((item) => (item ? { ...item } : null));
+		const run = async () => {
+			try {
+				const config = await invoke<Record<string, unknown>>("load_local_config");
+				config.detectRois = snapshot;
+				config.detectRoi = snapshot[0];
+				await invoke("save_local_config", { config });
+			} catch (err: unknown) {
+				op.roiMessage = errorMessage(err, "Could not save the slot");
+				await loadDetectRoi();
+			}
+		};
+		detectRoiWrite = detectRoiWrite.then(run, run);
+	}
+
+	function toggleDetectSlot(slot: number) {
+		if (op.admin) return;
+		const index = slot - 1;
+		const roi = op.detectRois[index];
+		if (!roi) return;
+		const stored = withSlotEnabled(op.detectRois, slot, !roi.enabled);
+		applyDetectRois(stored);
+		queueDetectRoiWrite(stored);
+	}
+
+	function disableAllDetectSlots() {
+		if (op.admin) return;
+		if (!op.detectRois.some((roi) => roi?.enabled)) return;
+		const stored = withAllSlotsDisabled(op.detectRois);
+		applyDetectRois(stored);
+		queueDetectRoiWrite(stored);
 	}
 
 	async function loadBarcodeRoi() {
@@ -1753,11 +1808,31 @@ function attachSession(
 		void saveBarcodeRoi(null);
 	}
 
-	function rerunDetect() {
+	function applyClearedSlotResults(clearedSlot: number) {
+		if (op.slotResults.length === 0) {
+			if (!op.detectRois.some((roi) => roi !== null)) op.detections = [];
+			return;
+		}
+		const remaining = reindexSlotResults(op.slotResults, clearedSlot);
+		if (remaining.length === 0) {
+			op.slotResults = [];
+			op.detections = [];
+			return;
+		}
+		if (remaining.length === 1) {
+			op.slotResults = [];
+			op.detections = remaining[0].detections;
+			return;
+		}
+		op.slotResults = remaining;
+		op.detections = remaining.flatMap((panel) => panel.detections);
+	}
+
+	function rerunDetect(keepPanels = false) {
 		if (!op.snapshot?.source || !pageAlive) return;
 		detectGeneration += 1;
 		const generation = detectGeneration;
-		void runDetect(generation);
+		void runDetect(generation, undefined, keepPanels);
 	}
 
 	function chooseImageFile(): Promise<File | null> {
@@ -1846,6 +1921,33 @@ function attachSession(
 		else if (event.key === "Escape" && op.drawing) cancelRoiDraw();
 		else if (event.key === "Escape" && op.modelMenuOpen) closeModelMenu();
 		else if (event.key === "Escape" && op.barcodeDrawing) cancelBarcodeDraw();
+		else if (!op.admin && !op.erpOpen) onSlotKey(event);
+	}
+
+	function typingTarget(target: EventTarget | null): boolean {
+		if (!(target instanceof HTMLElement)) return false;
+		const tag = target.tagName;
+		return (
+			tag === "INPUT" ||
+			tag === "TEXTAREA" ||
+			tag === "SELECT" ||
+			target.isContentEditable
+		);
+	}
+
+	function onSlotKey(event: KeyboardEvent) {
+		if (event.repeat || event.ctrlKey || event.metaKey || event.altKey) return;
+		if (typingTarget(event.target)) return;
+		if (event.key === "`") {
+			event.preventDefault();
+			disableAllDetectSlots();
+			return;
+		}
+		if (event.key < "1" || event.key > "4") return;
+		const slot = Number(event.key);
+		if (!op.detectRois[slot - 1]) return;
+		event.preventDefault();
+		toggleDetectSlot(slot);
 	}
 
 	function onIframeError() {
@@ -2217,6 +2319,7 @@ function attachSession(
 		beginSetRoi,
 		clearDetectRoi,
 		setDetectSlot,
+		toggleDetectSlot,
 		beginSetBarcodeRoi,
 		clearBarcodeRoi,
 		openErp,

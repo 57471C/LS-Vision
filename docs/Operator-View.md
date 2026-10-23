@@ -13,7 +13,9 @@ The main screen used on the bench.
 
 - With Test mode off, the countdown reads a full-resolution raw frame (`capture_snapshot`) when it reaches 0. That still is a separate camera handle, so the preview canvas keeps drawing through the capture.
 - Rust crops that frame to the saved barcode ROI when one is set. The page first tries the native detector and ZXing on the preview JPEG, then Rust (`decode_barcode`, QR and Code 39). A crop whose long edge is over 1920 pixels is halved until it fits, and that smaller image is read first. One trailing slash is removed.
-- A code that matches the BoM holds the current preview JPEG over the canvas and runs detection on the raw frame. Boxes and IC labels are drawn on top of that preview. The preview slot was not cleared by the snapshot.
+- A code that matches the BoM holds the current preview JPEG over the canvas and runs detection on the raw frame. Boxes and IC labels are drawn on top of that preview. When more than one detect slot returned boxes, every slot is drawn, coloured and tagged with that slot number. One slot keeps the usual part colours. The preview slot was not cleared by the snapshot.
+- Clear ROI removes the selected slot and packs the remaining regions to the front. The slot outlines and the result panels use that numbering at once. With no slots left, detection uses the full frame.
+- While Settings is locked, four squares sit beside Camera when at least one slot has a box. With no saved slot, the squares stay hidden. Grey has no box and does not click, and the pointer stays a normal arrow. Green is on. Red is off. Keys 1–4 toggle a saved slot. Backtick turns every saved slot off. The choice is saved immediately and the next inspection uses it. Detection runs only on slots that are on. When every saved slot is off, the region outlines stay hidden and detection does not use the full frame. Those squares do not move or resize a box.
 - **Decode QR / Barcode** uses the same decode path on demand.
 - A miss, or a code that is not in the BoM, leaves the live view in place.
 

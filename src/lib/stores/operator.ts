@@ -199,7 +199,7 @@ function zoomFrame(
 	// While drawing, keep the whole still so the new box can start anywhere.
 	// More than one saved slot stays on the full frame so every box is visible.
 	const detectRoi = soleDetectRoi(detectRois);
-	if (drawing || !detectRoi) return null;
+	if (drawing || !detectRoi || !detectRoi.enabled) return null;
 	if (paneWidth < 1 || paneHeight < 1 || frameWidth < 1 || frameHeight < 1)
 		return null;
 	const roiW = detectRoi.w * paneWidth;
@@ -261,6 +261,7 @@ export type OperatorSession = {
 	beginSetRoi: () => void;
 	clearDetectRoi: () => void;
 	setDetectSlot: (slot: number) => void;
+	toggleDetectSlot: (slot: number) => void;
 	beginSetBarcodeRoi: () => void;
 	clearBarcodeRoi: () => void;
 	openErp: () => Promise<void>;

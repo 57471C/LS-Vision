@@ -1,7 +1,7 @@
 <script lang="ts">
 // biome-ignore-all lint/correctness/noUnusedVariables: Biome 2.4 does not treat Svelte template references as uses
 
-import { type DetectRoi, slotColor } from "$lib/detect-rois";
+import { type DetectRoi, overlayDetections, slotColor } from "$lib/detect-rois";
 import {
 	detectionCounts,
 	extraPartCount,
@@ -20,6 +20,7 @@ const {
 	refs,
 	rememberPaneSize,
 	resumeLiveFeed,
+	toggleDetectSlot,
 	zoom,
 } = useOperator();
 
@@ -35,6 +36,7 @@ type Detection = {
 	confidence: number;
 	bbox: number[];
 	consumed?: boolean;
+	slot?: number;
 };
 
 type DetectionMark = {
@@ -51,6 +53,7 @@ type DetectionMark = {
 	labelH: number;
 	unexpected: boolean;
 	child: boolean;
+	slot?: number;
 };
 
 // OpenCV stored these as BGR.
@@ -153,10 +156,12 @@ function detectionMarks(
 			labelX = Math.max(originX, imageRight - labelW);
 		if (labelY + labelH > imageBottom)
 			labelY = Math.max(originY, imageBottom - labelH);
+		const tint = item.slot ? slotColor(item.slot).stroke : "";
 		marks.push({
-			key: `${index}:${item.ic}:${x1}:${y1}`,
+			key: `${item.slot ?? 0}:${index}:${item.ic}:${x1}:${y1}`,
 			ic: item.ic,
-			color: colorForIc(item.ic),
+			color: tint || colorForIc(item.ic),
+			slot: item.slot,
 			x,
 			y,
 			w,
@@ -176,6 +181,12 @@ function detectionMarks(
 	return marks;
 }
 
+function slotSquareClass(roi: DetectRoi | null): string {
+	if (!roi) return "border-neutral-700 bg-neutral-800 text-neutral-500";
+	if (roi.enabled) return "border-green-400 bg-green-500 text-neutral-950";
+	return "border-red-500 bg-red-600 text-white";
+}
+
 function paintedSlots(
 	slots: readonly (DetectRoi | null)[],
 ): { slot: number; roi: DetectRoi }[] {
@@ -183,10 +194,16 @@ function paintedSlots(
 	slots.forEach((roi, index) => {
 		if (roi) found.push({ slot: index + 1, roi });
 	});
+	// Every saved slot is off, so the outlines stay hidden.
+	if (found.length > 0 && found.every((item) => !item.roi.enabled)) return [];
 	return found;
 }
 
 $: bannerParts = $operator.bom?.parts ?? [];
+$: overlayBoxes = overlayDetections(
+	$operator.detections,
+	$operator.slotResults,
+);
 $: bannerCounts = detectionCounts($operator.detections);
 $: extraParts =
 	$operator.detectState !== "done"
@@ -221,9 +238,36 @@ $: bannerCount = (wrongParts ? 1 : 0) + (extraParts > 0 ? 1 : 0);
 
 <section class="flex min-h-0 min-w-0 flex-col overflow-hidden border border-neutral-700 bg-black">
 	<div class="flex shrink-0 items-center justify-between border-b border-neutral-800 px-3 py-1.5">
-		<h2 class="text-[11px] font-semibold uppercase tracking-widest text-neutral-500">
-			{$operator.snapshot ? "Snapshot" : "Camera"}
-		</h2>
+		<div class="flex items-center gap-2">
+			<h2 class="text-[11px] font-semibold uppercase tracking-widest text-neutral-500">
+				{$operator.snapshot ? "Snapshot" : "Camera"}
+			</h2>
+			{#if !$operator.admin && $operator.detectRois.some((roi) => roi)}
+				<div class="flex items-center gap-1" role="group" aria-label="Detect slots">
+					{#each [1, 2, 3, 4] as slot (slot)}
+						{@const box = $operator.detectRois[slot - 1]}
+						{#if box}
+							<button
+								type="button"
+								class="inline-flex h-6 w-6 cursor-pointer items-center justify-center border text-[11px] font-semibold {slotSquareClass(box)}"
+								aria-pressed={box.enabled}
+								aria-label="Slot {slot}"
+								on:click={() => toggleDetectSlot(slot)}
+							>
+								{slot}
+							</button>
+						{:else}
+							<span
+								class="inline-flex h-6 w-6 cursor-default items-center justify-center border border-neutral-700 bg-neutral-800 text-[11px] font-semibold text-neutral-500"
+								aria-hidden="true"
+							>
+								{slot}
+							</span>
+						{/if}
+					{/each}
+				</div>
+			{/if}
+		</div>
 		{#if $operator.roiMessage}
 			<p class="text-xs text-amber-200">{$operator.roiMessage}</p>
 		{:else if $operator.snapshot}
@@ -353,8 +397,8 @@ $: bannerCount = (wrongParts ? 1 : 0) + (extraParts > 0 ? 1 : 0);
 						</svg>
 					{/if}
 				{/if}
-				{#if $operator.snapshot && $operator.paneWidth > 0 && $operator.paneHeight > 0 && $operator.detections.length > 0}
-					{@const marks = detectionMarks($operator.snapshot, $operator.paneWidth, $operator.paneHeight, $operator.frameWidth, $operator.frameHeight, $operator.detections, $zoom, $operator.bom?.parts ?? null, $operator.admin)}
+				{#if $operator.snapshot && $operator.paneWidth > 0 && $operator.paneHeight > 0 && overlayBoxes.length > 0}
+					{@const marks = detectionMarks($operator.snapshot, $operator.paneWidth, $operator.paneHeight, $operator.frameWidth, $operator.frameHeight, overlayBoxes, $zoom, $operator.bom?.parts ?? null, $operator.admin)}
 					{@const viewW = $zoom ? $zoom.width : $operator.frameWidth}
 					{@const viewH = $zoom ? $zoom.height : $operator.frameHeight}
 					{#if marks.length > 0 && viewW > 0 && viewH > 0}
@@ -437,6 +481,26 @@ $: bannerCount = (wrongParts ? 1 : 0) + (extraParts > 0 ? 1 : 0);
 										dominant-baseline="central"
 									>
 										{mark.ic}
+									</text>
+								{/if}
+								{#if mark.slot}
+									<rect
+										x={mark.x}
+										y={mark.y}
+										width="14"
+										height="14"
+										fill={slotColor(mark.slot).stroke}
+									/>
+									<text
+										x={mark.x + 7}
+										y={mark.y + 11}
+										fill="#0a0a0a"
+										font-size="10"
+										font-family="ui-monospace, monospace"
+										font-weight="700"
+										text-anchor="middle"
+									>
+										{mark.slot}
 									</text>
 								{/if}
 							{/each}
