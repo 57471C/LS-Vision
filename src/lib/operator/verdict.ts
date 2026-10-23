@@ -5,12 +5,19 @@ import type { Part } from "$lib/stores/operator";
 
 export type InspectionVerdict = "pass" | "fail" | "incomplete";
 
+type CountedDetection = { ic: string; consumed?: boolean };
+
+// A child box used by a matching part rule is not a BoM part.
+function countsTowardBom(item: CountedDetection): boolean {
+	return item.ic !== "" && item.consumed !== true;
+}
+
 export function detectionCounts(
-	items: { ic: string }[],
+	items: CountedDetection[],
 ): Record<string, number> {
 	const counts: Record<string, number> = {};
 	for (const item of items) {
-		if (!item.ic) continue;
+		if (!countsTowardBom(item)) continue;
 		counts[item.ic] = (counts[item.ic] ?? 0) + 1;
 	}
 	return counts;
@@ -41,12 +48,12 @@ export function extraPartCount(
 // A class is unexpected only when a BoM is loaded and the class is not on it.
 // Extra boxes of a listed class, including 2VDSWN02, are a quantity check.
 export function hasUnexpected(
-	items: { ic: string }[],
+	items: CountedDetection[],
 	parts: { ic: string }[],
 ): boolean {
 	if (!parts.length) return false;
 	const known = new Set(parts.map((part) => part.ic));
-	return items.some((item) => item.ic !== "" && !known.has(item.ic));
+	return items.some((item) => countsTowardBom(item) && !known.has(item.ic));
 }
 
 export function inspectionVerdict(args: {
@@ -56,7 +63,7 @@ export function inspectionVerdict(args: {
 	detectFailed: boolean;
 	parts: Part[];
 	counts: Record<string, number>;
-	detections: { ic: string }[];
+	detections: CountedDetection[];
 }): InspectionVerdict {
 	if (args.status !== "pass" || !args.bomLoaded) return "fail";
 	if (args.detectState !== "done") return "incomplete";

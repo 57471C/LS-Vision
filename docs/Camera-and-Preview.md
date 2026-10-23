@@ -16,3 +16,5 @@ Camera modes come from the device (Media Foundation). A newly attached camera li
 ## Settings preview
 
 Settings can open a separate preview window for the selected camera. It uses the same paced `capture_preview` path and the same Display FPS.
+
+Detect, on that window, sends the current preview frame to the active ONNX model through `detect_image`. The saved confidence threshold is the one the operator view uses. Boxes and a short list stay on that frame until Clear or Escape. The \ key does the same while the preview window is focused. It does not look up a BoM or change the operator page. With no ONNX model loaded, the button is disabled and the window says "No model loaded."

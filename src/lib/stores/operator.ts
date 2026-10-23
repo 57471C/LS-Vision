@@ -44,6 +44,8 @@ export type Detection = {
 	ic: string;
 	confidence: number;
 	bbox: number[];
+	// Set when a matching part rule used this box as its child.
+	consumed?: boolean;
 };
 
 export type BomView = {

@@ -19,6 +19,8 @@ export type PartBox = {
 	ic: string;
 	confidence: number;
 	bbox: number[];
+	// True when this box was the child of a matching rule and was not rewritten.
+	consumed?: boolean;
 };
 
 export type PartComposition = {
@@ -96,6 +98,26 @@ function centerInside(child: Rect, parent: Rect): boolean {
 	return x >= parent.x1 && x <= parent.x2 && y >= parent.y1 && y <= parent.y2;
 }
 
+// Every box of the child class whose center sits inside this parent.
+// A blank child class means any other box.
+function childIndexes(
+	detections: readonly PartBox[],
+	boxes: readonly (Rect | null)[],
+	parentIndex: number,
+	parentBox: Rect,
+	childClass: string,
+): number[] {
+	const found: number[] = [];
+	for (let otherIndex = 0; otherIndex < detections.length; otherIndex += 1) {
+		if (otherIndex === parentIndex) continue;
+		if (childClass && detections[otherIndex]?.ic !== childClass) continue;
+		const childBox = boxes[otherIndex];
+		if (!childBox || !centerInside(childBox, parentBox)) continue;
+		found.push(otherIndex);
+	}
+	return found;
+}
+
 function formatBox(box: Rect): string {
 	const n = (value: number) =>
 		Number.isInteger(value) ? String(value) : value.toFixed(1);
@@ -110,7 +132,8 @@ function missingClassNote(
 	if (missingParent && missingChild) {
 		return `parent ${rule.parent} and child ${rule.child} are not in the model class list`;
 	}
-	if (missingParent) return `parent ${rule.parent} is not in the model class list`;
+	if (missingParent)
+		return `parent ${rule.parent} is not in the model class list`;
 	return `child ${rule.child} is not in the model class list`;
 }
 
@@ -145,25 +168,33 @@ export function applyPartRules(
 	}
 	const boxes = detections.map((item) => rectOf(item.bbox));
 	const next = detections.slice();
+	const rewritten = new Set<number>();
+	const consumed = new Set<number>();
 	let matched = false;
 	for (let index = 0; index < detections.length; index += 1) {
 		const item = detections[index];
 		const parentBox = boxes[index];
-		if (!parentBox) continue;
+		if (!item || !parentBox) continue;
 		for (const entry of usable) {
 			const rule = entry.rule;
 			if (item.ic !== rule.parent) continue;
 			if (rule.condition === "contains" && !rule.child) continue;
-			const inside = detections.some((other, otherIndex) => {
-				if (otherIndex === index) return false;
-				if (rule.child && other.ic !== rule.child) return false;
-				const childBox = boxes[otherIndex];
-				if (!childBox) return false;
-				return centerInside(childBox, parentBox);
-			});
-			const matchedRule = rule.condition === "contains" ? inside : !inside;
+			const hits = childIndexes(
+				detections,
+				boxes,
+				index,
+				parentBox,
+				rule.child,
+			);
+			const matchedRule =
+				rule.condition === "contains" ? hits.length > 0 : hits.length === 0;
 			if (!matchedRule) continue;
 			next[index] = { ...item, ic: rule.result };
+			rewritten.add(index);
+			// Those child boxes made the rule match. They are not BoM parts.
+			if (rule.condition === "contains") {
+				for (const hit of hits) consumed.add(hit);
+			}
 			const childText = rule.child || "any class";
 			log.push(
 				`Part rule ${entry.number} matched: ${rule.parent} ${conditionLabel(rule.condition)} ${childText} -> ${rule.result} at ${formatBox(parentBox)}`,
@@ -171,6 +202,12 @@ export function applyPartRules(
 			matched = true;
 			break;
 		}
+	}
+	for (const index of consumed) {
+		if (rewritten.has(index)) continue;
+		const item = next[index];
+		if (!item) continue;
+		next[index] = { ...item, consumed: true };
 	}
 	if (!matched && usable.length > 0) log.push("Part rules: none matched");
 	return { detections: next, log, skipped };

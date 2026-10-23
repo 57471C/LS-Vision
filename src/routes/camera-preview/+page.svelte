@@ -69,6 +69,44 @@ let snapshotDay = "";
 let snapshotMessage = "";
 let snapshotSaved = "";
 
+type DetectBody = {
+	detections?: unknown;
+	message?: unknown;
+};
+
+type DetectMark = {
+	ic: string;
+	confidence: number;
+	x: number;
+	y: number;
+	w: number;
+	h: number;
+	color: string;
+};
+
+const DETECT_COLORS = [
+	"rgb(60, 180, 0)",
+	"rgb(255, 165, 0)",
+	"rgb(0, 140, 255)",
+	"rgb(230, 60, 60)",
+	"rgb(200, 60, 200)",
+	"rgb(200, 200, 0)",
+	"rgb(0, 180, 180)",
+	"rgb(255, 100, 0)",
+];
+
+let lastFrame = "";
+let modelReady = false;
+let modelChecked = false;
+let modelLoadId = 0;
+let detectBusy = false;
+let detectGeneration = 0;
+let detectImage = "";
+let detectW = 0;
+let detectH = 0;
+let detectMarks: DetectMark[] = [];
+let detectNote = "";
+
 function formatStatus(body: PreviewBody, canvasRate: string): string {
 	const width = body.width;
 	const height = body.height;
@@ -386,7 +424,29 @@ function onKeyDown(event: KeyboardEvent) {
 	if (event.key === "Enter" && !snapshotOpen && !typingTarget(event)) {
 		event.preventDefault();
 		void takeSnapshot();
+		return;
 	}
+	if (event.key === "Escape" && !snapshotOpen && detectImage) {
+		event.preventDefault();
+		clearDetect();
+		return;
+	}
+	// The shortcut belongs to this window. A focused text field keeps the key.
+	if (event.key === "\\" && !snapshotOpen && !textTarget(event)) {
+		event.preventDefault();
+		void runDetect();
+	}
+}
+
+function textTarget(event: KeyboardEvent): boolean {
+	const target = event.target;
+	if (!(target instanceof HTMLElement)) return false;
+	if (target.isContentEditable) return true;
+	const tag = target.tagName;
+	if (tag === "TEXTAREA" || tag === "SELECT") return true;
+	if (tag !== "INPUT") return false;
+	const type = (target as HTMLInputElement).type;
+	return type === "text" || type === "search" || type === "url" || type === "";
 }
 
 function onKeyUp(event: KeyboardEvent) {
@@ -429,6 +489,7 @@ async function drawFrame(url: string): Promise<boolean> {
 		if (!context) return false;
 		context.drawImage(bitmap, 0, 0);
 		painted = true;
+		lastFrame = url;
 		return true;
 	} finally {
 		bitmap.close();
@@ -446,6 +507,8 @@ function useIndex(next: number) {
 	paintStamps.length = 0;
 	frameW = 0;
 	frameH = 0;
+	lastFrame = "";
+	clearDetect();
 	focusNotice = "";
 	focusStatus = "";
 	if (focusTimer) {
@@ -524,6 +587,149 @@ async function loadDisplayFps() {
 
 function invokeMessage(err: unknown, fallback: string): string {
 	return typeof err === "string" && err.trim() ? err : fallback;
+}
+
+function readNames(value: unknown): string[] {
+	if (!Array.isArray(value)) return [];
+	return value.filter(
+		(item): item is string => typeof item === "string" && item.length > 0,
+	);
+}
+
+function matchName(name: string, files: readonly string[]): string {
+	const cleaned = name.trim().toLowerCase();
+	if (!cleaned) return "";
+	return files.find((item) => item.toLowerCase() === cleaned) ?? "";
+}
+
+// The same choice detect_image uses: the saved name when it is an ONNX file
+// in the model folder, otherwise the first ONNX file.
+function activeOnnx(stored: unknown, files: readonly string[]): string {
+	const saved = typeof stored === "string" ? matchName(stored, files) : "";
+	if (saved) return saved.toLowerCase().endsWith(".onnx") ? saved : "";
+	return (
+		matchName("best.onnx", files) ||
+		files.find((item) => item.toLowerCase().endsWith(".onnx")) ||
+		""
+	);
+}
+
+function colorForIc(ic: string): string {
+	const bytes = new TextEncoder().encode(ic);
+	let total = 0;
+	for (const byte of bytes) total += byte;
+	return DETECT_COLORS[total % DETECT_COLORS.length];
+}
+
+function readDetections(value: unknown): DetectMark[] {
+	if (!Array.isArray(value)) return [];
+	const marks: DetectMark[] = [];
+	for (const item of value) {
+		if (!item || typeof item !== "object") continue;
+		const row = item as {
+			ic?: unknown;
+			confidence?: unknown;
+			bbox?: unknown;
+		};
+		const ic = typeof row.ic === "string" ? row.ic : "";
+		const confidence = typeof row.confidence === "number" ? row.confidence : 0;
+		const bbox = Array.isArray(row.bbox) ? row.bbox : [];
+		if (bbox.length < 4) continue;
+		const [rawX1, rawY1, rawX2, rawY2] = bbox;
+		if (
+			![rawX1, rawY1, rawX2, rawY2].every(
+				(value) => typeof value === "number" && Number.isFinite(value),
+			)
+		) {
+			continue;
+		}
+		const x1 = Math.min(rawX1, rawX2);
+		const y1 = Math.min(rawY1, rawY2);
+		const x2 = Math.max(rawX1, rawX2);
+		const y2 = Math.max(rawY1, rawY2);
+		if (x2 <= x1 || y2 <= y1) continue;
+		marks.push({
+			ic,
+			confidence,
+			x: x1,
+			y: y1,
+			w: x2 - x1,
+			h: y2 - y1,
+			color: colorForIc(ic),
+		});
+	}
+	marks.sort((left, right) => left.confidence - right.confidence);
+	return marks;
+}
+
+function clearDetect() {
+	detectGeneration += 1;
+	detectBusy = false;
+	detectImage = "";
+	detectW = 0;
+	detectH = 0;
+	detectMarks = [];
+	detectNote = "";
+}
+
+async function refreshModel() {
+	const loadId = ++modelLoadId;
+	try {
+		const listed = await invoke<unknown>("list_vision_models");
+		const config = await invoke<{ model?: unknown }>("load_local_config");
+		if (closed || loadId !== modelLoadId) return;
+		modelReady = activeOnnx(config.model, readNames(listed)).length > 0;
+	} catch {
+		if (closed || loadId !== modelLoadId) return;
+		modelReady = false;
+	}
+	if (loadId === modelLoadId) modelChecked = true;
+}
+
+// Preview check only. The operator page still owns BoM comparison and banners.
+async function runDetect() {
+	if (!modelReady || detectBusy || snapshotOpen) return;
+	const image = lastFrame;
+	const width = frameW;
+	const height = frameH;
+	if (!image || width < 1 || height < 1) {
+		detectNote = "No preview frame.";
+		return;
+	}
+	const gen = ++detectGeneration;
+	const camera = index;
+	detectBusy = true;
+	detectNote = "";
+	try {
+		const body = await invoke<DetectBody>("detect_image", { image });
+		if (closed || gen !== detectGeneration || camera !== index) return;
+		const message = typeof body.message === "string" ? body.message.trim() : "";
+		if (message) {
+			detectImage = "";
+			detectMarks = [];
+			detectNote = message;
+			if (
+				message === "Model is missing." ||
+				message.includes("is a .pt file") ||
+				message.includes("not an ONNX")
+			) {
+				modelReady = false;
+			}
+			return;
+		}
+		detectImage = image;
+		detectW = width;
+		detectH = height;
+		detectMarks = readDetections(body.detections);
+		detectNote = "";
+	} catch (err: unknown) {
+		if (closed || gen !== detectGeneration) return;
+		detectImage = "";
+		detectMarks = [];
+		detectNote = invokeMessage(err, "Detect failed.");
+	} finally {
+		if (gen === detectGeneration) detectBusy = false;
+	}
 }
 
 async function takeSnapshot() {
@@ -613,6 +819,7 @@ onMount(() => {
 	page?.addEventListener("wheel", onWheel, { passive: false });
 	const observer = new ResizeObserver(() => fitFrame());
 	if (viewportEl) observer.observe(viewportEl);
+	void refreshModel();
 	void loadDisplayFps().then(() => {
 		if (generation === 0) void runPreview(generation);
 	});
@@ -691,7 +898,12 @@ onDestroy(() => {
 	</style>
 </svelte:head>
 
-<svelte:window on:keydown={onKeyDown} on:keyup={onKeyUp} on:blur={releaseSpace} />
+<svelte:window
+	on:keydown={onKeyDown}
+	on:keyup={onKeyUp}
+	on:blur={releaseSpace}
+	on:focus={refreshModel}
+/>
 
 <div bind:this={pageEl} class="relative flex h-dvh flex-col overflow-hidden bg-neutral-950 text-neutral-100">
 	<header class="flex shrink-0 items-center justify-between gap-3 border-b border-neutral-800 bg-neutral-900 px-4 py-2">
@@ -703,7 +915,7 @@ onDestroy(() => {
 		{/if}
 	</header>
 	<p class="shrink-0 border-b border-neutral-800 px-4 py-1 text-[11px] text-neutral-500">
-		Focus slider or Auto · Ctrl+wheel zoom · Space+drag pan · Enter snapshot
+		Focus slider or Auto · Ctrl+wheel zoom · Space+drag pan · Enter snapshot · \ detect
 	</p>
 	{#if snapshotSaved}
 		<p class="shrink-0 px-4 py-1 text-xs text-neutral-200">{snapshotSaved}</p>
@@ -730,6 +942,83 @@ onDestroy(() => {
 			style:transform-origin="0 0"
 			aria-label="Camera {index} preview"
 		></canvas>
+		{#if detectImage}
+			<img
+				src={detectImage}
+				alt=""
+				class="pointer-events-none absolute"
+				style:left="{fitLeft}px"
+				style:top="{fitTop}px"
+				style:width="{fitW}px"
+				style:height="{fitH}px"
+				style:transform="translate({panX}px, {panY}px) scale({zoom})"
+				style:transform-origin="0 0"
+			/>
+			<svg
+				class="pointer-events-none absolute"
+				style:left="{fitLeft}px"
+				style:top="{fitTop}px"
+				style:width="{fitW}px"
+				style:height="{fitH}px"
+				style:transform="translate({panX}px, {panY}px) scale({zoom})"
+				style:transform-origin="0 0"
+				viewBox="0 0 {detectW} {detectH}"
+				preserveAspectRatio="none"
+				aria-hidden="true"
+			>
+				{#each detectMarks as mark, markIndex (`${markIndex}:${mark.ic}`)}
+					<rect
+						x={mark.x}
+						y={mark.y}
+						width={mark.w}
+						height={mark.h}
+						fill="none"
+						stroke={mark.color}
+						stroke-width="2"
+						vector-effect="non-scaling-stroke"
+						data-detection={mark.ic}
+					/>
+					<text
+						x={mark.x}
+						y={mark.y + 16}
+						fill={mark.color}
+						font-size="16"
+						font-family="ui-monospace, monospace"
+						font-weight="600"
+					>
+						{mark.ic}
+					</text>
+				{/each}
+			</svg>
+			<div
+				class="absolute left-3 top-3 z-[2] max-h-48 max-w-xs overflow-auto border border-neutral-700 bg-neutral-950/90 px-3 py-2"
+				role="status"
+				on:pointerdown|stopPropagation
+			>
+				<p class="text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+					Detections
+				</p>
+				{#if detectMarks.length === 0}
+					<p class="mt-1 text-sm text-neutral-200">No detections.</p>
+				{:else}
+					<ul class="mt-1 space-y-1">
+						{#each detectMarks as mark, markIndex (`${markIndex}:${mark.ic}:${mark.confidence}`)}
+							<li class="font-mono text-sm text-neutral-100">
+								{mark.ic}
+								<span class="text-neutral-400">{mark.confidence.toFixed(2)}</span>
+							</li>
+						{/each}
+					</ul>
+				{/if}
+				<button
+					type="button"
+					class="mt-2 border border-neutral-600 bg-neutral-800 px-2 py-1 text-xs font-semibold text-neutral-100"
+					on:click={clearDetect}
+				>
+					Clear
+				</button>
+			</div>
+		{/if}
 		{#if failed || !painted}
 			<p class="absolute inset-0 flex items-center justify-center px-6 text-center text-sm text-neutral-300">
 				{message || "Opening camera…"}
@@ -768,6 +1057,23 @@ onDestroy(() => {
 			{#if focusNotice}
 				<span class="max-w-36 truncate text-xs text-amber-300" title={focusNotice}>{focusNotice}</span>
 			{/if}
+			<div class="ml-auto flex shrink-0 items-center gap-2">
+				<button
+					type="button"
+					class="inline-flex min-h-9 items-center gap-2 border border-blue-500 bg-blue-600 px-3 text-sm font-semibold text-white disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
+					title="Detect (\)"
+					disabled={!modelReady || detectBusy || snapshotOpen}
+					on:click={runDetect}
+				>
+					{detectBusy ? "Detecting..." : "Detect"}
+					<kbd class="font-mono text-xs opacity-80">\</kbd>
+				</button>
+				{#if modelChecked && !modelReady}
+					<span class="max-w-40 text-xs text-amber-200">No model loaded.</span>
+				{:else if detectNote}
+					<span class="max-w-40 truncate text-xs text-amber-200" title={detectNote}>{detectNote}</span>
+				{/if}
+			</div>
 		</div>
 	</div>
 	{#if snapshotOpen}
