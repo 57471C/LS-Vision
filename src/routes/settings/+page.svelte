@@ -2,6 +2,7 @@
 // biome-ignore-all lint/correctness/noUnusedVariables: Biome 2.4 does not treat Svelte template references as uses
 
 import { onDestroy, onMount } from "svelte";
+import ClassPicker from "$lib/ClassPicker.svelte";
 import {
 	activateCamera,
 	assignActiveCamera,
@@ -11,16 +12,16 @@ import {
 	retainCameraSettings,
 	settingsForCamera,
 } from "$lib/camera-settings";
-import ClassPicker from "$lib/ClassPicker.svelte";
 import {
-	parsePartRules,
 	PART_LABEL_LIMIT,
 	PART_RULE_LIMIT,
 	type PartCondition,
 	type PartRule,
+	parsePartRules,
 } from "$lib/part-composition";
 
 const DEV_PASSWORD = "admin";
+const DEFAULT_DESCRIPTION_PATH = "/VisionAppApi/ListInventoryDescription";
 const UNLOCK_KEY = "ls-vision-settings-open";
 const SECTION_KEY = "ls-vision-settings-section";
 const DEFAULT_SQL_DRIVER = "ODBC Driver 18 for SQL Server";
@@ -48,6 +49,7 @@ let mssqlPassword = "";
 let apiBaseUrl = "";
 let apiPath = "";
 let apiKey = "";
+let apiDescriptionPath = DEFAULT_DESCRIPTION_PATH;
 let notice = "";
 let saving = false;
 let erpName = "";
@@ -227,11 +229,30 @@ function readSource(value: unknown): BomSource {
 }
 
 function readApi(value: unknown) {
+	apiDescriptionPath = DEFAULT_DESCRIPTION_PATH;
 	if (!value || typeof value !== "object") return;
-	const api = value as { baseUrl?: unknown; path?: unknown; key?: unknown };
+	const api = value as {
+		baseUrl?: unknown;
+		path?: unknown;
+		key?: unknown;
+		descriptionPath?: unknown;
+	};
 	if (typeof api.baseUrl === "string") apiBaseUrl = api.baseUrl;
 	if (typeof api.path === "string") apiPath = api.path;
 	if (typeof api.key === "string") apiKey = api.key;
+	if ("descriptionPath" in api) {
+		apiDescriptionPath =
+			typeof api.descriptionPath === "string" ? api.descriptionPath : "";
+	}
+}
+
+function descriptionPathError(value: string): string {
+	const path = value.trim();
+	if (!path) return "";
+	if (path.length > 200 || /\s/.test(path) || path.includes("://")) {
+		return "Enter a path such as /VisionAppApi/ListInventoryDescription.";
+	}
+	return "";
 }
 
 function apiBaseUrlError(value: string): string {
@@ -1049,6 +1070,11 @@ async function saveSource() {
 			return;
 		}
 	}
+	const endpointProblem = descriptionPathError(apiDescriptionPath);
+	if (endpointProblem) {
+		notice = endpointProblem;
+		return;
+	}
 	saving = true;
 	notice = "";
 	try {
@@ -1078,6 +1104,7 @@ async function saveSource() {
 					baseUrl: apiBaseUrl.trim(),
 					path: apiPath.trim(),
 					key: apiKey.trim(),
+					descriptionPath: apiDescriptionPath.trim(),
 				},
 			},
 		});
@@ -1169,8 +1196,7 @@ async function loadPartClasses() {
 		if (id !== partClassLoadId) return;
 		partClasses = Array.isArray(data.classes)
 			? data.classes.filter(
-					(item): item is string =>
-						typeof item === "string" && item.length > 0,
+					(item): item is string => typeof item === "string" && item.length > 0,
 				)
 			: [];
 		const message = typeof data.message === "string" ? data.message.trim() : "";
@@ -3174,6 +3200,19 @@ onDestroy(() => {
 									</p>
 								</div>
 							{/if}
+
+							<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+								Description endpoint
+								<input
+									class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
+									bind:value={apiDescriptionPath}
+									autocomplete="off"
+									placeholder="/VisionAppApi/ListInventoryDescription"
+								/>
+							</label>
+							<p class="text-sm text-neutral-400">
+								Optional. Unexpected codes are posted to this path on the API base URL, with the API key. The description is shown on the Not in BoM list. Leave blank to show the code only.
+							</p>
 
 							<div class="flex flex-wrap items-center gap-2">
 								<button

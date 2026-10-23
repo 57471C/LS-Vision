@@ -350,7 +350,11 @@ function attachSession(
 		};
 	}
 
-	async function recordResult(image: string | null, includeDetection: boolean) {
+	async function recordResult(
+		image: string | null,
+		includeDetection: boolean,
+		descriptions: Record<string, string> = {},
+	) {
 		const view = op.result;
 		if (!view || (view.status !== "pass" && view.status !== "fail")) return;
 		const detections = includeDetection ? op.detections.slice() : [];
@@ -383,7 +387,10 @@ function attachSession(
 					: Object.entries(counts)
 							.filter(([ic]) => !known.has(ic))
 							.sort((left, right) => left[0].localeCompare(right[0]))
-							.map(([ic, count]) => ({ ic, count }));
+							.map(([ic, count]) => {
+								const des = descriptions[ic]?.trim() ?? "";
+								return des ? { ic, count, des } : { ic, count };
+							});
 			const outcome = await invoke<{ saved: boolean }>("save_result", {
 				passed,
 				kitIc: view.kitCode ?? "",
@@ -431,11 +438,70 @@ function attachSession(
 		void recordResult(null, false);
 	}
 
+	function unexpectedIcs(): string[] {
+		const parts = op.bom?.parts ?? [];
+		if (!op.bom || parts.length === 0) return [];
+		const known = new Set(parts.map((part) => part.ic));
+		return Object.keys(detectionCounts(op.detections))
+			.filter((ic) => !known.has(ic))
+			.sort((left, right) => left.localeCompare(right));
+	}
+
+	function descriptionMap(body: { items?: unknown }): Record<string, string> {
+		if (!Array.isArray(body.items)) return {};
+		const names: Record<string, string> = {};
+		for (const item of body.items) {
+			if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+			const row = item as Record<string, unknown>;
+			const ic = typeof row.ic === "string" ? row.ic.trim() : "";
+			const des = typeof row.des === "string" ? row.des.trim() : "";
+			if (ic && des && !names[ic]) names[ic] = des;
+		}
+		return names;
+	}
+
+	async function loadPartDescriptions(
+		generation: number,
+		icList: string[],
+	): Promise<Record<string, string>> {
+		if (!icList.length || generation !== detectGeneration || !pageAlive)
+			return {};
+		try {
+			const body = await invoke<{ items?: unknown }>(
+				"post_inventory_descriptions",
+				{ icList },
+			);
+			if (generation !== detectGeneration || !pageAlive) return {};
+			return descriptionMap(body);
+		} catch (err: unknown) {
+			if (generation !== detectGeneration || !pageAlive) return {};
+			writeConsole(
+				`Inventory descriptions: ${invokeError(err, "lookup failed")}. The list shows the IC only.`,
+			);
+			return {};
+		}
+	}
+
+	async function finishDetection(
+		generation: number,
+		viewAtStart: InspectView | null,
+		image: string | null,
+		icList: string[],
+	) {
+		const descriptions = await loadPartDescriptions(generation, icList);
+		if (generation !== detectGeneration || !pageAlive) return;
+		op.partDescriptions = descriptions;
+		if (op.result === viewAtStart) {
+			await recordResult(image, true, descriptions);
+		}
+	}
+
 	async function runDetect(generation: number, body: { image?: string }) {
 		if (generation !== detectGeneration) return;
 		const viewAtStart = op.result;
 		op.detectState = "running";
 		op.detections = [];
+		op.partDescriptions = {};
 		op.detectMessage = "";
 		try {
 			const payload = await requestDetections(body);
@@ -474,8 +540,14 @@ function attachSession(
 				};
 			}
 			op.detectState = "done";
+			const outside = unexpectedIcs();
 			if (op.result === viewAtStart) {
-				void recordResult(op.snapshot?.image ?? body.image ?? null, true);
+				void finishDetection(
+					generation,
+					viewAtStart,
+					op.snapshot?.image ?? body.image ?? null,
+					outside,
+				);
 			}
 		} catch (err: unknown) {
 			if (generation !== detectGeneration || !pageAlive) return;

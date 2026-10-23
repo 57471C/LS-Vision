@@ -311,6 +311,7 @@ onMount(() => {
 												{/if}
 											{/if}
 											{#if row.detail.extras?.length}
+												{@const showDes = row.detail.extras.some((extra) => extra.des?.trim())}
 												<h3 class="text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
 													Not in BoM
 												</h3>
@@ -318,6 +319,9 @@ onMount(() => {
 													<thead>
 														<tr class="border-b border-neutral-600 text-[11px] uppercase tracking-widest text-neutral-400">
 															<th class="py-2 pr-3 font-semibold">IC</th>
+															{#if showDes}
+																<th class="py-2 pr-3 font-semibold">Description</th>
+															{/if}
 															<th class="py-2 text-right font-semibold">Count</th>
 														</tr>
 													</thead>
@@ -325,6 +329,9 @@ onMount(() => {
 														{#each row.detail.extras as extra (extra.ic)}
 															<tr class="border-b border-neutral-800">
 																<td class="py-2 pr-3 font-mono font-medium">{extra.ic}</td>
+																{#if showDes}
+																	<td class="py-2 pr-3 text-neutral-200">{extra.des ?? ""}</td>
+																{/if}
 																<td class="py-2 text-right font-semibold">{extra.count}</td>
 															</tr>
 														{/each}

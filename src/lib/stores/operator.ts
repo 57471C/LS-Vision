@@ -119,6 +119,7 @@ export type OperatorState = {
 	savingModel: boolean;
 	modelNotice: string;
 	partRuleWarning: boolean;
+	partDescriptions: Record<string, string>;
 	consoleOpen: boolean;
 	consoleLines: ConsoleLine[];
 };
@@ -170,6 +171,7 @@ export function initialOperator(): OperatorState {
 		savingModel: false,
 		modelNotice: "",
 		partRuleWarning: false,
+		partDescriptions: {},
 		consoleOpen: false,
 		consoleLines: [],
 	};
