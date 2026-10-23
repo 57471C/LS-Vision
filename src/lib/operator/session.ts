@@ -9,6 +9,12 @@ import { tick } from "svelte";
 import { get, writable } from "svelte/store";
 import { activateCamera, readDisplayFps } from "$lib/camera-settings";
 import {
+	detectSlotNumber,
+	panelsForSlots,
+	parseDetectRoi,
+	parseDetectRois,
+} from "$lib/detect-rois";
+import {
 	appendConsoleLine,
 	consoleStamp,
 	isCameraOpenError,
@@ -243,6 +249,7 @@ function attachSession(
 		detectGeneration += 1;
 		op.snapshot = null;
 		op.detections = [];
+		op.slotResults = [];
 		op.detectMessage = "";
 		op.detectState = "idle";
 		op.paneWidth = 0;
@@ -343,20 +350,30 @@ function attachSession(
 		return `data:image/jpeg;base64,${text.replace(/\s+/g, "")}`;
 	}
 
-	async function requestDetections(): Promise<{
+	type DetectObject = {
 		detections?: unknown;
 		classes?: unknown;
 		image_base64?: unknown;
 		message?: unknown;
-	}> {
-		// .onnx runs in Rust on the latest raw frame. A .pt file is not detected.
+		slot?: unknown;
+	};
+
+	async function requestDetections(image?: string): Promise<unknown> {
+		// .onnx runs in Rust. A live detect uses the latest raw frame. Test mode
+		// passes the chosen file. A .pt file is not detected.
 		if (op.modelName.toLowerCase().endsWith(".onnx")) {
-			return await invoke("detect_image");
+			return await invoke("detect_image", {
+				image: image && image.trim() ? image : null,
+			});
 		}
 		return {
 			detections: [],
 			message: `${op.modelName} is a .pt file. Choose an .onnx model to detect parts.`,
 		};
+	}
+
+	function isDetectObject(value: unknown): value is DetectObject {
+		return !!value && typeof value === "object" && !Array.isArray(value);
 	}
 
 	function noteRawSize(frame: WatchBody) {
@@ -401,11 +418,17 @@ function attachSession(
 		image: string | null,
 		includeDetection: boolean,
 		descriptions: Record<string, string> = {},
+		slot = 1,
+		detectionsOverride?: Detection[],
+		noteSlot = false,
 	) {
 		if (op.testMode) return;
 		const view = op.result;
 		if (!view || (view.status !== "pass" && view.status !== "fail")) return;
-		const detections = includeDetection ? op.detections.slice() : [];
+		const detections = includeDetection
+			? (detectionsOverride ?? op.detections).slice()
+			: [];
+		const storedSlot = detectSlotNumber(slot) ?? 1;
 		const detectMessage = includeDetection ? op.detectMessage : "";
 		try {
 			const config = await readConfig();
@@ -464,11 +487,12 @@ function attachSession(
 				description: view.des ?? "",
 				imageBase64: image,
 				detail,
+				slot: storedSlot,
 			});
 			if (!outcome.saved) return;
 			const job = view.jobCard?.trim();
 			writeConsole(
-				`Result saved: ${passed ? "pass" : "fail"} ${view.kitCode?.trim() || "(no kit)"}${job ? ` job ${job}` : ""}`,
+				`Result saved: ${passed ? "pass" : "fail"} ${view.kitCode?.trim() || "(no kit)"}${job ? ` job ${job}` : ""}${noteSlot ? ` slot ${storedSlot}` : ""}`,
 			);
 			const resultsPath =
 				typeof config.api?.resultsPath === "string"
@@ -484,6 +508,7 @@ function attachSession(
 					description: view.des ?? "",
 					imagePath: outcome.imagePath ?? "",
 					detail,
+					slot: storedSlot,
 				});
 			} catch (postErr: unknown) {
 				writeConsole(
@@ -564,53 +589,110 @@ function attachSession(
 		const descriptions = await loadPartDescriptions(generation, icList);
 		if (generation !== detectGeneration || !pageAlive) return;
 		op.partDescriptions = descriptions;
-		if (op.result === viewAtStart) {
-			await recordResult(image, true, descriptions);
+		if (op.result !== viewAtStart) return;
+		const parts = viewAtStart?.parts ?? [];
+		const bomLoaded =
+			!!op.bom && parts.length > 0 && op.bom.kitCode === (viewAtStart?.kitCode ?? "");
+		const panels = panelsForSlots(op.slotResults, bomLoaded);
+		if (panels.length > 0) {
+			for (const panel of panels) {
+				await recordResult(
+					image,
+					true,
+					descriptions,
+					panel.slot,
+					panel.detections,
+					true,
+				);
+			}
+			return;
 		}
+		await recordResult(image, true, descriptions);
 	}
 
-	async function runDetect(generation: number) {
+	function noteDetectMessage(message: string) {
+		op.detectMessage = message;
+		if (message === "Model is missing." || message === "Model failed to load.") {
+			op.modelNotice = message;
+		} else if (
+			!message &&
+			(op.modelNotice === "Model is missing." ||
+				op.modelNotice === "Model failed to load.")
+		) {
+			op.modelNotice = "";
+		}
+		noteModelFromDetect(message);
+	}
+
+	function applyDetectedStill(encoded: unknown) {
+		if (!op.snapshot) return;
+		op.snapshot = {
+			...op.snapshot,
+			image:
+				typeof encoded === "string" && encoded
+					? detectedImageSrc(encoded)
+					: op.snapshot.image,
+			detected: op.detections.length > 0,
+		};
+	}
+
+	async function runDetect(generation: number, image?: string) {
 		if (generation !== detectGeneration) return;
 		const viewAtStart = op.result;
 		op.detectState = "running";
 		op.detections = [];
+		op.slotResults = [];
 		op.partDescriptions = {};
 		op.detectMessage = "";
 		try {
-			const payload = await requestDetections();
+			const payload = await requestDetections(image);
 			if (generation !== detectGeneration || !pageAlive) return;
-			const composed = await composeDetections(
-				fitDetections(asDetections(payload.detections)),
-				modelClassList(payload.classes),
-			);
-			if (generation !== detectGeneration || !pageAlive) return;
-			op.detections = composed.detections;
-			if (composed.checked) op.partRuleWarning = composed.skipped > 0;
-			op.detectMessage =
-				typeof payload.message === "string" ? payload.message : "";
-			if (
-				op.detectMessage === "Model is missing." ||
-				op.detectMessage === "Model failed to load."
-			) {
-				op.modelNotice = op.detectMessage;
-			} else if (
-				!op.detectMessage &&
-				(op.modelNotice === "Model is missing." ||
-					op.modelNotice === "Model failed to load.")
-			) {
-				op.modelNotice = "";
-			}
-			noteModelFromDetect(op.detectMessage);
-			const encoded = payload.image_base64;
-			if (op.snapshot) {
-				op.snapshot = {
-					...op.snapshot,
-					image:
-						typeof encoded === "string" && encoded
-							? detectedImageSrc(encoded)
-							: op.snapshot.image,
-					detected: op.detections.length > 0,
-				};
+			if (Array.isArray(payload)) {
+				const parsed: { slot: number; detections: Detection[] }[] = [];
+				const flat: Detection[] = [];
+				let skipped = 0;
+				let checked = false;
+				for (const entry of payload) {
+					if (!isDetectObject(entry)) continue;
+					const slot = detectSlotNumber(entry.slot);
+					if (slot === null) continue;
+					const composed = await composeDetections(
+						fitDetections(asDetections(entry.detections)),
+						modelClassList(entry.classes),
+					);
+					if (generation !== detectGeneration || !pageAlive) return;
+					parsed.push({ slot, detections: composed.detections });
+					flat.push(...composed.detections);
+					if (composed.checked) {
+						checked = true;
+						skipped += composed.skipped;
+					}
+				}
+				// Slot 1 on its own keeps the single result panel.
+				if (parsed.length === 1 && parsed[0].slot === 1) {
+					op.slotResults = [];
+					op.detections = parsed[0].detections;
+				} else {
+					op.slotResults = parsed;
+					op.detections = flat;
+				}
+				if (checked) op.partRuleWarning = skipped > 0;
+				noteDetectMessage("");
+				applyDetectedStill(null);
+			} else {
+				if (!isDetectObject(payload)) throw new Error("Detect failed");
+				const composed = await composeDetections(
+					fitDetections(asDetections(payload.detections)),
+					modelClassList(payload.classes),
+				);
+				if (generation !== detectGeneration || !pageAlive) return;
+				op.slotResults = [];
+				op.detections = composed.detections;
+				if (composed.checked) op.partRuleWarning = composed.skipped > 0;
+				noteDetectMessage(
+					typeof payload.message === "string" ? payload.message : "",
+				);
+				applyDetectedStill(payload.image_base64);
 			}
 			op.detectState = "done";
 			const outside = unexpectedIcs();
@@ -624,6 +706,7 @@ function attachSession(
 			}
 		} catch (err: unknown) {
 			if (generation !== detectGeneration || !pageAlive) return;
+			op.slotResults = [];
 			op.detectMessage = errorMessage(err, "Detect failed");
 			noteModelFromDetect(op.detectMessage);
 			op.detectState = "done";
@@ -1033,6 +1116,7 @@ function attachSession(
 		testMode?: unknown;
 		skipResultSave?: unknown;
 		detectRoi?: unknown;
+		detectRois?: unknown;
 		partRules?: unknown;
 		api?: { descriptionPath?: unknown; resultsPath?: unknown } | null;
 		camera?: { index?: unknown; displayFps?: unknown } | null;
@@ -1198,28 +1282,13 @@ function attachSession(
 	}
 
 	function asRoi(value: unknown): DetectRoi | null {
-		if (!value || typeof value !== "object") return null;
-		const row = value as DetectRoi;
-		if (
-			typeof row.x !== "number" ||
-			typeof row.y !== "number" ||
-			typeof row.w !== "number" ||
-			typeof row.h !== "number"
-		) {
-			return null;
-		}
-		if (![row.x, row.y, row.w, row.h].every((n) => Number.isFinite(n)))
-			return null;
-		if (row.w < 0.01 || row.h < 0.01) return null;
-		if (
-			row.x < 0 ||
-			row.y < 0 ||
-			row.x + row.w > 1.001 ||
-			row.y + row.h > 1.001
-		) {
-			return null;
-		}
-		return { x: row.x, y: row.y, w: row.w, h: row.h };
+		return parseDetectRoi(value);
+	}
+
+	function applyDetectRois(slots: (DetectRoi | null)[]) {
+		const next = slots.length === 4 ? slots : parseDetectRois(slots, null);
+		op.detectRois = next;
+		op.detectRoi = next[0];
 	}
 
 	async function loadCamera() {
@@ -1459,12 +1528,20 @@ function attachSession(
 		roiDrag = null;
 	}
 
+	function setDetectSlot(next: number) {
+		op.detectSlot = detectSlotNumber(next) ?? 0;
+	}
+
 	function beginSetRoi() {
 		if (!op.admin) return;
 		if (op.barcodeDrawing) cancelBarcodeDraw();
 		if (op.drawing) {
 			cancelRoiDraw();
 			op.roiMessage = "";
+			return;
+		}
+		if (detectSlotNumber(op.detectSlot) === null) {
+			op.roiMessage = "Choose a slot from 1 to 4.";
 			return;
 		}
 		if (!op.snapshot) {
@@ -1551,7 +1628,7 @@ function attachSession(
 	async function loadDetectRoi() {
 		try {
 			const data = await readConfig();
-			op.detectRoi = asRoi(data.detectRoi);
+			applyDetectRois(parseDetectRois(data.detectRois, data.detectRoi));
 		} catch {
 			// A missed read keeps the current region.
 		}
@@ -1569,18 +1646,27 @@ function attachSession(
 
 	async function saveDetectRoi(roi: DetectRoi | null) {
 		if (!op.admin) return;
+		const slot = detectSlotNumber(op.detectSlot);
+		if (slot === null) {
+			op.roiMessage = "Choose a slot from 1 to 4.";
+			op.draftMark = null;
+			return;
+		}
 		op.savingRoi = true;
 		op.roiMessage = "";
 		try {
 			const config = await invoke<Record<string, unknown>>("load_local_config");
+			const slots = parseDetectRois(config.detectRois, config.detectRoi);
 			const next = roi ? roundRoi(roi) : null;
-			config.detectRoi = next;
+			slots[slot - 1] = next;
+			config.detectRois = slots;
+			config.detectRoi = slots[0];
 			await invoke("save_local_config", { config });
-			op.detectRoi = asRoi(next);
+			applyDetectRois(slots.map((item) => asRoi(item)));
 			op.draftMark = null;
 			op.drawing = false;
 			roiDrag = null;
-			op.roiMessage = "Saved.";
+			op.roiMessage = next ? `Saved slot ${slot}.` : `Cleared slot ${slot}.`;
 			rerunDetect();
 		} catch (err: unknown) {
 			op.roiMessage = errorMessage(err, "Could not save the ROI");
@@ -1591,6 +1677,7 @@ function attachSession(
 
 	function clearDetectRoi() {
 		if (!op.admin || op.savingRoi) return;
+		if (detectSlotNumber(op.detectSlot) === null) return;
 		cancelRoiDraw();
 		void saveDetectRoi(null);
 	}
@@ -1726,14 +1813,10 @@ function attachSession(
 		try {
 			const dataUrl = await readImageFile(file);
 			if (!pageAlive || !op.bom || op.bom.kitCode !== kitCode) return;
-			try {
-				noteRawSize(await readFrame(op.cameraIndex));
-			} catch {
-				// Detection reports a missing camera frame. The chosen file stays the still.
-			}
+			// Boxes stay in this file's pixels. The camera frame is not the photo.
 			scaleToPreview = false;
 			const generation = holdStill(dataUrl, kitCode);
-			await runDetect(generation);
+			await runDetect(generation, dataUrl);
 		} catch (err: unknown) {
 			if (!pageAlive) return;
 			op.detectMessage = errorMessage(err, "Could not read the image");
@@ -2133,6 +2216,7 @@ function attachSession(
 		toggleFeed,
 		beginSetRoi,
 		clearDetectRoi,
+		setDetectSlot,
 		beginSetBarcodeRoi,
 		clearBarcodeRoi,
 		openErp,

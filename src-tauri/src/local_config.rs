@@ -202,6 +202,7 @@ fn default_config() -> Value {
         "testMode": false,
         "skipResultSave": true,
         "detectRoi": null,
+        "detectRois": [null, null, null, null],
         "barcodeRoi": null,
         "model": "",
         "confidence": 0.45,

@@ -52,6 +52,7 @@ pub struct ListedResult {
     pub created_at: String,
     pub has_image: bool,
     pub detail: Value,
+    pub slot: i64,
 }
 
 /// Test mode skips the write. Otherwise a missing, true, or non-boolean
@@ -111,6 +112,15 @@ fn clip_text(raw: &str, limit: usize) -> String {
     raw.trim().chars().take(limit).collect()
 }
 
+/// Stored and posted slot. Missing or out-of-range values stay 1 so older
+/// callers, and a single full-frame inspection, keep a valid row.
+fn result_slot(slot: Option<i64>) -> i64 {
+    match slot {
+        Some(value) if (1..=4).contains(&value) => value,
+        _ => 1,
+    }
+}
+
 fn db_err(err: impl std::fmt::Display) -> String {
     format!("Could not use the results database: {err}")
 }
@@ -136,12 +146,14 @@ fn open_db(root: &Path) -> Result<Connection, String> {
                 created_at TEXT NOT NULL,
                 image_path TEXT,
                 detail_json TEXT NOT NULL,
-                job_card TEXT NOT NULL DEFAULT ''
+                job_card TEXT NOT NULL DEFAULT '',
+                slot INTEGER NOT NULL DEFAULT 1
             );
             CREATE INDEX IF NOT EXISTS results_created_at ON results (created_at);",
         )
         .map_err(db_err)?;
     ensure_job_card_column(&connection)?;
+    ensure_slot_column(&connection)?;
     Ok(connection)
 }
 
@@ -168,6 +180,34 @@ fn ensure_job_card_column(connection: &Connection) -> Result<(), String> {
     connection
         .execute(
             "ALTER TABLE results ADD COLUMN job_card TEXT NOT NULL DEFAULT ''",
+            [],
+        )
+        .map_err(db_err)?;
+    Ok(())
+}
+
+fn column_present(connection: &Connection, column: &str) -> Result<bool, String> {
+    let mut statement = connection
+        .prepare("PRAGMA table_info(results)")
+        .map_err(db_err)?;
+    let names = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(db_err)?;
+    for name in names {
+        if name.map_err(db_err)?.eq_ignore_ascii_case(column) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn ensure_slot_column(connection: &Connection) -> Result<(), String> {
+    if column_present(connection, "slot")? {
+        return Ok(());
+    }
+    connection
+        .execute(
+            "ALTER TABLE results ADD COLUMN slot INTEGER NOT NULL DEFAULT 1",
             [],
         )
         .map_err(db_err)?;
@@ -241,6 +281,7 @@ pub(crate) fn save_in(
     job_card: &str,
     image_base64: Option<&str>,
     detail: &Value,
+    slot: i64,
     when: DateTime<Local>,
 ) -> Result<SavedInspection, String> {
     let _guard = DB_LOCK
@@ -268,9 +309,9 @@ pub(crate) fn save_in(
     };
     let inserted = connection.execute(
         "INSERT INTO results (
-            passed, kit_ic, description, created_at, image_path, detail_json, job_card
+            passed, kit_ic, description, created_at, image_path, detail_json, job_card, slot
          )
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             passed,
             clip_text(kit_ic, 200),
@@ -279,6 +320,7 @@ pub(crate) fn save_in(
             image_path,
             detail_text,
             clip_text(job_card, 80),
+            result_slot(Some(slot)),
         ],
     );
     if let Err(err) = inserted {
@@ -304,7 +346,7 @@ pub(crate) fn list_in(root: &Path) -> Result<Vec<ListedResult>, String> {
     let connection = open_db(root)?;
     let mut statement = connection
         .prepare(
-            "SELECT id, passed, kit_ic, description, created_at, image_path, detail_json, job_card
+            "SELECT id, passed, kit_ic, description, created_at, image_path, detail_json, job_card, slot
              FROM results
              ORDER BY created_at DESC, id DESC",
         )
@@ -314,6 +356,7 @@ pub(crate) fn list_in(root: &Path) -> Result<Vec<ListedResult>, String> {
             let image_path: Option<String> = row.get(5)?;
             let detail_text: String = row.get(6)?;
             let job_card: String = row.get(7)?;
+            let slot: i64 = row.get(8)?;
             let detail = serde_json::from_str(&detail_text).unwrap_or_else(|_| json!({}));
             let has_image = image_path
                 .as_deref()
@@ -328,6 +371,7 @@ pub(crate) fn list_in(root: &Path) -> Result<Vec<ListedResult>, String> {
                 created_at: row.get(4)?,
                 has_image,
                 detail,
+                slot,
             })
         })
         .map_err(db_err)?;
@@ -402,6 +446,7 @@ pub fn save_result(
     job_card: Option<String>,
     image_base64: Option<String>,
     detail: Value,
+    slot: Option<i64>,
 ) -> Result<SaveOutcome, String> {
     let config = local_config::load_document(&local_config::project_root()?)?;
     if saving_disabled(&config) {
@@ -416,6 +461,7 @@ pub fn save_result(
         job_card.as_deref().unwrap_or(""),
         image_base64.as_deref(),
         &detail,
+        result_slot(slot),
         Local::now(),
     )
 }
@@ -439,6 +485,7 @@ pub(crate) fn save_enabled(
     job_card: &str,
     image_base64: Option<&str>,
     detail: &Value,
+    slot: i64,
     when: DateTime<Local>,
 ) -> Result<SaveOutcome, String> {
     if saving_disabled(config) {
@@ -452,6 +499,7 @@ pub(crate) fn save_enabled(
         job_card,
         image_base64,
         detail,
+        slot,
         when,
     )?;
     Ok(outcome_of(saved))
@@ -478,11 +526,13 @@ pub(crate) fn inspection_body(
     image_path: &str,
     image_base64: &str,
     detail: &Value,
+    slot: i64,
 ) -> Value {
     let mut body = json!({
         "jobCard": clip_text(job_card, 80),
         "timestamp": timestamp.trim(),
         "passed": passed,
+        "slot": result_slot(Some(slot)),
         "kitIc": clip_text(kit_ic, 200),
         "description": clip_text(description, 500),
         "imagePath": image_path.trim(),
@@ -515,6 +565,7 @@ pub(crate) fn post_if_enabled(
     description: &str,
     image_path: &str,
     detail: &Value,
+    slot: i64,
 ) -> Result<(), String> {
     if saving_disabled(config) || results_path(config).is_empty() {
         return Ok(());
@@ -529,6 +580,7 @@ pub(crate) fn post_if_enabled(
         image_path,
         &image_base64,
         detail,
+        slot,
     );
     let bytes = serde_json::to_vec(&body).map_err(|_| "Could not build the result.".to_string())?;
     crate::bom::post_api_path(config, "resultsPath", &bytes, POST_TIMEOUT)
@@ -543,6 +595,7 @@ pub fn post_inspection_result(
     description: String,
     image_path: Option<String>,
     detail: Value,
+    slot: Option<i64>,
 ) -> Result<(), String> {
     let config = local_config::load_document(&local_config::project_root()?)?;
     if saving_disabled(&config) || results_path(&config).is_empty() {
@@ -558,6 +611,7 @@ pub fn post_inspection_result(
         &description,
         image_path.as_deref().unwrap_or(""),
         &detail,
+        result_slot(slot),
     )
 }
 
@@ -671,6 +725,7 @@ mod tests {
             "17834402",
             Some(&tiny_jpeg()),
             &detail,
+            1,
             when(),
         )
         .unwrap();
@@ -694,6 +749,7 @@ mod tests {
         assert_eq!(listed[0].kit_ic, "6PBBK001");
         assert_eq!(listed[0].description, "Accessory Kit");
         assert_eq!(listed[0].job_card, "17834402");
+        assert_eq!(listed[0].slot, 1);
         assert!(listed[0].has_image);
         assert_eq!(listed[0].detail["parts"][0]["ic"], "2BBMNM08");
         let image = image_in(&root, id).unwrap();
@@ -757,6 +813,7 @@ mod tests {
         let listed = list_in(&root).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].job_card, "");
+        assert_eq!(listed[0].slot, 1);
         let inserted = save_in(
             &root,
             false,
@@ -765,6 +822,7 @@ mod tests {
             "17834402",
             None,
             &json!({}),
+            1,
             when(),
         )
         .unwrap();
@@ -832,6 +890,7 @@ mod tests {
                 "17834402",
                 Some(&tiny_jpeg()),
                 &detail,
+                1,
                 when(),
             )
             .unwrap();
@@ -911,6 +970,7 @@ mod tests {
             "17834402",
             Some(&wide_png()),
             &detail,
+            1,
             when(),
         )
         .unwrap();
@@ -935,6 +995,7 @@ mod tests {
             "Accessory Kit",
             &saved.image_path,
             &detail,
+            1,
         )
         .unwrap();
         let bytes = received.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -948,6 +1009,7 @@ mod tests {
         assert_eq!(payload["jobCard"], "17834402");
         assert_eq!(payload["timestamp"], saved.created_at);
         assert_eq!(payload["passed"], true);
+        assert_eq!(payload["slot"], 1);
         assert_eq!(payload["kitIc"], "6PBBK001");
         assert_eq!(payload["description"], "Accessory Kit");
         assert_eq!(payload["imagePath"], saved.image_path);
@@ -957,6 +1019,54 @@ mod tests {
             .decode(payload["imageBase64"].as_str().unwrap())
             .unwrap();
         assert_capped_jpeg(&image);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_chosen_slot_is_stored_and_posted() {
+        let body = inspection_body(
+            "17834402",
+            "2026-10-19T14:05:03+11:00",
+            false,
+            "6PBBK001",
+            "Kit",
+            "images/result.jpg",
+            "",
+            &json!({ "parts": [] }),
+            3,
+        );
+        assert_eq!(body["slot"], 3);
+        assert_eq!(
+            inspection_body(
+                "17834402",
+                "2026-10-19T14:05:03+11:00",
+                true,
+                "6PBBK001",
+                "Kit",
+                "",
+                "",
+                &json!({}),
+                9,
+            )["slot"],
+            1
+        );
+        let root = temp_root("slot");
+        let saved = save_in(
+            &root,
+            false,
+            "6PBBK001",
+            "Kit",
+            "17834402",
+            None,
+            &json!({}),
+            3,
+            when(),
+        )
+        .unwrap();
+        let listed = list_in(&root).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, saved.id);
+        assert_eq!(listed[0].slot, 3);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -984,6 +1094,7 @@ mod tests {
             "Kit",
             "",
             &detail,
+            1,
         )
         .unwrap();
         let testing = json!({
@@ -1005,6 +1116,7 @@ mod tests {
             "Kit",
             "images/17834402_20261019-140503.jpg",
             &detail,
+            1,
         )
         .unwrap();
         let _ = fs::remove_dir_all(root);

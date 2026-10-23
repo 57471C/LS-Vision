@@ -270,6 +270,7 @@ onMount(() => {
 										<div class="flex flex-col gap-3">
 											<p class="font-mono text-lg font-semibold text-neutral-100">
 												Job card {row.jobCard?.trim() || "—"}
+												<span class="ml-3 text-[11px] font-semibold uppercase tracking-widest text-neutral-500">Slot {row.slot || 1}</span>
 											</p>
 											{#if row.detail.message}
 												<p class="text-base text-neutral-200">{row.detail.message}</p>

@@ -1,8 +1,10 @@
 <script lang="ts">
 // biome-ignore-all lint/correctness/noUnusedVariables: Biome 2.4 does not treat Svelte template references as uses
 
+import { panelsForSlots } from "$lib/detect-rois";
 import { detectionCounts, inspectionVerdict } from "$lib/operator/verdict";
 import { useOperator } from "$lib/stores/operator";
+import type { Detection, SlotDetections } from "$lib/stores/operator";
 
 const { chooseAndDetect, operator } = useOperator();
 
@@ -22,12 +24,6 @@ type BomView = {
 	kitCode: string;
 	des?: string;
 	parts: Part[];
-};
-
-type Detection = {
-	ic: string;
-	confidence: number;
-	bbox: number[];
 };
 
 type DetectedCount = {
@@ -69,6 +65,12 @@ function matchSummary(parts: Part[], items: Detection[]): string {
 }
 
 $: counts = detectionCounts($operator.detections);
+$: bomLoaded = isLoadedBom($operator.result, $operator.bom);
+$: visibleSlots = panelsForSlots($operator.slotResults, bomLoaded);
+$: splitSlots =
+	visibleSlots.length > 0 &&
+	($operator.slotResults.length > 1 ||
+		$operator.slotResults.some((slot) => slot.slot !== 1));
 $: detectFailed =
 	$operator.detectState === "done" &&
 	!!$operator.detectMessage &&
@@ -76,7 +78,7 @@ $: detectFailed =
 $: verdict = $operator.result
 	? inspectionVerdict({
 			status: $operator.result.status,
-			bomLoaded: isLoadedBom($operator.result, $operator.bom),
+			bomLoaded,
 			detectState: $operator.detectState,
 			detectFailed,
 			parts: $operator.result.parts ?? [],
@@ -84,13 +86,32 @@ $: verdict = $operator.result
 			detections: $operator.detections,
 		})
 	: "fail";
+
+function slotVerdict(panel: SlotDetections): "pass" | "fail" | "incomplete" {
+	const view = $operator.result;
+	if (!view) return "fail";
+	const slotCounts = detectionCounts(panel.detections);
+	const failed =
+		$operator.detectState === "done" &&
+		!!$operator.detectMessage &&
+		panel.detections.length === 0;
+	return inspectionVerdict({
+		status: view.status,
+		bomLoaded,
+		detectState: $operator.detectState,
+		detectFailed: failed,
+		parts: view.parts ?? [],
+		counts: slotCounts,
+		detections: panel.detections,
+	});
+}
 </script>
 
 <section class="flex min-h-0 min-w-0 flex-col overflow-hidden border border-neutral-700 bg-neutral-900">
 	<h2 class="shrink-0 border-b border-neutral-800 px-3 py-1.5 text-[11px] font-semibold uppercase tracking-widest text-neutral-500">
 		Result
 	</h2>
-	{#if $operator.result}
+	{#if $operator.result && !splitSlots}
 		<p
 			class="shrink-0 px-4 py-4 text-4xl font-black uppercase leading-none tracking-widest {verdict ===
 			'pass'
@@ -214,6 +235,144 @@ $: verdict = $operator.result
 			{#if !hideBenchNote($operator.result.info)}
 				<p class="text-sm text-neutral-400">{$operator.result.info}</p>
 			{/if}
+		</div>
+	{:else if $operator.result}
+		<div class="result-scroll flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-4">
+			{#each visibleSlots as panel, panelIndex (panel.slot)}
+				{@const slotCounts = detectionCounts(panel.detections)}
+				{@const slotFailed =
+					$operator.detectState === "done" &&
+					!!$operator.detectMessage &&
+					panel.detections.length === 0}
+				{@const slotBanner = slotVerdict(panel)}
+				{@const showSeen =
+					$operator.detectState !== "idle" && bomLoaded && !slotFailed}
+				<section class="flex flex-col gap-3 border border-neutral-800 bg-neutral-950 p-3">
+					<h3 class="text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+						Slot {panel.slot}
+					</h3>
+					<p
+						class="px-4 py-4 text-4xl font-black uppercase leading-none tracking-widest {slotBanner ===
+						'pass'
+							? 'bg-green-500 text-neutral-950'
+							: slotBanner === 'incomplete'
+								? 'bg-amber-500 text-neutral-950'
+								: 'bg-red-600 text-white'}"
+					>
+						{slotBanner}
+					</p>
+					{#if $operator.result.kitCode}
+						<p class="font-mono text-2xl font-semibold tracking-tight">{$operator.result.kitCode}</p>
+					{/if}
+					{#if $operator.result.jobCard}
+						<p class="font-mono text-xl font-semibold tracking-tight text-neutral-100">
+							<span class="mr-2 text-[11px] font-semibold uppercase tracking-widest text-neutral-500">Job card</span>{$operator.result.jobCard}
+						</p>
+					{/if}
+					{#if panelIndex === 0 && $operator.testMode && bomLoaded}
+						<button
+							type="button"
+							class="inline-flex min-h-11 w-fit items-center border border-blue-500 bg-blue-600 px-4 text-sm font-semibold text-white"
+							on:click={chooseAndDetect}
+						>
+							Choose image
+						</button>
+						<p class="text-sm text-neutral-400">
+							Test mode is on. Choose an image file to detect parts for this kit.
+						</p>
+					{/if}
+					{#if $operator.result.des}
+						<p class="text-base text-neutral-300">{$operator.result.des}</p>
+					{/if}
+					{#if !hideBenchNote($operator.result.message)}
+						<p class="text-base text-neutral-200">{$operator.result.message}</p>
+					{/if}
+					{#if $operator.result.parts?.length}
+						<table class="w-full border-collapse text-left text-sm">
+							<thead>
+								<tr class="border-b border-neutral-600 text-[11px] uppercase tracking-widest text-neutral-400">
+									<th class="py-2 pr-3 font-semibold">IC</th>
+									<th class="py-2 pr-3 font-semibold">Description</th>
+									<th class="py-2 text-right font-semibold">Qty</th>
+									{#if showSeen}
+										<th class="py-2 text-right font-semibold">Seen</th>
+									{/if}
+								</tr>
+							</thead>
+							<tbody>
+								{#each $operator.result.parts as part, i (i)}
+									<tr class="border-b border-neutral-800">
+										<td class="py-2 pr-3 font-mono font-medium">{part.ic}</td>
+										<td class="py-2 pr-3 text-neutral-200">{part.des}</td>
+										<td class="py-2 text-right font-semibold">{part.qty}</td>
+										{#if showSeen}
+											<td
+												class="py-2 text-right font-semibold {$operator.detectState === 'running'
+													? 'text-neutral-500'
+													: (slotCounts[part.ic] ?? 0) >= part.qty
+														? 'text-green-400'
+														: 'text-red-400'}"
+											>
+												{$operator.detectState === "running" ? "…" : (slotCounts[part.ic] ?? 0)}
+											</td>
+										{/if}
+									</tr>
+								{/each}
+							</tbody>
+						</table>
+						{#if showSeen && $operator.detectState === "done"}
+							<p class="text-sm text-neutral-300">{matchSummary($operator.result.parts, panel.detections)}</p>
+						{/if}
+					{/if}
+					{#if slotBanner === "incomplete" && $operator.detectState !== "running"}
+						<p class="text-sm text-neutral-400">Part counts are not confirmed yet.</p>
+					{/if}
+					{#if $operator.detectState === "running"}
+						<p class="text-sm text-neutral-400">Detecting parts...</p>
+					{/if}
+					{#if $operator.detectState === "done"}
+						{@const extras = partsOutsideBom(
+							panel.detections,
+							$operator.bom?.parts ?? null,
+							$operator.partDescriptions,
+						)}
+						{#if extras.length}
+							{@const showDes = !!$operator.bom && extras.some((row) => row.des)}
+							<h3 class="text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+								{$operator.bom ? "Not in BoM" : "Detected parts"}
+							</h3>
+							<table class="w-full border-collapse text-left text-sm">
+								<thead>
+									<tr class="border-b border-neutral-600 text-[11px] uppercase tracking-widest text-neutral-400">
+										<th class="py-2 pr-3 font-semibold">IC</th>
+										{#if showDes}
+											<th class="py-2 pr-3 font-semibold">Description</th>
+										{/if}
+										<th class="py-2 text-right font-semibold">Count</th>
+									</tr>
+								</thead>
+								<tbody>
+									{#each extras as row (row.ic)}
+										<tr class="border-b border-neutral-800">
+											<td class="py-2 pr-3 font-mono font-medium">{row.ic}</td>
+											{#if showDes}
+												<td class="py-2 pr-3 text-neutral-200">{row.des}</td>
+											{/if}
+											<td class="py-2 text-right font-semibold">{row.count}</td>
+										</tr>
+									{/each}
+								</tbody>
+							</table>
+						{/if}
+					{/if}
+					{#if $operator.detectMessage}
+						<p class="text-sm text-red-300">{$operator.detectMessage}</p>
+					{/if}
+					{#if !hideBenchNote($operator.result.info)}
+						<p class="text-sm text-neutral-400">{$operator.result.info}</p>
+					{/if}
+				</section>
+			{/each}
 		</div>
 	{:else}
 		<div class="px-4 py-8">

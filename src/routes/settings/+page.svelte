@@ -13,6 +13,11 @@ import {
 	settingsForCamera,
 } from "$lib/camera-settings";
 import {
+	type DetectRoi,
+	parseDetectRoi,
+	parseDetectRois,
+} from "$lib/detect-rois";
+import {
 	PART_LABEL_LIMIT,
 	PART_RULE_LIMIT,
 	type PartCondition,
@@ -30,7 +35,6 @@ type BomSource = "json" | "mssql" | "api";
 type AuthMode = "windows" | "sql";
 type MssqlFields = { server: string; database: string; user: string };
 type SettingsSection = "camera" | "capture" | "training" | "parts" | "database";
-type DetectRoi = { x: number; y: number; w: number; h: number };
 type BarcodeRoi = { x: number; y: number; width: number; height: number };
 
 const sectionOn =
@@ -65,6 +69,8 @@ let skipResultSave = true;
 let testNotice = "";
 let savingTest = false;
 let roi: DetectRoi | null = null;
+let roiSlot = "";
+let roiSlots: (DetectRoi | null)[] = [null, null, null, null];
 let roiX: number | null = null;
 let roiY: number | null = null;
 let roiW: number | null = null;
@@ -286,14 +292,24 @@ function apiBaseUrlError(value: string): string {
 }
 
 function asRoi(value: unknown): DetectRoi | null {
-	if (!value || typeof value !== "object") return null;
-	const row = value as Record<string, unknown>;
-	const x = Number(row.x);
-	const y = Number(row.y);
-	const w = Number(row.w);
-	const h = Number(row.h);
-	if (![x, y, w, h].every((part) => Number.isFinite(part))) return null;
-	return { x, y, w, h };
+	return parseDetectRoi(value);
+}
+
+function showRoiSlot() {
+	const index = Number(roiSlot);
+	if (!Number.isInteger(index) || index < 1 || index > 4) {
+		fillRoi(null);
+		return;
+	}
+	fillRoi(roiSlots[index - 1] ?? null);
+}
+
+function onRoiSlotChange(event: Event) {
+	const target = event.currentTarget;
+	if (!(target instanceof HTMLSelectElement)) return;
+	roiSlot = target.value;
+	roiNotice = "";
+	showRoiSlot();
 }
 
 function fillRoi(value: DetectRoi | null) {
@@ -866,7 +882,8 @@ async function loadTestMode() {
 async function loadRoi() {
 	try {
 		const data = await loadDocument();
-		fillRoi(asRoi(data.detectRoi));
+		roiSlots = parseDetectRois(data.detectRois, data.detectRoi);
+		showRoiSlot();
 		fillBarcodeRoi(asBarcodeRoi(data.barcodeRoi));
 	} catch (err: unknown) {
 		roiNotice = invokeError(err, "Could not load the ROI");
@@ -982,12 +999,21 @@ async function saveErp() {
 }
 
 async function postRoi(next: DetectRoi | null) {
+	const index = Number(roiSlot);
+	if (!Number.isInteger(index) || index < 1 || index > 4) {
+		roiNotice = "Choose a slot.";
+		return;
+	}
 	savingRoi = true;
 	roiNotice = "";
 	try {
 		const current = await loadDocument();
-		current.detectRoi = next;
+		const slots = parseDetectRois(current.detectRois, current.detectRoi);
+		slots[index - 1] = next;
+		current.detectRois = slots;
+		current.detectRoi = slots[0];
 		await storeDocument(current);
+		roiSlots = slots;
 		fillRoi(asRoi(next));
 		roiNotice = "Saved";
 	} catch (err: unknown) {
@@ -997,7 +1023,19 @@ async function postRoi(next: DetectRoi | null) {
 	}
 }
 
+function roiFieldsEmpty(): boolean {
+	return roiX === null && roiY === null && roiW === null && roiH === null;
+}
+
 function saveRoi() {
+	if (!roiSlot) {
+		roiNotice = "Choose a slot.";
+		return;
+	}
+	if (roiFieldsEmpty()) {
+		void postRoi(null);
+		return;
+	}
 	const next = readRoiFields();
 	if (!next) {
 		roiNotice =
@@ -2606,11 +2644,27 @@ onDestroy(() => {
 								<legend class="text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
 									Part detection
 								</legend>
+								<label class="flex w-28 flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+									Slot
+									<select
+										class="border border-neutral-600 bg-neutral-950 px-3 py-2 font-mono text-base font-medium normal-case tracking-normal text-neutral-100"
+										value={roiSlot}
+										on:change={onRoiSlotChange}
+									>
+										<option value=""></option>
+										<option value="1">1</option>
+										<option value="2">2</option>
+										<option value="3">3</option>
+										<option value="4">4</option>
+									</select>
+								</label>
 								<p class="text-sm text-neutral-400">
-									{#if roi}
-										Detection uses this region of the image.
+									{#if !roiSlot}
+										No slot selected. With no slots saved, detection uses the full image.
+									{:else if roi}
+										Slot {roiSlot} uses this region of the image.
 									{:else}
-										No region saved. Detection uses the full image.
+										Slot {roiSlot} is unset.
 									{/if}
 									Hold a snapshot on the operator page and use Set ROI to draw it.
 								</p>
@@ -2624,6 +2678,7 @@ onDestroy(() => {
 											min="0"
 											max="1"
 											step="any"
+											disabled={!roiSlot}
 										/>
 									</label>
 									<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
@@ -2635,6 +2690,7 @@ onDestroy(() => {
 											min="0"
 											max="1"
 											step="any"
+											disabled={!roiSlot}
 										/>
 									</label>
 									<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
@@ -2646,6 +2702,7 @@ onDestroy(() => {
 											min="0"
 											max="1"
 											step="any"
+											disabled={!roiSlot}
 										/>
 									</label>
 									<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
@@ -2657,6 +2714,7 @@ onDestroy(() => {
 											min="0"
 											max="1"
 											step="any"
+											disabled={!roiSlot}
 										/>
 									</label>
 								</div>
@@ -2665,7 +2723,7 @@ onDestroy(() => {
 								<button
 									type="submit"
 									class="inline-flex min-h-11 items-center border border-blue-500 bg-blue-600 px-4 text-sm font-semibold text-white disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
-									disabled={savingRoi}
+									disabled={savingRoi || !roiSlot}
 								>
 									{savingRoi ? "Saving..." : "Save"}
 								</button>
@@ -2674,6 +2732,7 @@ onDestroy(() => {
 									class="inline-flex min-h-11 items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100 disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
 									on:click={clearRoi}
 									disabled={savingRoi ||
+										!roiSlot ||
 										(roi === null &&
 											roiX === null &&
 											roiY === null &&
