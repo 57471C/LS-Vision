@@ -28,6 +28,14 @@ Settings are stored in `vision/config.local.json` (gitignored). The unlock passw
 
 Training lists `.pt` and `.onnx` files in the app data models folder. Update model copies an `.onnx` file over the selected `.onnx` name, or over `best.onnx`. The selected basename is `model` in `vision/config.local.json`. Detection runs only for `.onnx`, and the next run loads the copied file.
 
+## Part rules
+
+Settings > Parts stores `partRules` in `vision/config.local.json`. Each row is a parent class, a child class, a condition (`contains` or `no child`), and a result IC. Parent and child are chosen from the active ONNX model's class list. Type in the field to filter that list. Add and remove rows, then Save. Up and Down set the order. Rules run from top to bottom and the first match wins.
+
+`contains` matches when the child box center lies inside the parent box, including the edge. `no child` matches when that center is absent. A blank child on `no child` means any class inside the parent. The parent box is renamed to the result IC. The child box keeps the class the model gave it. An empty list leaves every class unchanged. At inspect time, a rule whose parent or named child is not in the loaded model's class list is skipped. The operator page shows "Some part rules could not be applied (missing classes). Check Settings." and the operator console names each skipped rule. A model with no class metadata shows "This model has no class list." and leaves the class fields disabled. With no ONNX model, the message is "Load a model to choose classes."
+
+Example: parent `Hinge_Plate`, child `P02_Logo`, condition `contains`, result `2QHP02`. A second row with condition `no child` and result `2QHP01` names a plate that has no logo inside it.
+
 ## Database
 
 - BoM source: JSON (`vision/sample-bom.json`), API (base URL, path, and API key; the barcode is the job card number), or MSSQL (Windows Authentication by default, SQL authentication optional).

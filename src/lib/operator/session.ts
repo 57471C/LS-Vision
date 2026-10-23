@@ -14,6 +14,7 @@ import {
 	isCameraOpenError,
 } from "$lib/operator/console";
 import { detectionCounts, inspectionVerdict } from "$lib/operator/verdict";
+import { applyPartRules, parsePartRules } from "$lib/part-composition";
 import {
 	type BarcodeRoi,
 	createOperatorViews,
@@ -122,6 +123,10 @@ function attachSession(
 
 	function toggleConsole() {
 		op.consoleOpen = !op.consoleOpen;
+	}
+
+	function dismissPartRuleWarning() {
+		op.partRuleWarning = false;
 	}
 
 	function noteCameraOpenError(message: string) {
@@ -281,6 +286,44 @@ function attachSession(
 		return found;
 	}
 
+	function modelClassList(value: unknown): string[] | null {
+		if (!Array.isArray(value)) return null;
+		const names: string[] = [];
+		for (const item of value) {
+			if (typeof item !== "string" || !item || names.includes(item)) continue;
+			names.push(item);
+		}
+		return names;
+	}
+
+	// Rename parents before the counts, the overlay, and the saved result.
+	// The model list from detect_image is left as the trained class names.
+	// checked is false when this detect did not return a class list.
+	async function composeDetections(
+		items: Detection[],
+		modelClasses: readonly string[] | null,
+	): Promise<{ detections: Detection[]; skipped: number; checked: boolean }> {
+		try {
+			const config = await readConfig();
+			const rules = parsePartRules(config.partRules);
+			if (rules.length === 0) {
+				return { detections: items, skipped: 0, checked: true };
+			}
+			const outcome = applyPartRules(items, rules, modelClasses);
+			for (const line of outcome.log) writeConsole(line);
+			return {
+				detections: outcome.detections,
+				skipped: outcome.skipped,
+				checked: modelClasses !== null,
+			};
+		} catch (err: unknown) {
+			writeConsole(
+				`Part rules: ${invokeError(err, "Could not load part rules")}. Classes were left unchanged.`,
+			);
+			return { detections: items, skipped: 0, checked: false };
+		}
+	}
+
 	function detectedImageSrc(encoded: string): string {
 		const text = encoded.trim();
 		if (text.startsWith("data:")) return text;
@@ -289,6 +332,7 @@ function attachSession(
 
 	async function requestDetections(body: { image?: string }): Promise<{
 		detections?: unknown;
+		classes?: unknown;
 		image_base64?: unknown;
 		message?: unknown;
 	}> {
@@ -395,7 +439,13 @@ function attachSession(
 		try {
 			const payload = await requestDetections(body);
 			if (generation !== detectGeneration || !pageAlive) return;
-			op.detections = asDetections(payload.detections);
+			const composed = await composeDetections(
+				asDetections(payload.detections),
+				modelClassList(payload.classes),
+			);
+			if (generation !== detectGeneration || !pageAlive) return;
+			op.detections = composed.detections;
+			if (composed.checked) op.partRuleWarning = composed.skipped > 0;
 			op.detectMessage =
 				typeof payload.message === "string" ? payload.message : "";
 			if (
@@ -828,6 +878,7 @@ function attachSession(
 		testMode?: unknown;
 		skipResultSave?: unknown;
 		detectRoi?: unknown;
+		partRules?: unknown;
 		camera?: { index?: unknown; displayFps?: unknown } | null;
 		erp?: { name?: unknown; url?: unknown } | null;
 	};
@@ -1954,6 +2005,7 @@ function attachSession(
 		openErpInBrowser,
 		toggleConsole,
 		clearConsole,
+		dismissPartRuleWarning,
 	};
 	return session;
 }

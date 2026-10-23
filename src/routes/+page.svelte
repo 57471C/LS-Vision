@@ -32,6 +32,7 @@ const {
 	onIframeError,
 	openErpInBrowser,
 	toggleConsole,
+	dismissPartRuleWarning,
 } = session;
 
 onMount(() => start());
@@ -130,6 +131,26 @@ onDestroy(() => stop());
 
 		<ResultsPanel />
 	</div>
+
+	{#if $operator.partRuleWarning}
+		<div
+			class="pointer-events-none absolute inset-x-0 bottom-14 z-30 flex justify-center px-4"
+			role="status"
+		>
+			<div
+				class="pointer-events-auto flex max-w-xl items-start gap-3 border border-amber-700/80 bg-neutral-900 px-4 py-3 text-sm text-amber-100 shadow-lg"
+			>
+				<p>Some part rules could not be applied (missing classes). Check Settings.</p>
+				<button
+					type="button"
+					class="shrink-0 border border-amber-700/80 px-2 py-1 text-xs font-semibold uppercase tracking-wide text-amber-100"
+					on:click={dismissPartRuleWarning}
+				>
+					Dismiss
+				</button>
+			</div>
+		</div>
+	{/if}
 
 	{#if $operator.admin && $operator.consoleOpen}
 		<OperatorConsole />

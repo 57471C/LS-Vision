@@ -589,6 +589,164 @@ fn names_from_pairs(pairs: Vec<(usize, String)>) -> Vec<String> {
     names
 }
 
+const LOAD_CLASSES: &str = "Load a model to choose classes.";
+const NO_CLASS_LIST: &str = "This model has no class list.";
+
+#[derive(Debug, Serialize)]
+pub struct ModelClasses {
+    model: String,
+    classes: Vec<String>,
+    message: String,
+}
+
+fn read_varint(data: &[u8], index: &mut usize) -> Option<u64> {
+    let mut value = 0u64;
+    let mut shift = 0;
+    while *index < data.len() && shift < 64 {
+        let byte = data[*index];
+        *index += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some(value);
+        }
+        shift += 7;
+    }
+    None
+}
+
+fn protobuf_bytes<'a>(data: &'a [u8], index: &mut usize) -> Option<&'a [u8]> {
+    let len = usize::try_from(read_varint(data, index)?).ok()?;
+    let end = index.checked_add(len)?;
+    if end > data.len() {
+        return None;
+    }
+    let bytes = &data[*index..end];
+    *index = end;
+    Some(bytes)
+}
+
+// ONNX ModelProto stores Ultralytics class names in metadata_props (field 14).
+fn onnx_names_metadata(data: &[u8]) -> Option<String> {
+    let mut index = 0;
+    while index < data.len() {
+        let tag = read_varint(data, &mut index)?;
+        let field = tag >> 3;
+        let wire = tag & 7;
+        match wire {
+            0 => {
+                read_varint(data, &mut index)?;
+            }
+            1 => index = index.checked_add(8)?,
+            5 => index = index.checked_add(4)?,
+            2 => {
+                let bytes = protobuf_bytes(data, &mut index)?;
+                if field == 14 {
+                    if let Some(text) = metadata_entry_value(bytes, "names") {
+                        return Some(text);
+                    }
+                }
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn metadata_entry_value(data: &[u8], wanted: &str) -> Option<String> {
+    let mut index = 0;
+    let mut key = String::new();
+    let mut value = String::new();
+    while index < data.len() {
+        let tag = read_varint(data, &mut index)?;
+        let field = tag >> 3;
+        if tag & 7 != 2 {
+            return None;
+        }
+        let bytes = protobuf_bytes(data, &mut index)?;
+        let text = String::from_utf8_lossy(bytes).into_owned();
+        if field == 1 {
+            key = text;
+        } else if field == 2 {
+            value = text;
+        }
+    }
+    if key == wanted && !value.is_empty() {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+fn listed_classes(names: Vec<String>) -> Vec<String> {
+    let mut listed = Vec::new();
+    for name in names {
+        if name.is_empty() || listed.iter().any(|item| item == &name) {
+            continue;
+        }
+        listed.push(name);
+    }
+    listed
+}
+
+fn classes_from_metadata(model: &str, data: &[u8]) -> ModelClasses {
+    let Some(text) = onnx_names_metadata(data) else {
+        return ModelClasses {
+            model: model.to_string(),
+            classes: Vec::new(),
+            message: NO_CLASS_LIST.to_string(),
+        };
+    };
+    let classes = listed_classes(parse_class_names(&text));
+    let message = if classes.is_empty() {
+        NO_CLASS_LIST.to_string()
+    } else {
+        String::new()
+    };
+    ModelClasses {
+        model: model.to_string(),
+        classes,
+        message,
+    }
+}
+
+fn load_model_prompt(model: &str) -> ModelClasses {
+    ModelClasses {
+        model: model.to_string(),
+        classes: Vec::new(),
+        message: LOAD_CLASSES.to_string(),
+    }
+}
+
+fn model_class_names_now() -> ModelClasses {
+    let Ok(root) = local_config::project_root() else {
+        return load_model_prompt("");
+    };
+    let Ok(model) = local_config::configured_model_name(&root) else {
+        return load_model_prompt("");
+    };
+    if !model.to_ascii_lowercase().ends_with(".onnx") {
+        return load_model_prompt(&model);
+    }
+    let Ok(models) = local_config::app_models_dir() else {
+        return load_model_prompt(&model);
+    };
+    let Ok(path) = resolved_onnx_model(&models, &model) else {
+        return load_model_prompt(&model);
+    };
+    let Ok(data) = std::fs::read(&path) else {
+        return load_model_prompt(&model);
+    };
+    classes_from_metadata(&model, &data)
+}
+
+#[tauri::command]
+pub async fn model_class_names() -> ModelClasses {
+    match tauri::async_runtime::spawn_blocking(model_class_names_now).await {
+        Ok(found) => found,
+        Err(_) => load_model_prompt(""),
+    }
+}
+
 fn score_at(
     values: &[f32],
     bcn: bool,
@@ -1196,7 +1354,7 @@ fn run_model(
     height: u32,
     roi: Option<&Roi>,
     conf_threshold: f32,
-) -> Result<Vec<Detection>, String> {
+) -> Result<(Vec<Detection>, Vec<String>), String> {
     let image_size = with_model(path, |model| Ok(model.image_size))?;
     let prepared = detect_view(rgb, width, height, roi, image_size)?;
     infer_prepared(path, image_size, prepared, conf_threshold)
@@ -1207,7 +1365,7 @@ fn infer_prepared(
     image_size: usize,
     prepared: (Vec<f32>, i32, i32, i32, i32),
     conf_threshold: f32,
-) -> Result<Vec<Detection>, String> {
+) -> Result<(Vec<Detection>, Vec<String>), String> {
     let (data, view_w, view_h, origin_x, origin_y) = prepared;
     with_model(path, |model| {
         let retry = if model.provider == Provider::Cpu {
@@ -1215,7 +1373,7 @@ fn infer_prepared(
         } else {
             Some(data.clone())
         };
-        match infer_detections(
+        let found = match infer_detections(
             model,
             data,
             image_size,
@@ -1225,7 +1383,7 @@ fn infer_prepared(
             origin_y,
             conf_threshold,
         ) {
-            Ok(found) => Ok(found),
+            Ok(found) => found,
             Err(message) => {
                 let Some(retry) = retry else {
                     return Err(message);
@@ -1255,9 +1413,11 @@ fn infer_prepared(
                     origin_x,
                     origin_y,
                     conf_threshold,
-                )
+                )?
             }
-        }
+        };
+        // The same names this session used to label boxes. Empty gaps are dropped.
+        Ok((found, listed_classes(model.names.clone())))
     })
 }
 
@@ -1268,10 +1428,12 @@ fn detect_on_model(
     conf_threshold: f32,
 ) -> Result<Value, String> {
     let (rgb, width, height) = decode_rgb(bytes)?;
-    let detections = run_model(path, &rgb, width, height, roi, conf_threshold)?;
+    let (detections, classes) =
+        run_model(path, &rgb, width, height, roi, conf_threshold)?;
     let encoded = encode_jpeg(&rgb, width, height)?;
     Ok(json!({
         "detections": detections,
+        "classes": classes,
         "image_base64": encoded,
     }))
 }
@@ -1601,6 +1763,87 @@ mod tests {
         assert_eq!(names, vec!["2BBMNM08".to_string(), "2BB06B2SZ".to_string()]);
     }
 
+    fn proto_varint(value: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut rest = value;
+        loop {
+            let mut byte = (rest & 0x7f) as u8;
+            rest >>= 7;
+            if rest != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if rest == 0 {
+                break;
+            }
+        }
+        out
+    }
+
+    fn proto_bytes(field: u32, bytes: &[u8]) -> Vec<u8> {
+        let mut out = proto_varint((u64::from(field) << 3) | 2);
+        out.extend(proto_varint(bytes.len() as u64));
+        out.extend(bytes);
+        out
+    }
+
+    fn proto_entry(key: &str, value: &str) -> Vec<u8> {
+        let mut body = proto_bytes(1, key.as_bytes());
+        body.extend(proto_bytes(2, value.as_bytes()));
+        proto_bytes(14, &body)
+    }
+
+    #[test]
+    fn onnx_metadata_lists_hinge_plate_and_logo() {
+        let mut model = proto_varint(8);
+        model.push(10);
+        model.extend(proto_bytes(7, &[1, 2, 3, 4]));
+        model.extend(proto_entry(
+            "names",
+            "{0: 'Hinge_Plate', 1: 'P02_Logo', 3: 'bolt'}",
+        ));
+        model.extend(proto_entry("args", "{'batch': 1}"));
+        let found = classes_from_metadata("demo.onnx", &model);
+        assert_eq!(found.message, "");
+        assert_eq!(
+            found.classes,
+            vec![
+                "Hinge_Plate".to_string(),
+                "P02_Logo".to_string(),
+                "bolt".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn onnx_without_class_metadata_has_no_class_list() {
+        let model = proto_bytes(7, b"graph");
+        let found = classes_from_metadata("plain.onnx", &model);
+        assert!(found.classes.is_empty());
+        assert_eq!(found.message, NO_CLASS_LIST);
+        assert!(onnx_names_metadata(&[0xff, 0xff, 0xff]).is_none());
+    }
+
+    #[test]
+    fn installed_onnx_exposes_its_class_list_when_present() {
+        let Ok(appdata) = std::env::var("APPDATA") else {
+            return;
+        };
+        let path = std::path::PathBuf::from(appdata)
+            .join("studio.lean.ls-vision")
+            .join("models")
+            .join("best.onnx");
+        if !path.is_file() {
+            return;
+        }
+        let data = std::fs::read(&path).unwrap();
+        let found = classes_from_metadata("best.onnx", &data);
+        assert!(found.message.is_empty(), "{}", found.message);
+        assert!(found.classes.len() >= 2, "{:?}", found.classes);
+        assert!(found.classes.iter().any(|name| name == "2QHP01"));
+        assert!(found.classes.iter().any(|name| name == "2QHP02"));
+    }
+
     #[test]
     fn detect_roi_rejects_a_bool_and_clips_the_box() {
         assert!(clean_detect_roi(&Value::Null).is_none());
@@ -1662,6 +1905,7 @@ mod tests {
         );
         // The fixture was exported at conf 0.25. Live detection uses the saved value.
         let payload = detect_on_model(&bytes, &model, None, 0.25).unwrap();
+        assert!(payload["classes"].is_array());
         let got: Vec<Detection> = serde_json::from_value(payload["detections"].clone()).unwrap();
         let fixture = manifest.join("tests").join("example3-onnx-detections.json");
         let expected: Vec<Detection> =
