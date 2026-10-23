@@ -11,6 +11,7 @@ import {
 	retainCameraSettings,
 	settingsForCamera,
 } from "$lib/camera-settings";
+import ClassPicker from "$lib/ClassPicker.svelte";
 import {
 	parsePartRules,
 	PART_LABEL_LIMIT,
@@ -159,6 +160,10 @@ let partNotice = "";
 let savingParts = false;
 let partLoadId = 0;
 let partRuleSeq = 0;
+let partClasses: string[] = [];
+let partClassMessage = "Load a model to choose classes.";
+let partClassesReady = false;
+let partClassLoadId = 0;
 
 const PREVIEW_LABEL = "camera-preview";
 const PREVIEW_CHANNEL = "ls-vision-camera-preview";
@@ -199,7 +204,10 @@ function selectSection(next: SettingsSection) {
 	sessionStorage.setItem(SECTION_KEY, next);
 	if (next === "camera") void loadCameraSettings();
 	if (next === "training") void loadModel();
-	if (next === "parts") void loadPartRules();
+	if (next === "parts") {
+		void loadPartRules();
+		void loadPartClasses();
+	}
 }
 
 function focusOnMount(node: HTMLInputElement) {
@@ -419,6 +427,7 @@ async function loadSource() {
 		await loadRoi();
 		await loadModel();
 		await loadPartRules();
+		if (section === "parts") await loadPartClasses();
 	} catch (err: unknown) {
 		if (id !== configLoadId) return;
 		notice = invokeError(err, "Could not load vision/config.local.json.");
@@ -762,6 +771,7 @@ async function saveModel() {
 			message?: unknown;
 		}>("set_active_model", { filename: modelName });
 		applyModel(data);
+		void loadPartClasses();
 		modelNotice =
 			typeof data.message === "string" && data.message ? data.message : "Saved";
 	} catch (err: unknown) {
@@ -787,6 +797,7 @@ async function updateModel() {
 				: "Updated";
 		if (message !== "No file selected.") {
 			applyModel(data);
+			void loadPartClasses();
 		}
 		modelNotice = message;
 	} catch (err: unknown) {
@@ -1115,8 +1126,11 @@ function partRuleProblem(drafts: readonly PartRuleDraft[]): string {
 		const child = rule.child.trim();
 		const result = rule.result.trim();
 		if (!parent && !child && !result) continue;
-		if (!parent || !child || !result) {
-			return `Rule ${index + 1} needs a parent class, a child class, and a result IC.`;
+		const noChild = rule.condition === "no-child";
+		if (!parent || !result || (!noChild && !child)) {
+			return noChild
+				? `Rule ${index + 1} needs a parent class and a result IC.`
+				: `Rule ${index + 1} needs a parent class, a child class, and a result IC.`;
 		}
 		if (
 			parent.length > PART_LABEL_LIMIT ||
@@ -1138,9 +1152,38 @@ function partRulesFromDrafts(drafts: readonly PartRuleDraft[]): PartRule[] {
 		if (!parent && !child && !result) continue;
 		const condition: PartCondition =
 			rule.condition === "no-child" ? "no-child" : "contains";
+		if (!parent || !result || (condition === "contains" && !child)) continue;
 		rules.push({ parent, child, condition, result });
 	}
 	return rules;
+}
+
+async function loadPartClasses() {
+	const id = ++partClassLoadId;
+	try {
+		const data = await invokeRust<{
+			model?: unknown;
+			classes?: unknown;
+			message?: unknown;
+		}>("model_class_names");
+		if (id !== partClassLoadId) return;
+		partClasses = Array.isArray(data.classes)
+			? data.classes.filter(
+					(item): item is string =>
+						typeof item === "string" && item.length > 0,
+				)
+			: [];
+		const message = typeof data.message === "string" ? data.message.trim() : "";
+		partClassMessage = partClasses.length
+			? ""
+			: message || "Load a model to choose classes.";
+		partClassesReady = true;
+	} catch {
+		if (id !== partClassLoadId) return;
+		partClasses = [];
+		partClassMessage = "Load a model to choose classes.";
+		partClassesReady = true;
+	}
 }
 
 async function loadPartRules() {
@@ -1908,9 +1951,15 @@ async function openPreview() {
 	}
 }
 
+function onWindowFocus() {
+	if (!unlocked || section !== "parts") return;
+	void loadPartClasses();
+}
+
 onMount(() => {
 	previewChannel = new BroadcastChannel(PREVIEW_CHANNEL);
 	previewChannel.onmessage = onPreviewFocus;
+	window.addEventListener("focus", onWindowFocus);
 	void loadInference();
 	if (!unlocked) {
 		void loadModel();
@@ -1923,6 +1972,7 @@ onMount(() => {
 onDestroy(() => {
 	cancelCameraApply();
 	cancelConfidenceSave();
+	window.removeEventListener("focus", onWindowFocus);
 	previewChannel?.close();
 	previewChannel = null;
 });
@@ -2839,8 +2889,13 @@ onDestroy(() => {
 							on:submit|preventDefault={savePartRules}
 						>
 							<p class="text-sm text-neutral-400">
-								After detection, a parent box is renamed to the result IC when its rule matches. Contains matches when the child box center lies inside the parent, including the edge. No child matches when that center is absent. Rules run from top to bottom and the first match wins. Child boxes keep the class the model gave them. An empty list leaves every class unchanged.
+								After detection, a parent box is renamed to the result IC when its rule matches. Parent and child are chosen from the active model's class list. Contains matches when the child box center lies inside the parent, including the edge. No child matches when that center is absent. A blank child on no child means any class inside the parent. Rules run from top to bottom and the first match wins. Child boxes keep the class the model gave them. An empty list leaves every class unchanged.
 							</p>
+							{#if !partClassesReady}
+								<p class="text-sm text-neutral-400">Loading classes...</p>
+							{:else if partClasses.length === 0}
+								<p class="text-sm text-neutral-400">{partClassMessage}</p>
+							{/if}
 							<div class="overflow-x-auto">
 								<table class="w-full min-w-[44rem] border-collapse text-left">
 									<thead>
@@ -2856,21 +2911,24 @@ onDestroy(() => {
 										{#each partRules as rule, index (rule.id)}
 											<tr class="border-t border-neutral-800">
 												<td class="px-2 py-2">
-													<input
-														class="w-full min-w-32 border border-neutral-600 bg-neutral-950 px-2 py-2 font-mono text-sm text-neutral-100"
+													<ClassPicker
 														bind:value={rule.parent}
-														aria-label={`Parent class for rule ${index + 1}`}
-														maxlength={PART_LABEL_LIMIT}
-														autocomplete="off"
+														classes={partClasses}
+														label={`Parent class for rule ${index + 1}`}
+														disabled={savingParts ||
+															!partClassesReady ||
+															partClasses.length === 0}
 													/>
 												</td>
 												<td class="px-2 py-2">
-													<input
-														class="w-full min-w-32 border border-neutral-600 bg-neutral-950 px-2 py-2 font-mono text-sm text-neutral-100"
+													<ClassPicker
 														bind:value={rule.child}
-														aria-label={`Child class for rule ${index + 1}`}
-														maxlength={PART_LABEL_LIMIT}
-														autocomplete="off"
+														classes={partClasses}
+														label={`Child class for rule ${index + 1}`}
+														allowEmpty={rule.condition === "no-child"}
+														disabled={savingParts ||
+															!partClassesReady ||
+															partClasses.length === 0}
 													/>
 												</td>
 												<td class="px-2 py-2">

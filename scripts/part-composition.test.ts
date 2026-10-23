@@ -218,6 +218,113 @@ check(
 	chained.detections[0]?.ic === "2QHP02",
 );
 
+const blankChild = parsePartRules([
+	{
+		parent: "Hinge_Plate",
+		child: "",
+		condition: "no-child",
+		result: "2QHP01",
+	},
+	{
+		parent: "Hinge_Plate",
+		child: "",
+		condition: "contains",
+		result: "2QHP02",
+	},
+]);
+check(
+	"a blank child is kept for no child and dropped for contains",
+	blankChild.length === 1 &&
+		blankChild[0]?.condition === "no-child" &&
+		blankChild[0]?.child === "",
+);
+const modelClasses = ["Hinge_Plate", "P02_Logo", "2BBMNM08", "bolt"];
+const mixedRules: PartRule[] = [
+	{
+		parent: "Missing_Plate",
+		child: "P02_Logo",
+		condition: "contains",
+		result: "2QHP99",
+	},
+	hingeRules[0],
+	{
+		parent: "Hinge_Plate",
+		child: "Old_Logo",
+		condition: "no-child",
+		result: "SKIPPED_IC",
+	},
+];
+const mixed = applyPartRules(snapshot, mixedRules, modelClasses);
+check(
+	"a missing parent is skipped and the valid rule still renames the plate",
+	mixed.detections[0]?.ic === "2QHP02" &&
+		mixed.detections[2]?.ic === "Hinge_Plate" &&
+		!mixed.detections.some((item) => item.ic === "SKIPPED_IC" || item.ic === "2QHP99"),
+	mixed.detections.map((item) => item.ic).join(","),
+);
+check(
+	"skipped rules are logged and counted once each",
+	mixed.skipped === 2 &&
+		mixed.log[0] ===
+			"Part rule 1 skipped: parent Missing_Plate is not in the model class list" &&
+		mixed.log[1] ===
+			"Part rule 3 skipped: child Old_Logo is not in the model class list" &&
+		mixed.log.some((line) => line.startsWith("Part rule 2 matched:")),
+	mixed.log.join(" | "),
+);
+const bothMissing = applyPartRules(
+	snapshot,
+	[
+		{
+			parent: "Missing_Plate",
+			child: "Old_Logo",
+			condition: "contains",
+			result: "2QHP99",
+		},
+	],
+	modelClasses,
+);
+check(
+	"a rule missing both classes is one skip and leaves the boxes unchanged",
+	bothMissing.skipped === 1 &&
+		bothMissing.detections[0]?.ic === "Hinge_Plate" &&
+		bothMissing.log[0] ===
+			"Part rule 1 skipped: parent Missing_Plate and child Old_Logo are not in the model class list" &&
+		!bothMissing.log.some((line) => line === "Part rules: none matched"),
+	bothMissing.log.join(" | "),
+);
+const blankOnModel = applyPartRules(
+	[box("Hinge_Plate", [0, 0, 100, 80])],
+	blankChild,
+	modelClasses,
+);
+check(
+	"a blank child is not treated as a missing class",
+	blankOnModel.skipped === 0 && blankOnModel.detections[0]?.ic === "2QHP01",
+	blankOnModel.log.join(" | "),
+);
+const noNames = applyPartRules(snapshot, hingeRules, []);
+check(
+	"a model with no class names skips every rule",
+	noNames.skipped === 2 && noNames.detections[0]?.ic === "Hinge_Plate",
+	noNames.log.join(" | "),
+);
+
+const blankApplied = applyPartRules(
+	[
+		box("Hinge_Plate", [0, 0, 100, 80]),
+		box("Hinge_Plate", [200, 0, 280, 260]),
+		box("bolt", [210, 210, 230, 230]),
+	],
+	blankChild,
+);
+check(
+	"a blank no-child rule matches only a parent with nothing inside",
+	blankApplied.detections.map((item) => item.ic).join(",") ===
+		"2QHP01,Hinge_Plate,bolt",
+	blankApplied.detections.map((item) => item.ic).join(","),
+);
+
 if (failed > 0) {
 	throw new Error(`${failed} part composition checks failed`);
 }

@@ -116,6 +116,7 @@ export type OperatorState = {
 	modelMenuOpen: boolean;
 	savingModel: boolean;
 	modelNotice: string;
+	partRuleWarning: boolean;
 	consoleOpen: boolean;
 	consoleLines: ConsoleLine[];
 };
@@ -166,6 +167,7 @@ export function initialOperator(): OperatorState {
 		modelMenuOpen: false,
 		savingModel: false,
 		modelNotice: "",
+		partRuleWarning: false,
 		consoleOpen: false,
 		consoleLines: [],
 	};
@@ -261,6 +263,7 @@ export type OperatorSession = {
 	openErpInBrowser: () => Promise<void>;
 	toggleConsole: () => void;
 	clearConsole: () => void;
+	dismissPartRuleWarning: () => void;
 };
 
 export type OperatorStores = {

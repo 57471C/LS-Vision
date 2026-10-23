@@ -24,6 +24,7 @@ export type PartBox = {
 export type PartComposition = {
 	detections: PartBox[];
 	log: string[];
+	skipped: number;
 };
 
 type Rect = {
@@ -61,7 +62,9 @@ export function parsePartRules(value: unknown): PartRule[] {
 		const child = cleanLabel(row.child);
 		const result = cleanLabel(row.result);
 		const condition = readCondition(row.condition);
-		if (!parent || !child || !result || !condition) continue;
+		if (!parent || !result || !condition) continue;
+		// A blank child is only meaningful for "no child": any class inside the parent.
+		if (condition === "contains" && !child) continue;
 		rules.push({ parent, child, condition, result });
 		if (rules.length >= PART_RULE_LIMIT) break;
 	}
@@ -99,38 +102,76 @@ function formatBox(box: Rect): string {
 	return `${n(box.x1)},${n(box.y1)},${n(box.x2)},${n(box.y2)}`;
 }
 
+function missingClassNote(
+	rule: PartRule,
+	missingParent: boolean,
+	missingChild: boolean,
+): string {
+	if (missingParent && missingChild) {
+		return `parent ${rule.parent} and child ${rule.child} are not in the model class list`;
+	}
+	if (missingParent) return `parent ${rule.parent} is not in the model class list`;
+	return `child ${rule.child} is not in the model class list`;
+}
+
+// modelClasses null means this detect did not return a class list, so every
+// saved rule still runs. An empty list means the model has no class names.
 export function applyPartRules(
 	detections: readonly PartBox[],
 	rules: readonly PartRule[],
+	modelClasses: readonly string[] | null = null,
 ): PartComposition {
 	if (rules.length === 0) {
-		return { detections: detections.slice(), log: [] };
+		return { detections: detections.slice(), log: [], skipped: 0 };
+	}
+	const known = modelClasses === null ? null : new Set(modelClasses);
+	const usable: { rule: PartRule; number: number }[] = [];
+	const log: string[] = [];
+	let skipped = 0;
+	for (let ruleIndex = 0; ruleIndex < rules.length; ruleIndex += 1) {
+		const rule = rules[ruleIndex];
+		if (known) {
+			const missingParent = !known.has(rule.parent);
+			const missingChild = rule.child.length > 0 && !known.has(rule.child);
+			if (missingParent || missingChild) {
+				skipped += 1;
+				log.push(
+					`Part rule ${ruleIndex + 1} skipped: ${missingClassNote(rule, missingParent, missingChild)}`,
+				);
+				continue;
+			}
+		}
+		usable.push({ rule, number: ruleIndex + 1 });
 	}
 	const boxes = detections.map((item) => rectOf(item.bbox));
 	const next = detections.slice();
-	const log: string[] = [];
+	let matched = false;
 	for (let index = 0; index < detections.length; index += 1) {
 		const item = detections[index];
 		const parentBox = boxes[index];
 		if (!parentBox) continue;
-		for (let ruleIndex = 0; ruleIndex < rules.length; ruleIndex += 1) {
-			const rule = rules[ruleIndex];
+		for (const entry of usable) {
+			const rule = entry.rule;
 			if (item.ic !== rule.parent) continue;
+			if (rule.condition === "contains" && !rule.child) continue;
 			const inside = detections.some((other, otherIndex) => {
-				if (otherIndex === index || other.ic !== rule.child) return false;
+				if (otherIndex === index) return false;
+				if (rule.child && other.ic !== rule.child) return false;
 				const childBox = boxes[otherIndex];
 				if (!childBox) return false;
 				return centerInside(childBox, parentBox);
 			});
-			const matched = rule.condition === "contains" ? inside : !inside;
-			if (!matched) continue;
+			const matchedRule = rule.condition === "contains" ? inside : !inside;
+			if (!matchedRule) continue;
 			next[index] = { ...item, ic: rule.result };
+			const childText = rule.child || "any class";
 			log.push(
-				`Part rule ${ruleIndex + 1} matched: ${rule.parent} ${conditionLabel(rule.condition)} ${rule.child} -> ${rule.result} at ${formatBox(parentBox)}`,
+				`Part rule ${entry.number} matched: ${rule.parent} ${conditionLabel(rule.condition)} ${childText} -> ${rule.result} at ${formatBox(parentBox)}`,
 			);
+			matched = true;
 			break;
 		}
 	}
-	if (log.length === 0) log.push("Part rules: none matched");
-	return { detections: next, log };
+	if (!matched && usable.length > 0) log.push("Part rules: none matched");
+	return { detections: next, log, skipped };
 }

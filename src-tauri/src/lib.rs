@@ -51,6 +51,7 @@ pub fn run() {
             training::save_training_image,
             detect::detect_image,
             detect::benchmark_detect,
+            detect::model_class_names,
             inference_ep::inference_status,
             inference_ep::set_inference_ep,
             results::save_result,

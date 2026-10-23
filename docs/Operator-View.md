@@ -25,7 +25,7 @@ When Test mode is on, the countdown does not read the camera. The button reads *
 
 The right-hand panel shows pass or fail, the kit, and the parts table (expected quantity against what detection saw).
 
-Part rules, when Settings has any, run after the model returns boxes and before those counts and the boxes on the still. A matching parent class is shown as the result IC. The operator console lists each rule that matched. With no rules, the classes on screen are the ones the model returned.
+Part rules, when Settings has any, run after the model returns boxes and before those counts and the boxes on the still. A matching parent class is shown as the result IC. A rule whose parent or named child is not in that model's class list is skipped. The other rules still run, and the pass or fail result stays on screen. The page then shows a dismissible notice: "Some part rules could not be applied (missing classes). Check Settings." The operator console lists each rule that matched and each rule that was skipped. With no rules, the classes on screen are the ones the model returned.
 
 ## ERP panel
 
