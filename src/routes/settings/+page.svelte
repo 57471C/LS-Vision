@@ -11,6 +11,13 @@ import {
 	retainCameraSettings,
 	settingsForCamera,
 } from "$lib/camera-settings";
+import {
+	parsePartRules,
+	PART_LABEL_LIMIT,
+	PART_RULE_LIMIT,
+	type PartCondition,
+	type PartRule,
+} from "$lib/part-composition";
 
 const DEV_PASSWORD = "admin";
 const UNLOCK_KEY = "ls-vision-settings-open";
@@ -20,7 +27,7 @@ const DEFAULT_SQL_DRIVER = "ODBC Driver 18 for SQL Server";
 type BomSource = "json" | "mssql" | "api";
 type AuthMode = "windows" | "sql";
 type MssqlFields = { server: string; database: string; user: string };
-type SettingsSection = "camera" | "capture" | "training" | "database";
+type SettingsSection = "camera" | "capture" | "training" | "parts" | "database";
 type DetectRoi = { x: number; y: number; w: number; h: number };
 type BarcodeRoi = { x: number; y: number; width: number; height: number };
 
@@ -146,6 +153,12 @@ let trainingDir = "";
 let trainingNotice = "";
 let savingTraining = false;
 let configLoadId = 0;
+type PartRuleDraft = PartRule & { id: number };
+let partRules: PartRuleDraft[] = [];
+let partNotice = "";
+let savingParts = false;
+let partLoadId = 0;
+let partRuleSeq = 0;
 
 const PREVIEW_LABEL = "camera-preview";
 const PREVIEW_CHANNEL = "ls-vision-camera-preview";
@@ -173,6 +186,7 @@ function storedSection(): SettingsSection {
 		value === "camera" ||
 		value === "capture" ||
 		value === "training" ||
+		value === "parts" ||
 		value === "database"
 	) {
 		return value;
@@ -185,6 +199,7 @@ function selectSection(next: SettingsSection) {
 	sessionStorage.setItem(SECTION_KEY, next);
 	if (next === "camera") void loadCameraSettings();
 	if (next === "training") void loadModel();
+	if (next === "parts") void loadPartRules();
 }
 
 function focusOnMount(node: HTMLInputElement) {
@@ -403,6 +418,7 @@ async function loadSource() {
 		await loadTestMode();
 		await loadRoi();
 		await loadModel();
+		await loadPartRules();
 	} catch (err: unknown) {
 		if (id !== configLoadId) return;
 		notice = invokeError(err, "Could not load vision/config.local.json.");
@@ -1066,6 +1082,126 @@ async function saveSource() {
 		notice = invokeError(err, "Could not save vision/config.local.json.");
 	} finally {
 		saving = false;
+	}
+}
+
+function blankPartRule(): PartRuleDraft {
+	partRuleSeq += 1;
+	return {
+		id: partRuleSeq,
+		parent: "",
+		child: "",
+		condition: "contains",
+		result: "",
+	};
+}
+
+function showPartRules(value: unknown) {
+	partRules = parsePartRules(value).map((rule) => {
+		partRuleSeq += 1;
+		return { id: partRuleSeq, ...rule };
+	});
+}
+
+function partRuleProblem(drafts: readonly PartRuleDraft[]): string {
+	const filled = drafts.filter(
+		(rule) => rule.parent.trim() || rule.child.trim() || rule.result.trim(),
+	);
+	if (filled.length > PART_RULE_LIMIT) {
+		return `Save at most ${PART_RULE_LIMIT} rules.`;
+	}
+	for (const [index, rule] of drafts.entries()) {
+		const parent = rule.parent.trim();
+		const child = rule.child.trim();
+		const result = rule.result.trim();
+		if (!parent && !child && !result) continue;
+		if (!parent || !child || !result) {
+			return `Rule ${index + 1} needs a parent class, a child class, and a result IC.`;
+		}
+		if (
+			parent.length > PART_LABEL_LIMIT ||
+			child.length > PART_LABEL_LIMIT ||
+			result.length > PART_LABEL_LIMIT
+		) {
+			return `Rule ${index + 1} must be ${PART_LABEL_LIMIT} characters or fewer.`;
+		}
+	}
+	return "";
+}
+
+function partRulesFromDrafts(drafts: readonly PartRuleDraft[]): PartRule[] {
+	const rules: PartRule[] = [];
+	for (const rule of drafts) {
+		const parent = rule.parent.trim();
+		const child = rule.child.trim();
+		const result = rule.result.trim();
+		if (!parent && !child && !result) continue;
+		const condition: PartCondition =
+			rule.condition === "no-child" ? "no-child" : "contains";
+		rules.push({ parent, child, condition, result });
+	}
+	return rules;
+}
+
+async function loadPartRules() {
+	const epoch = ++partLoadId;
+	try {
+		const data = await loadDocument();
+		if (epoch !== partLoadId || savingParts) return;
+		showPartRules(data.partRules);
+	} catch (err: unknown) {
+		if (epoch !== partLoadId) return;
+		partNotice = invokeError(err, "Could not load part rules");
+	}
+}
+
+function addPartRule() {
+	if (partRules.length >= PART_RULE_LIMIT) {
+		partNotice = `Save at most ${PART_RULE_LIMIT} rules.`;
+		return;
+	}
+	partNotice = "";
+	partRules = [...partRules, blankPartRule()];
+}
+
+function removePartRule(id: number) {
+	partNotice = "";
+	partRules = partRules.filter((rule) => rule.id !== id);
+}
+
+function movePartRule(id: number, delta: number) {
+	const index = partRules.findIndex((rule) => rule.id === id);
+	const target = index + delta;
+	if (index < 0 || target < 0 || target >= partRules.length) return;
+	const next = partRules.slice();
+	const [row] = next.splice(index, 1);
+	next.splice(target, 0, row);
+	partRules = next;
+}
+
+async function savePartRules() {
+	const problem = partRuleProblem(partRules);
+	if (problem) {
+		partNotice = problem;
+		return;
+	}
+	const rules = partRulesFromDrafts(partRules);
+	savingParts = true;
+	partLoadId += 1;
+	partNotice = "";
+	try {
+		const current = await loadDocument();
+		current.partRules = rules;
+		const saved = await storeDocument(current);
+		showPartRules(saved.partRules);
+		partNotice = rules.length
+			? `Saved. ${rules.length} part ${rules.length === 1 ? "rule" : "rules"}.`
+			: "Saved. No part rules, so classes stay as the model named them.";
+	} catch (err: unknown) {
+		partNotice = invokeError(err, "Could not save part rules");
+	} finally {
+		partLoadId += 1;
+		savingParts = false;
 	}
 }
 
@@ -1953,6 +2089,26 @@ onDestroy(() => {
 				</button>
 				<button
 					type="button"
+					class={section === "parts" ? sectionOn : sectionOff}
+					aria-current={section === "parts" ? "page" : undefined}
+					on:click={() => selectSection("parts")}
+				>
+					<svg
+						xmlns="http://www.w3.org/2000/svg"
+						viewBox="0 0 24 24"
+						class="h-5 w-5"
+						fill="none"
+						stroke="currentColor"
+						stroke-width="2"
+						aria-hidden="true"
+					>
+						<rect x="3" y="3" width="12" height="12" />
+						<rect x="9" y="9" width="12" height="12" />
+					</svg>
+					Parts
+				</button>
+				<button
+					type="button"
 					class={section === "database" ? sectionOn : sectionOff}
 					aria-current={section === "database" ? "page" : undefined}
 					on:click={() => selectSection("database")}
@@ -2672,6 +2828,127 @@ onDestroy(() => {
 							</fieldset>
 							{#if inferenceNotice}
 								<p class="text-sm text-neutral-200">{inferenceNotice}</p>
+							{/if}
+						</form>
+					{:else if section === "parts"}
+						<h2 id="settings-section-heading" class="text-lg font-semibold tracking-tight xl:col-span-2">
+							Part rules
+						</h2>
+						<form
+							class="flex flex-col gap-4 border border-neutral-700 bg-neutral-900 p-4 xl:col-span-2"
+							on:submit|preventDefault={savePartRules}
+						>
+							<p class="text-sm text-neutral-400">
+								After detection, a parent box is renamed to the result IC when its rule matches. Contains matches when the child box center lies inside the parent, including the edge. No child matches when that center is absent. Rules run from top to bottom and the first match wins. Child boxes keep the class the model gave them. An empty list leaves every class unchanged.
+							</p>
+							<div class="overflow-x-auto">
+								<table class="w-full min-w-[44rem] border-collapse text-left">
+									<thead>
+										<tr class="text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+											<th class="px-2 py-2" scope="col">Parent class</th>
+											<th class="px-2 py-2" scope="col">Child class</th>
+											<th class="px-2 py-2" scope="col">Condition</th>
+											<th class="px-2 py-2" scope="col">Result IC</th>
+											<th class="px-2 py-2" scope="col">Actions</th>
+										</tr>
+									</thead>
+									<tbody>
+										{#each partRules as rule, index (rule.id)}
+											<tr class="border-t border-neutral-800">
+												<td class="px-2 py-2">
+													<input
+														class="w-full min-w-32 border border-neutral-600 bg-neutral-950 px-2 py-2 font-mono text-sm text-neutral-100"
+														bind:value={rule.parent}
+														aria-label={`Parent class for rule ${index + 1}`}
+														maxlength={PART_LABEL_LIMIT}
+														autocomplete="off"
+													/>
+												</td>
+												<td class="px-2 py-2">
+													<input
+														class="w-full min-w-32 border border-neutral-600 bg-neutral-950 px-2 py-2 font-mono text-sm text-neutral-100"
+														bind:value={rule.child}
+														aria-label={`Child class for rule ${index + 1}`}
+														maxlength={PART_LABEL_LIMIT}
+														autocomplete="off"
+													/>
+												</td>
+												<td class="px-2 py-2">
+													<select
+														class="w-full border border-neutral-600 bg-neutral-950 px-2 py-2 text-sm text-neutral-100"
+														bind:value={rule.condition}
+														aria-label={`Condition for rule ${index + 1}`}
+													>
+														<option value="contains">contains</option>
+														<option value="no-child">no child</option>
+													</select>
+												</td>
+												<td class="px-2 py-2">
+													<input
+														class="w-full min-w-28 border border-neutral-600 bg-neutral-950 px-2 py-2 font-mono text-sm text-neutral-100"
+														bind:value={rule.result}
+														aria-label={`Result IC for rule ${index + 1}`}
+														maxlength={PART_LABEL_LIMIT}
+														autocomplete="off"
+													/>
+												</td>
+												<td class="px-2 py-2">
+													<div class="flex flex-wrap gap-1">
+														<button
+															type="button"
+															class="inline-flex min-h-9 items-center border border-neutral-600 bg-neutral-800 px-2 text-sm font-semibold text-neutral-100 disabled:border-neutral-800 disabled:text-neutral-600"
+															on:click={() => movePartRule(rule.id, -1)}
+															disabled={index === 0 || savingParts}
+														>
+															Up
+														</button>
+														<button
+															type="button"
+															class="inline-flex min-h-9 items-center border border-neutral-600 bg-neutral-800 px-2 text-sm font-semibold text-neutral-100 disabled:border-neutral-800 disabled:text-neutral-600"
+															on:click={() => movePartRule(rule.id, 1)}
+															disabled={index === partRules.length - 1 || savingParts}
+														>
+															Down
+														</button>
+														<button
+															type="button"
+															class="inline-flex min-h-9 items-center border border-neutral-600 bg-neutral-800 px-2 text-sm font-semibold text-neutral-100 disabled:border-neutral-800 disabled:text-neutral-600"
+															on:click={() => removePartRule(rule.id)}
+															disabled={savingParts}
+														>
+															Remove
+														</button>
+													</div>
+												</td>
+											</tr>
+										{/each}
+									</tbody>
+								</table>
+							</div>
+							{#if partRules.length === 0}
+								<p class="text-sm text-neutral-400">
+									No rules. Detected classes stay as the model named them.
+								</p>
+							{/if}
+							<div class="flex flex-wrap items-center gap-2">
+								<button
+									type="button"
+									class="inline-flex min-h-11 items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100 disabled:border-neutral-700 disabled:text-neutral-500"
+									on:click={addPartRule}
+									disabled={savingParts || partRules.length >= PART_RULE_LIMIT}
+								>
+									Add rule
+								</button>
+								<button
+									type="submit"
+									class="inline-flex min-h-11 items-center border border-blue-500 bg-blue-600 px-4 text-sm font-semibold text-white disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
+									disabled={savingParts}
+								>
+									{savingParts ? "Saving..." : "Save"}
+								</button>
+							</div>
+							{#if partNotice}
+								<p class="text-sm text-neutral-200">{partNotice}</p>
 							{/if}
 						</form>
 					{:else}

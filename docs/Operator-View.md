@@ -25,6 +25,8 @@ When Test mode is on, the countdown does not read the camera. The button reads *
 
 The right-hand panel shows pass or fail, the kit, and the parts table (expected quantity against what detection saw).
 
+Part rules, when Settings has any, run after the model returns boxes and before those counts and the boxes on the still. A matching parent class is shown as the result IC. The operator console lists each rule that matched. With no rules, the classes on screen are the ones the model returned.
+
 ## ERP panel
 
 When Settings has an ERP name and URL, an amber button slides that page over the vision view. A strip on the left returns to the camera.

@@ -28,6 +28,14 @@ Settings are stored in `vision/config.local.json` (gitignored). The unlock passw
 
 Training lists `.pt` and `.onnx` files in the app data models folder. Update model copies an `.onnx` file over the selected `.onnx` name, or over `best.onnx`. The selected basename is `model` in `vision/config.local.json`. Detection runs only for `.onnx`, and the next run loads the copied file.
 
+## Part rules
+
+Settings > Parts stores `partRules` in `vision/config.local.json`. Each row is a parent class, a child class, a condition (`contains` or `no child`), and a result IC. Add and remove rows, then Save. Up and Down set the order. Rules run from top to bottom and the first match wins.
+
+`contains` matches when the child box center lies inside the parent box, including the edge. `no child` matches when it does not. The parent box is renamed to the result IC. The child box keeps the class the model gave it. An empty list leaves every class unchanged.
+
+Example: parent `Hinge_Plate`, child `P02_Logo`, condition `contains`, result `2QHP02`. A second row with condition `no child` and result `2QHP01` names a plate that has no logo inside it.
+
 ## Database
 
 - BoM source: JSON (`vision/sample-bom.json`), API (base URL, path, and API key; the barcode is the job card number), or MSSQL (Windows Authentication by default, SQL authentication optional).

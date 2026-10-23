@@ -14,6 +14,7 @@ import {
 	isCameraOpenError,
 } from "$lib/operator/console";
 import { detectionCounts, inspectionVerdict } from "$lib/operator/verdict";
+import { applyPartRules, parsePartRules } from "$lib/part-composition";
 import {
 	type BarcodeRoi,
 	createOperatorViews,
@@ -281,6 +282,24 @@ function attachSession(
 		return found;
 	}
 
+	// Rename parents before the counts, the overlay, and the saved result.
+	// The model list from detect_image is left as the trained class names.
+	async function composeDetections(items: Detection[]): Promise<Detection[]> {
+		try {
+			const config = await readConfig();
+			const rules = parsePartRules(config.partRules);
+			if (rules.length === 0) return items;
+			const outcome = applyPartRules(items, rules);
+			for (const line of outcome.log) writeConsole(line);
+			return outcome.detections;
+		} catch (err: unknown) {
+			writeConsole(
+				`Part rules: ${invokeError(err, "Could not load part rules")}. Classes were left unchanged.`,
+			);
+			return items;
+		}
+	}
+
 	function detectedImageSrc(encoded: string): string {
 		const text = encoded.trim();
 		if (text.startsWith("data:")) return text;
@@ -395,7 +414,11 @@ function attachSession(
 		try {
 			const payload = await requestDetections(body);
 			if (generation !== detectGeneration || !pageAlive) return;
-			op.detections = asDetections(payload.detections);
+			const composed = await composeDetections(
+				asDetections(payload.detections),
+			);
+			if (generation !== detectGeneration || !pageAlive) return;
+			op.detections = composed;
 			op.detectMessage =
 				typeof payload.message === "string" ? payload.message : "";
 			if (
@@ -828,6 +851,7 @@ function attachSession(
 		testMode?: unknown;
 		skipResultSave?: unknown;
 		detectRoi?: unknown;
+		partRules?: unknown;
 		camera?: { index?: unknown; displayFps?: unknown } | null;
 		erp?: { name?: unknown; url?: unknown } | null;
 	};
