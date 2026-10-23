@@ -4,7 +4,7 @@ Guidance for AI coding agents working on LS-Vision.
 
 ## Project context
 
-LS-Vision is a Tauri 2 + SvelteKit desktop app for bench-top kit verification using computer vision. Version 0.3.4. The high-level plan lives in `plan.md`. Prefer small, incremental changes that move the core loop forward.
+LS-Vision is a Tauri 2 + SvelteKit desktop app for bench-top kit verification using computer vision. Version 0.3.5. The high-level plan lives in `plan.md`. Prefer small, incremental changes that move the core loop forward.
 
 ## Architecture notes
 
