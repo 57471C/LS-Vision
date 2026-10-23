@@ -4,7 +4,7 @@
 
 - The kit label is read from `barcodeRoi` when that region is saved. Otherwise the full frame is used.
 - Settings > Capture edits the region as fractions of the frame (left, top, width, height). The operator page can draw the same region on the live feed.
-- Decode order on a camera still: native QR detector, then ZXing (QR), then Rust `decode_barcode` (QR and Code 39).
+- Decode order: native QR detector, then ZXing (QR), both on the preview JPEG, then Rust `decode_barcode` on the raw frame (QR and Code 39). When that crop's long edge is over 1920 pixels, Rust halves it until it fits and reads the smaller image first. A 4K symbol is missed at full size.
 - One trailing slash is removed, so `6PBBK001/` matches `6PBBK001`.
 - A successful read that matches the BoM holds the still and runs detection. The preview canvas is not stalled by that snapshot.
 

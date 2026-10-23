@@ -3,10 +3,13 @@ mod bom;
 mod bom_sql;
 mod camera;
 mod detect;
+mod frame;
 mod inference_ep;
 mod local_config;
 mod results;
 mod training;
+
+use std::sync::{Arc, Mutex};
 
 use tauri::Manager;
 
@@ -22,6 +25,9 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
+            app.manage(frame::FrameState {
+                latest: Arc::new(Mutex::new(None)),
+            });
             if let Ok(dir) = app.path().app_data_dir() {
                 local_config::set_app_data_dir(dir);
             }

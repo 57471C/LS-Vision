@@ -1,17 +1,20 @@
-//! One Windows camera, held open on a single thread, returning a JPEG.
+//! One Windows camera, held open on a single thread.
 //!
 //! Media Foundation delivers frames on the thread that owns the source
 //! reader. List and capture therefore share one worker, and that worker
 //! keeps at most one session. Switching cameras shuts the media source
 //! down before the next device is activated, so the hardware encoder is
 //! free for the new open. Frames arrive through an async source-reader
-//! callback. Each sample is stored twice: a preview handle and a still
-//! handle. `capture_preview` takes the preview handle, so the next preview
-//! waits for a new sample. `capture_snapshot` clones the still handle and
-//! does not empty the preview slot. JPEG encoding runs only when a command
-//! asks for a frame, and it does not run on the callback or on the camera
-//! thread. `capture_snapshot` keeps the selected mode. `capture_preview`
-//! scales that frame to fit in 1280×720. A saved numeric focus is applied
+//! callback. The callback keeps the sample's contiguous media buffer and
+//! hands that same buffer to a preview handle and a still handle. It does
+//! not copy the pixels. `capture_preview` takes the preview handle, so the
+//! next preview waits for a new sample, and it is the only path that
+//! encodes a JPEG. `capture_snapshot` clones the still handle, converts
+//! those pixels to an RGB `RawFrame`, and stores that frame. It does not
+//! empty the preview slot and it does not encode a JPEG. Conversion runs
+//! on the command thread, not on the callback or the camera thread.
+//! `capture_snapshot` keeps the selected mode. `capture_preview` scales
+//! that frame to fit in 1280×720. A saved numeric focus is applied
 //! when the device opens, and `set_camera_focus` sets manual focus.
 //! `set_camera_autofocus` returns the camera to autofocus and clears that
 //! saved value. A missing focus leaves autofocus alone. Brightness and
@@ -39,33 +42,83 @@ const RELEASE_WAIT: Duration = Duration::from_millis(250);
 const RESOURCE_CODE: u32 = 0xC00D_3704;
 
 struct Frame {
-    bytes: Arc<Vec<u8>>,
+    pixels: FrameHandle,
     width: u32,
     height: u32,
     format: PixelFormat,
     fps: Option<f32>,
 }
 
-/// Latest sample, as two handles. Taking the preview handle does not clear
-/// the still, and copying the still does not clear the preview.
+/// One sample. Owned bytes are the test path. On Windows the camera path
+/// holds the Media Foundation buffer and locks it only while encoding.
+enum FrameKind {
+    #[cfg(test)]
+    Owned(Vec<u8>),
+    #[cfg(windows)]
+    Media(session::MediaFrame),
+}
+
+#[derive(Clone)]
+struct FrameHandle {
+    kind: Arc<FrameKind>,
+}
+
+impl FrameHandle {
+    #[cfg(test)]
+    fn owned(bytes: Vec<u8>) -> Self {
+        Self {
+            kind: Arc::new(FrameKind::Owned(bytes)),
+        }
+    }
+
+    #[cfg(windows)]
+    fn media(frame: session::MediaFrame) -> Self {
+        Self {
+            kind: Arc::new(FrameKind::Media(frame)),
+        }
+    }
+
+    #[cfg(test)]
+    fn same_as(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.kind, &other.kind)
+    }
+
+    /// `use_pixels` must finish with the slice. The media buffer is unlocked
+    /// when this returns, and a second caller waits until then.
+    fn with_pixels<R>(&self, use_pixels: impl FnOnce(&[u8]) -> R) -> Result<R, String> {
+        match self.kind.as_ref() {
+            #[cfg(test)]
+            FrameKind::Owned(bytes) => Ok(use_pixels(bytes)),
+            #[cfg(windows)]
+            FrameKind::Media(frame) => frame.with_pixels(use_pixels),
+        }
+    }
+}
+
+/// Latest sample, as two handles on one buffer. Taking the preview handle
+/// does not clear the still, and cloning the still does not clear the preview.
 struct FrameSlots {
-    preview: Option<Arc<Vec<u8>>>,
-    still: Option<Arc<Vec<u8>>>,
+    preview: Option<FrameHandle>,
+    still: Option<FrameHandle>,
 }
 
 impl FrameSlots {
-    fn publish(&mut self, bytes: Vec<u8>) {
-        let frame = Arc::new(bytes);
-        self.still = Some(Arc::clone(&frame));
+    fn publish(&mut self, frame: FrameHandle) {
+        self.still = Some(frame.clone());
         self.preview = Some(frame);
     }
 
-    fn take_preview(&mut self) -> Option<Arc<Vec<u8>>> {
+    fn take_preview(&mut self) -> Option<FrameHandle> {
         self.preview.take()
     }
 
-    fn copy_still(&self) -> Option<Arc<Vec<u8>>> {
-        self.still.as_ref().map(Arc::clone)
+    fn copy_still(&self) -> Option<FrameHandle> {
+        self.still.clone()
+    }
+
+    fn clear(&mut self) {
+        self.preview = None;
+        self.still = None;
     }
 }
 
@@ -200,18 +253,59 @@ pub fn list_camera_modes(index: Option<u32>) -> Result<Value, String> {
 }
 
 #[tauri::command]
-pub fn capture_snapshot(index: Option<u32>) -> Result<Value, String> {
+pub fn capture_snapshot(
+    index: Option<u32>,
+    state: tauri::State<crate::frame::FrameState>,
+) -> Result<Value, String> {
+    store_still(index, &state.latest)
+}
+
+/// Copy the still handle, convert it to RGB, and store that frame.
+/// The preview slot is left alone. This path does not encode a JPEG.
+fn store_still(
+    index: Option<u32>,
+    latest: &Mutex<Option<crate::frame::RawFrame>>,
+) -> Result<Value, String> {
     let frame = match command_frame(index, true) {
         Ok(frame) => frame,
         Err(response) => return response,
     };
-    let mode = frame_mode(&frame);
-    // Encode on this thread. The camera thread only opens the device
-    // and copies samples, so a JPEG cannot stall the next frame.
-    match encode_frame(&frame.bytes, mode) {
-        Ok(jpeg) => Ok(snapshot_body(&frame, &jpeg, frame.width, frame.height)),
-        Err(message) => Ok(fail(&message)),
-    }
+    let raw = match use_frame(&frame, rgb_frame) {
+        Ok((data, width, height)) => crate::frame::RawFrame {
+            width,
+            height,
+            channels: 3,
+            data,
+            timestamp_ms: timestamp_ms(),
+        },
+        Err(message) => return Ok(fail(&message)),
+    };
+    let body = json!({
+        "status": "pass",
+        "width": raw.width,
+        "height": raw.height,
+        "timestamp_ms": raw.timestamp_ms,
+    });
+    *lock(latest) = Some(raw);
+    Ok(body)
+}
+
+fn timestamp_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+fn capture_still(index: Option<u32>) -> Result<Value, String> {
+    store_still(index, test_latest())
+}
+
+#[cfg(test)]
+fn test_latest() -> &'static Mutex<Option<crate::frame::RawFrame>> {
+    static LATEST: OnceLock<Mutex<Option<crate::frame::RawFrame>>> = OnceLock::new();
+    LATEST.get_or_init(|| Mutex::new(None))
 }
 
 /// Latest frame, scaled to fit in 1280×720. The open mode is unchanged,
@@ -222,8 +316,7 @@ pub fn capture_preview(index: Option<u32>) -> Result<Value, String> {
         Ok(frame) => frame,
         Err(response) => return response,
     };
-    let mode = frame_mode(&frame);
-    match encode_preview(&frame.bytes, mode) {
+    match use_frame(&frame, encode_preview) {
         Ok((jpeg, preview_width, preview_height)) => {
             let mut body = snapshot_body(&frame, &jpeg, frame.width, frame.height);
             if let Some(object) = body.as_object_mut() {
@@ -325,6 +418,14 @@ fn fetch_frame(index: u32, still: bool) -> Result<Frame, String> {
         Ok(frame) => frame,
         Err(_) => Err("Camera thread stopped.".to_string()),
     }
+}
+
+fn use_frame<T>(
+    frame: &Frame,
+    encode: impl FnOnce(&[u8], Mode) -> Result<T, String>,
+) -> Result<T, String> {
+    let mode = frame_mode(frame);
+    frame.pixels.with_pixels(|bytes| encode(bytes, mode))?
 }
 
 fn frame_mode(frame: &Frame) -> Mode {
@@ -431,14 +532,14 @@ fn apply_focus(
 }
 
 fn take_frame(device: &session::Device, still: bool) -> Result<Frame, String> {
-    let bytes = if still {
+    let pixels = if still {
         device.copy_still(FIRST_FRAME_WAIT)?
     } else {
         device.wait_frame(FIRST_FRAME_WAIT)?
     };
     let mode = device.mode();
     Ok(Frame {
-        bytes,
+        pixels,
         width: mode.width,
         height: mode.height,
         format: mode.format,
@@ -903,6 +1004,28 @@ impl FpsMeter {
     }
 }
 
+fn rgb_frame(bytes: &[u8], mode: Mode) -> Result<(Vec<u8>, u32, u32), String> {
+    match mode.format {
+        PixelFormat::Mjpeg => mjpeg_to_rgb(bytes),
+        PixelFormat::Yuy2 => Ok((
+            yuy2_to_rgb(bytes, mode.width, mode.height)?,
+            mode.width,
+            mode.height,
+        )),
+        PixelFormat::Nv12 => Ok((
+            nv12_to_rgb(bytes, mode.width, mode.height)?,
+            mode.width,
+            mode.height,
+        )),
+        PixelFormat::Rgb24 => Ok((
+            bgr_to_rgb(bytes, mode.width, mode.height)?,
+            mode.width,
+            mode.height,
+        )),
+    }
+}
+
+#[cfg(test)]
 fn encode_frame(bytes: &[u8], mode: Mode) -> Result<Vec<u8>, String> {
     let (rgb, width, height) = match mode.format {
         PixelFormat::Mjpeg => mjpeg_to_rgb(bytes)?,
@@ -1156,6 +1279,30 @@ fn yuy2_to_rgb(bytes: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String>
     Ok(rgb)
 }
 
+fn nv12_to_rgb(bytes: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
+    if width < 2 || height < 2 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+        return Err("Could not decode the camera frame.".to_string());
+    }
+    let width = width as usize;
+    let height = height as usize;
+    let y_size = width.saturating_mul(height);
+    let need = y_size.saturating_add(y_size / 2);
+    if bytes.len() < need {
+        return Err("Could not decode the camera frame.".to_string());
+    }
+    let mut rgb = vec![0_u8; width * height * 3];
+    for row in 0..height {
+        for col in 0..width {
+            let y = i32::from(bytes[row * width + col]);
+            let uv_at = y_size + (row / 2) * width + (col & !1);
+            let u = i32::from(bytes[uv_at]);
+            let v = i32::from(bytes[uv_at + 1]);
+            write_rgb(&mut rgb, (row * width + col) * 3, y, u, v);
+        }
+    }
+    Ok(rgb)
+}
+
 fn nv12_to_jpeg(bytes: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
     if width < 2 || height < 2 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
         return Err("Could not encode the frame.".to_string());
@@ -1231,8 +1378,8 @@ mod session {
         CameraControl_Flags_Auto, CameraControl_Flags_Manual, CameraControl_Focus, IAMCameraControl,
     };
     use windows::Win32::Media::MediaFoundation::{
-        IMFActivate, IMFAttributes, IMFMediaSource, IMFMediaType, IMFSample, IMFSourceReader,
-        IMFSourceReaderCallback, IMFSourceReaderCallback_Impl, MF_API_VERSION,
+        IMFActivate, IMFAttributes, IMFMediaBuffer, IMFMediaSource, IMFMediaType, IMFSample,
+        IMFSourceReader, IMFSourceReaderCallback, IMFSourceReaderCallback_Impl, MF_API_VERSION,
         MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
         MF_E_HW_MFT_FAILED_START_STREAMING, MF_E_NO_MORE_TYPES, MF_MT_FRAME_RATE,
         MF_MT_FRAME_RATE_RANGE_MAX, MF_MT_FRAME_RATE_RANGE_MIN, MF_MT_FRAME_SIZE, MF_MT_SUBTYPE,
@@ -1291,9 +1438,20 @@ mod session {
 
         /// Replace both handles. The next sample overwrites them, so a slow
         /// preview cannot build a queue behind the reader. The still handle
-        /// stays when the preview handle is taken.
-        fn publish(&self, bytes: Vec<u8>) {
-            lock(&self.slots).publish(bytes);
+        /// stays when the preview handle is taken. A buffer handed off here
+        /// is dropped when the next sample replaces it, unless a command
+        /// still holds that handle for encode.
+        fn publish(&self, frame: super::FrameHandle) {
+            if self.stop.load(Ordering::Acquire) {
+                return;
+            }
+            {
+                let mut slots = lock(&self.slots);
+                if self.stop.load(Ordering::Acquire) {
+                    return;
+                }
+                slots.publish(frame);
+            }
             lock(&self.fps).note(Instant::now());
             *lock(&self.error) = None;
             self.frame_cv.notify_all();
@@ -1343,13 +1501,18 @@ mod session {
                     .fail(short_camera("The camera stopped streaming."));
                 return Ok(());
             }
-            // Request the next sample before copying this one so the
-            // driver is not stalled on the snapshot encode.
+            // Request the next sample before keeping this buffer so the
+            // driver is not stalled on the snapshot encode. The pixels stay
+            // in the media buffer. Encoding locks it later, on the command
+            // thread.
             self.shared.rearm();
+            if self.shared.stop.load(Ordering::Acquire) {
+                return Ok(());
+            }
             if let Some(sample) = sample.as_ref()
-                && let Some(bytes) = copy_sample(sample)
+                && let Some(frame) = media_frame(sample)
             {
-                self.shared.publish(bytes);
+                self.shared.publish(super::FrameHandle::media(frame));
             }
             Ok(())
         }
@@ -1412,13 +1575,13 @@ mod session {
             lock(&self.shared.fps).measured(Instant::now())
         }
 
-        pub(super) fn wait_frame(&self, timeout: Duration) -> Result<Arc<Vec<u8>>, String> {
+        pub(super) fn wait_frame(&self, timeout: Duration) -> Result<super::FrameHandle, String> {
             self.wait_slot(timeout, true)
         }
 
         /// Clone the still handle. This does not take the preview handle, so
         /// a snapshot does not make the paced preview wait for another sample.
-        pub(super) fn copy_still(&self, timeout: Duration) -> Result<Arc<Vec<u8>>, String> {
+        pub(super) fn copy_still(&self, timeout: Duration) -> Result<super::FrameHandle, String> {
             self.wait_slot(timeout, false)
         }
 
@@ -1491,7 +1654,11 @@ mod session {
             })
         }
 
-        fn wait_slot(&self, timeout: Duration, preview: bool) -> Result<Arc<Vec<u8>>, String> {
+        fn wait_slot(
+            &self,
+            timeout: Duration,
+            preview: bool,
+        ) -> Result<super::FrameHandle, String> {
             let deadline = Instant::now() + timeout;
             let mut slots = lock(&self.shared.slots);
             loop {
@@ -1558,6 +1725,9 @@ mod session {
             {
                 std::thread::sleep(Duration::from_millis(10));
             }
+            // Release the media buffers before the source shuts down.
+            // A late callback sees `stop` and does not publish another one.
+            lock(&self.shared.slots).clear();
             if let Some(source) = self.source.as_ref() {
                 unsafe {
                     let _ = source.Stop();
@@ -2072,20 +2242,103 @@ mod session {
         ((numerator as u64) << 32) | denominator as u64
     }
 
-    fn copy_sample(sample: &IMFSample) -> Option<Vec<u8>> {
+    /// Keep the sample's contiguous buffer. A sample that is already one
+    /// buffer is not copied. `ConvertToContiguousBuffer` copies only when
+    /// the sample is split across several buffers.
+    fn media_frame(sample: &IMFSample) -> Option<MediaFrame> {
         let buffer = unsafe { sample.ConvertToContiguousBuffer() }.ok()?;
-        let mut ptr = ptr::null_mut();
-        let mut length = 0_u32;
-        unsafe { buffer.Lock(&mut ptr, None, Some(&mut length)) }.ok()?;
-        let bytes = if ptr.is_null() || length == 0 || length as usize > MAX_FRAME_BYTES {
-            None
-        } else {
-            Some(unsafe { std::slice::from_raw_parts(ptr, length as usize) }.to_vec())
-        };
-        unsafe {
-            let _ = buffer.Unlock();
+        let length = unsafe { buffer.GetCurrentLength() }.ok()?;
+        if length == 0 || length as usize > MAX_FRAME_BYTES {
+            return None;
         }
-        bytes
+        Some(MediaFrame {
+            buffer,
+            gate: Mutex::new(()),
+        })
+    }
+
+    struct UnlockBuffer<'a>(&'a IMFMediaBuffer);
+
+    impl Drop for UnlockBuffer<'_> {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = self.0.Unlock();
+            }
+        }
+    }
+
+    pub(super) struct MediaFrame {
+        buffer: IMFMediaBuffer,
+        gate: Mutex<()>,
+    }
+
+    // The source reader delivers this buffer on an MTA worker. The windows
+    // crate does not mark the COM pointer Send. Callers initialise MTA on
+    // the thread that locks it, and `gate` keeps Lock single-threaded.
+    unsafe impl Send for MediaFrame {}
+    unsafe impl Sync for MediaFrame {}
+
+    impl MediaFrame {
+        pub(super) fn with_pixels<R>(
+            &self,
+            use_pixels: impl FnOnce(&[u8]) -> R,
+        ) -> Result<R, String> {
+            let _gate = super::lock(&self.gate);
+            ensure_com();
+            let mut ptr = ptr::null_mut();
+            let mut length = 0_u32;
+            unsafe { self.buffer.Lock(&mut ptr, None, Some(&mut length)) }
+                .map_err(|err| short_camera(&mf_error(&err)))?;
+            let _unlock = UnlockBuffer(&self.buffer);
+            if ptr.is_null() || length == 0 || length as usize > MAX_FRAME_BYTES {
+                return Err("Could not read the camera frame.".to_string());
+            }
+            let bytes = unsafe { std::slice::from_raw_parts(ptr, length as usize) };
+            Ok(use_pixels(bytes))
+        }
+    }
+
+    fn ensure_com() {
+        COM.with(|_| {});
+    }
+
+    thread_local! {
+        static COM: () = {
+            unsafe {
+                let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            }
+        };
+    }
+
+    #[cfg(test)]
+    pub(super) fn memory_frame(bytes: &[u8]) -> Result<super::FrameHandle, String> {
+        use windows::Win32::Media::MediaFoundation::MFCreateMemoryBuffer;
+
+        if bytes.is_empty() || bytes.len() > MAX_FRAME_BYTES {
+            return Err("Could not read the camera frame.".to_string());
+        }
+        let buffer = unsafe { MFCreateMemoryBuffer(bytes.len() as u32) }
+            .map_err(|err| short_camera(&mf_error(&err)))?;
+        let mut ptr = ptr::null_mut();
+        unsafe { buffer.Lock(&mut ptr, None, None) }
+            .map_err(|err| short_camera(&mf_error(&err)))?;
+        let _unlock = UnlockBuffer(&buffer);
+        if ptr.is_null() {
+            return Err("Could not read the camera frame.".to_string());
+        }
+        unsafe {
+            ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
+        }
+        drop(_unlock);
+        unsafe {
+            buffer
+                .SetCurrentLength(bytes.len() as u32)
+                .map_err(|err| short_camera(&mf_error(&err)))?;
+        }
+        Ok(super::FrameHandle::media(MediaFrame {
+            buffer,
+            gate: Mutex::new(()),
+        }))
     }
 
     struct Activates {
@@ -2201,7 +2454,6 @@ mod session {
 
 #[cfg(not(windows))]
 mod session {
-    use std::sync::Arc;
     use std::time::Duration;
 
     use super::{Mode, Requested};
@@ -2232,11 +2484,11 @@ mod session {
             None
         }
 
-        pub(super) fn wait_frame(&self, _timeout: Duration) -> Result<Arc<Vec<u8>>, String> {
+        pub(super) fn wait_frame(&self, _timeout: Duration) -> Result<super::FrameHandle, String> {
             Err("Camera capture is only available on Windows.".to_string())
         }
 
-        pub(super) fn copy_still(&self, _timeout: Duration) -> Result<Arc<Vec<u8>>, String> {
+        pub(super) fn copy_still(&self, _timeout: Duration) -> Result<super::FrameHandle, String> {
             Err("Camera capture is only available on Windows.".to_string())
         }
 
@@ -2300,17 +2552,56 @@ mod tests {
         };
         assert!(slots.copy_still().is_none());
         assert!(slots.take_preview().is_none());
-        slots.publish(vec![1, 2, 3]);
+        slots.publish(FrameHandle::owned(vec![1, 2, 3]));
         let still = slots.copy_still().expect("still");
-        assert_eq!(still.as_slice(), &[1, 2, 3]);
         let preview = slots.take_preview().expect("preview");
-        assert_eq!(preview.as_slice(), &[1, 2, 3]);
+        assert!(still.same_as(&preview));
+        still
+            .with_pixels(|bytes| assert_eq!(bytes, &[1, 2, 3]))
+            .unwrap();
+        preview
+            .with_pixels(|bytes| assert_eq!(bytes, &[1, 2, 3]))
+            .unwrap();
         assert!(slots.take_preview().is_none());
         let again = slots.copy_still().expect("still remains");
-        assert_eq!(again.as_slice(), &[1, 2, 3]);
-        slots.publish(vec![4]);
-        assert_eq!(slots.copy_still().expect("new still").as_slice(), &[4]);
-        assert_eq!(slots.take_preview().expect("new preview").as_slice(), &[4]);
+        assert!(again.same_as(&still));
+        slots.publish(FrameHandle::owned(vec![4]));
+        let new_still = slots.copy_still().expect("new still");
+        assert!(!new_still.same_as(&still));
+        new_still
+            .with_pixels(|bytes| assert_eq!(bytes, &[4]))
+            .unwrap();
+        slots
+            .take_preview()
+            .expect("new preview")
+            .with_pixels(|bytes| assert_eq!(bytes, &[4]))
+            .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn media_buffer_is_handed_off_without_a_second_copy() {
+        session::startup().expect("media foundation");
+        let mut slots = FrameSlots {
+            preview: None,
+            still: None,
+        };
+        slots.publish(session::memory_frame(&[9, 8, 7]).expect("buffer"));
+        let still = slots.copy_still().expect("still");
+        let preview = slots.take_preview().expect("preview");
+        assert!(still.same_as(&preview));
+        still
+            .with_pixels(|bytes| assert_eq!(bytes, &[9, 8, 7]))
+            .unwrap();
+        slots.publish(session::memory_frame(&[4]).expect("next buffer"));
+        still
+            .with_pixels(|bytes| assert_eq!(bytes, &[9, 8, 7]))
+            .unwrap();
+        slots
+            .copy_still()
+            .expect("new still")
+            .with_pixels(|bytes| assert_eq!(bytes, &[4]))
+            .unwrap();
     }
 
     #[test]
@@ -2547,6 +2838,12 @@ mod tests {
     }
 
     #[test]
+    fn nv12_block_becomes_rgb() {
+        let rgb = nv12_to_rgb(&[16, 16, 16, 16, 128, 128], 2, 2).unwrap();
+        assert_eq!(rgb.len(), 12);
+    }
+
+    #[test]
     fn nv12_block_becomes_a_jpeg() {
         let jpeg = encode_frame(
             &[16, 16, 16, 16, 128, 128],
@@ -2645,7 +2942,7 @@ mod tests {
             return;
         }
         for index in listed {
-            let _ = capture_snapshot(Some(index)).expect("open");
+            let _ = capture_still(Some(index)).expect("open");
             thread::sleep(Duration::from_millis(400));
             let started = Instant::now();
             let body = capture_preview(Some(index)).expect("preview");
@@ -2695,24 +2992,22 @@ mod tests {
         for index in listed {
             let modes = list_camera_modes(Some(index)).expect("modes");
             eprintln!("camera {index} modes {}", modes["default"]);
-            let _ = capture_snapshot(Some(index)).expect("open");
+            let _ = capture_still(Some(index)).expect("open");
             for step in 0..4 {
                 thread::sleep(Duration::from_millis(500));
                 let started = Instant::now();
-                let body = capture_snapshot(Some(index)).expect("frame");
+                let body = capture_still(Some(index)).expect("frame");
                 eprintln!(
-                    "camera {index} step {step}: encode {} ms, {}x{} {} fps={}",
+                    "camera {index} step {step}: convert {} ms, {}x{} timestamp={}",
                     started.elapsed().as_millis(),
                     body["width"],
                     body["height"],
-                    body["format"],
-                    body["fps"]
+                    body["timestamp_ms"]
                 );
-                let fps = body["fps"].as_f64().unwrap_or(0.0);
-                assert!(
-                    fps > 20.0,
-                    "camera {index} measured {fps} fps while streaming: {body}"
-                );
+                assert_eq!(body["status"], "pass", "{body}");
+                assert!(body["width"].as_u64().unwrap_or(0) > 0, "{body}");
+                assert!(body["height"].as_u64().unwrap_or(0) > 0, "{body}");
+                assert!(body["timestamp_ms"].as_u64().unwrap_or(0) > 0, "{body}");
             }
         }
     }
@@ -2739,17 +3034,17 @@ mod tests {
         order.reverse();
         let mut opened = Vec::new();
         for index in &order {
-            match capture_snapshot(Some(*index)) {
+            match capture_still(Some(*index)) {
                 Ok(body) if body["status"] == "pass" => {
                     thread::sleep(Duration::from_millis(800));
-                    let again = capture_snapshot(Some(*index)).expect("second frame");
+                    let again = capture_still(Some(*index)).expect("second frame");
                     eprintln!(
-                        "camera {index}: {}x{} {} fps={}",
-                        again["width"], again["height"], again["format"], again["fps"]
+                        "camera {index}: {}x{} timestamp={}",
+                        again["width"], again["height"], again["timestamp_ms"]
                     );
                     assert_eq!(again["status"], "pass", "{again}");
-                    let fps = again["fps"].as_f64().unwrap_or(0.0);
-                    assert!(fps > 2.0, "camera {index} measured {fps} fps: {again}");
+                    assert!(again["width"].as_u64().unwrap_or(0) > 0, "{again}");
+                    assert!(again["height"].as_u64().unwrap_or(0) > 0, "{again}");
                     opened.push(*index);
                 }
                 Ok(body) => eprintln!("camera {index} failed: {body}"),
@@ -2762,20 +3057,16 @@ mod tests {
             "every camera should stream: listed {listed:?}, opened {opened:?}"
         );
         if opened.len() >= 2 {
-            let back = capture_snapshot(Some(opened[0])).expect("reopen");
+            let back = capture_still(Some(opened[0])).expect("reopen");
             eprintln!(
-                "reopen camera {}: {}x{} {} fps={}",
-                opened[0], back["width"], back["height"], back["format"], back["fps"]
+                "reopen camera {}: {}x{} timestamp={}",
+                opened[0], back["width"], back["height"], back["timestamp_ms"]
             );
             assert_eq!(back["status"], "pass", "reopen after switch: {back}");
             thread::sleep(Duration::from_millis(800));
-            let again = capture_snapshot(Some(opened[0])).expect("reopen fps");
-            let fps = again["fps"].as_f64().unwrap_or(0.0);
-            assert!(
-                fps > 2.0,
-                "reopened camera {} measured {fps} fps: {again}",
-                opened[0]
-            );
+            let again = capture_still(Some(opened[0])).expect("reopen frame");
+            assert_eq!(again["status"], "pass", "{again}");
+            assert!(again["width"].as_u64().unwrap_or(0) > 0, "{again}");
         }
     }
 }
