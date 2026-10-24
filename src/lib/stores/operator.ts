@@ -271,6 +271,7 @@ export type OperatorSession = {
 	onRoiPointerMove: (event: PointerEvent) => void;
 	onRoiPointerUp: (event: PointerEvent) => void;
 	chooseAndDetect: () => Promise<void>;
+	chooseAndSaveReferences: () => Promise<void>;
 	onImagePicked: (event: Event) => void;
 	onImageCancel: () => void;
 	toggleModelMenu: () => Promise<void>;
