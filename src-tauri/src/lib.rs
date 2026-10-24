@@ -3,6 +3,7 @@ mod bom;
 mod bom_sql;
 mod camera;
 mod detect;
+mod dinov2;
 mod frame;
 mod inference_ep;
 mod local_config;
@@ -31,6 +32,8 @@ pub fn run() {
             if let Ok(dir) = app.path().app_data_dir() {
                 local_config::set_app_data_dir(dir);
             }
+            // Optional. A missing file logs a warning and leaves YOLO detection alone.
+            dinov2::load_on_startup();
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -59,6 +62,7 @@ pub fn run() {
             detect::detect_image,
             detect::benchmark_detect,
             detect::model_class_names,
+            dinov2::dinov2_status,
             inference_ep::inference_status,
             inference_ep::set_inference_ep,
             results::save_result,

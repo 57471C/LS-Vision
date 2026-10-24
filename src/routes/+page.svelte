@@ -53,8 +53,18 @@ onDestroy(() => stop());
 		on:cancel={onImageCancel}
 	/>
 	<header class="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-neutral-800 bg-neutral-900 px-4 py-2">
-		<div class="flex items-baseline gap-3">
-			<h1 class="text-lg font-semibold tracking-tight">LS-Vision</h1>
+		<div class="flex items-center gap-3">
+			<div class="flex items-center gap-2">
+				<img
+					src="/LS-Vision.svg"
+					alt=""
+					width="32"
+					height="32"
+					class="h-8 w-8 shrink-0"
+					aria-hidden="true"
+				/>
+				<h1 class="text-lg font-semibold tracking-tight">LS-Vision</h1>
+			</div>
 			<p class="text-xs font-medium uppercase tracking-widest text-neutral-500">Operator</p>
 		</div>
 		<div class="flex flex-wrap items-center gap-2">

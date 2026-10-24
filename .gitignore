@@ -26,3 +26,6 @@ vision/debug-barcode.jpg
 vision/barcode-debug.log
 # Model runs
 runs/
+
+# Optional DINOv2 weights next to the Tauri crate. YOLO models stay in app data.
+src-tauri/models/

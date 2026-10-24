@@ -1096,7 +1096,7 @@ pub(crate) fn ensure_runtime() -> bool {
     runtime().is_ok()
 }
 
-fn runtime() -> Result<ort::environment::Environment, String> {
+pub(crate) fn runtime() -> Result<ort::environment::Environment, String> {
     static ENV: Mutex<Option<ort::environment::Environment>> = Mutex::new(None);
     let mut guard = ENV.lock().unwrap_or_else(|err| err.into_inner());
     if let Some(env) = guard.clone() {
@@ -1134,7 +1134,7 @@ fn execution_provider(provider: Provider) -> ort::ep::ExecutionProviderDispatch 
     }
 }
 
-fn open_session(
+pub(crate) fn open_session(
     env: &ort::environment::Environment,
     path: &Path,
     provider: Provider,
