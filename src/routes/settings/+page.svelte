@@ -101,6 +101,15 @@ let confidenceNotice = "";
 let confidenceTimer: ReturnType<typeof setTimeout> | null = null;
 let confidenceGeneration = 0;
 let confidenceChain: Promise<void> = Promise.resolve();
+const MATCH_MIN = 0.5;
+const MATCH_MAX = 0.95;
+const MATCH_DEFAULT = 0.7;
+let matchThreshold = MATCH_DEFAULT;
+let matchText = "0.70";
+let matchNotice = "";
+let matchTimer: ReturnType<typeof setTimeout> | null = null;
+let matchGeneration = 0;
+let matchChain: Promise<void> = Promise.resolve();
 let inferenceProviders: string[] = ["cpu"];
 let inferenceEp = "cpu";
 let inferenceActive = "cpu";
@@ -547,6 +556,7 @@ async function loadModel() {
 		modelNotice = invokeError(err, "Could not load the model list");
 	}
 	await loadConfidence();
+	await loadMatchThreshold();
 }
 
 function clampConfidence(value: number): number {
@@ -646,6 +656,97 @@ function commitConfidence() {
 	}
 	showConfidence(parsed);
 	queueConfidenceSave();
+}
+
+function clampMatch(value: number): number {
+	if (!Number.isFinite(value)) return MATCH_DEFAULT;
+	const clamped = Math.min(MATCH_MAX, Math.max(MATCH_MIN, value));
+	return Math.round(clamped * 100) / 100;
+}
+
+function showMatch(value: number) {
+	matchThreshold = clampMatch(value);
+	matchText = matchThreshold.toFixed(2);
+}
+
+function matchFill(): number {
+	return ((matchThreshold - MATCH_MIN) / (MATCH_MAX - MATCH_MIN)) * 100;
+}
+
+function cancelMatchSave() {
+	if (matchTimer === null) return;
+	clearTimeout(matchTimer);
+	matchTimer = null;
+}
+
+function queueMatchSave() {
+	cancelMatchSave();
+	matchTimer = setTimeout(() => {
+		matchTimer = null;
+		const run = matchChain.then(persistMatch, persistMatch);
+		matchChain = run.then(
+			() => undefined,
+			() => undefined,
+		);
+	}, 200);
+}
+
+async function loadMatchThreshold() {
+	const generation = matchGeneration;
+	try {
+		const data = await loadDocument();
+		if (generation !== matchGeneration) return;
+		showMatch(
+			typeof data.matchThreshold === "number"
+				? data.matchThreshold
+				: MATCH_DEFAULT,
+		);
+	} catch (err: unknown) {
+		if (generation !== matchGeneration) return;
+		matchNotice = invokeError(err, "Could not load the match threshold");
+	}
+}
+
+async function persistMatch() {
+	const generation = ++matchGeneration;
+	const next = matchThreshold;
+	matchNotice = "";
+	try {
+		const current = await loadDocument();
+		if (generation !== matchGeneration || next !== matchThreshold) return;
+		current.matchThreshold = next;
+		await storeDocument(current);
+		if (generation !== matchGeneration) return;
+		matchNotice = `Saved. Match threshold is ${next.toFixed(2)}.`;
+	} catch (err: unknown) {
+		if (generation !== matchGeneration) return;
+		matchNotice = invokeError(err, "Could not save the match threshold");
+	}
+}
+
+function slideMatch(raw: string) {
+	showMatch(Number(raw));
+	queueMatchSave();
+}
+
+function stepMatch(delta: number) {
+	showMatch(matchThreshold + delta);
+	queueMatchSave();
+}
+
+function previewMatch(raw: string) {
+	matchText = raw;
+	cancelMatchSave();
+}
+
+function commitMatch() {
+	const parsed = Number(matchText);
+	if (!Number.isFinite(parsed)) {
+		matchText = matchThreshold.toFixed(2);
+		return;
+	}
+	showMatch(parsed);
+	queueMatchSave();
 }
 
 function modelNoticeClass(text: string): string {
@@ -3003,6 +3104,57 @@ onDestroy(() => {
 								</p>
 								{#if confidenceNotice}
 									<p class="text-sm text-neutral-200">{confidenceNotice}</p>
+								{/if}
+								<div class="flex items-center gap-3">
+									<span class="w-28 shrink-0 text-sm font-medium normal-case tracking-normal text-neutral-100">
+										Match
+									</span>
+									<button
+										type="button"
+										class="inline-flex h-11 w-8 shrink-0 items-center justify-center text-lg text-neutral-300 hover:text-white"
+										aria-label="Decrease match threshold"
+										on:click={() => stepMatch(-0.01)}
+									>−</button>
+									<input
+										type="range"
+										class="camera-slider min-w-0 flex-1"
+										min={MATCH_MIN}
+										max={MATCH_MAX}
+										step="0.01"
+										value={matchThreshold}
+										style="--fill: {matchFill()}%"
+										aria-label="Match threshold"
+										on:input={(event) => slideMatch(event.currentTarget.value)}
+									/>
+									<button
+										type="button"
+										class="inline-flex h-11 w-8 shrink-0 items-center justify-center text-lg text-neutral-300 hover:text-white"
+										aria-label="Increase match threshold"
+										on:click={() => stepMatch(0.01)}
+									>+</button>
+									<input
+										type="text"
+										inputmode="decimal"
+										class="h-9 w-16 shrink-0 border border-neutral-600 bg-neutral-950 text-center font-mono text-sm text-neutral-100"
+										aria-label="Match threshold value"
+										value={matchText}
+										on:input={(event) => previewMatch(event.currentTarget.value)}
+										on:blur={commitMatch}
+										on:keydown={(event) => {
+											if (event.key !== "Enter") return;
+											event.preventDefault();
+											commitMatch();
+										}}
+									/>
+								</div>
+								<p class="text-sm text-neutral-200">
+									Current value <span class="font-mono text-neutral-100">{matchThreshold.toFixed(2)}</span>
+								</p>
+								<p class="text-sm text-neutral-400">
+									A part with saved references counts toward the BoM only when its best match is above this score. Range 0.50 to 0.95. A part with no reference still counts.
+								</p>
+								{#if matchNotice}
+									<p class="text-sm text-neutral-200">{matchNotice}</p>
 								{/if}
 							</fieldset>
 							<div class="flex flex-wrap gap-2">

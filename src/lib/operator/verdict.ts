@@ -5,11 +5,25 @@ import type { Part } from "$lib/stores/operator";
 
 export type InspectionVerdict = "pass" | "fail" | "incomplete";
 
-type CountedDetection = { ic: string; consumed?: boolean };
+type CountedDetection = {
+	ic: string;
+	consumed?: boolean;
+	referenceMatch?: boolean;
+};
 
 // A child box used by a matching part rule is not a BoM part.
+// A box with saved references counts only when its cosine is above the threshold.
 function countsTowardBom(item: CountedDetection): boolean {
-	return item.ic !== "" && item.consumed !== true;
+	return item.ic !== "" && item.consumed !== true && item.referenceMatch !== false;
+}
+
+export type LineTally = "pass" | "short" | "extra";
+
+// Exact quantity. Fewer boxes than the BoM line is short. More is extra.
+export function lineTally(seen: number, expected: number): LineTally {
+	if (seen < expected) return "short";
+	if (seen > expected) return "extra";
+	return "pass";
 }
 
 export function detectionCounts(

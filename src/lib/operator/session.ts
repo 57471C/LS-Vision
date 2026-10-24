@@ -300,10 +300,17 @@ function attachSession(
 			if (!item || typeof item !== "object") continue;
 			const row = item as Detection;
 			if (typeof row.ic !== "string" || !row.ic) continue;
+			const referenceMatch =
+				row.referenceMatch === true
+					? true
+					: row.referenceMatch === false
+						? false
+						: undefined;
 			found.push({
 				ic: row.ic,
 				confidence: typeof row.confidence === "number" ? row.confidence : 0,
 				bbox: Array.isArray(row.bbox) ? row.bbox : [],
+				referenceMatch,
 			});
 		}
 		return found;

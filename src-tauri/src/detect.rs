@@ -27,6 +27,9 @@ use crate::local_config;
 const DEFAULT_CONFIDENCE: f32 = 0.45;
 const MIN_CONFIDENCE: f32 = 0.15;
 const MAX_CONFIDENCE: f32 = 0.80;
+const DEFAULT_MATCH_THRESHOLD: f32 = 0.70;
+const MIN_MATCH_THRESHOLD: f32 = 0.50;
+const MAX_MATCH_THRESHOLD: f32 = 0.95;
 const IOU_THRESHOLD: f32 = 0.7;
 const MAX_DET: usize = 300;
 const MAX_NMS: usize = 30_000;
@@ -44,6 +47,14 @@ struct Detection {
     ic: String,
     confidence: f64,
     bbox: [i32; 4],
+    /// Set when this class has saved references. True when the best cosine is
+    /// above the match threshold. Absent when there is nothing to compare.
+    #[serde(
+        default,
+        rename = "referenceMatch",
+        skip_serializing_if = "Option::is_none"
+    )]
+    reference_match: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -203,6 +214,20 @@ fn confidence_value(document: &Value) -> f32 {
         return DEFAULT_CONFIDENCE;
     }
     (number as f32).clamp(MIN_CONFIDENCE, MAX_CONFIDENCE)
+}
+
+/// Saved `matchThreshold` in vision/config.local.json. Missing or invalid values use 0.70.
+fn match_threshold(document: &Value) -> f32 {
+    let Some(number) = document
+        .get("matchThreshold")
+        .and_then(|value| value.as_f64())
+    else {
+        return DEFAULT_MATCH_THRESHOLD;
+    };
+    if !number.is_finite() {
+        return DEFAULT_MATCH_THRESHOLD;
+    }
+    (number as f32).clamp(MIN_MATCH_THRESHOLD, MAX_MATCH_THRESHOLD)
 }
 
 /// `enabled` defaults to true when the field is missing or not a boolean.
@@ -924,6 +949,7 @@ fn detections_from_output(
                 scaled[2] + frame.origin_x,
                 scaled[3] + frame.origin_y,
             ],
+            reference_match: None,
         });
     }
     Ok(detections)
@@ -1522,6 +1548,10 @@ fn detect_pixels(
         .as_ref()
         .map(confidence_value)
         .unwrap_or(DEFAULT_CONFIDENCE);
+    let cutoff = document
+        .as_ref()
+        .map(match_threshold)
+        .unwrap_or(DEFAULT_MATCH_THRESHOLD);
     let plan = document
         .as_ref()
         .map(detect_plan)
@@ -1531,9 +1561,15 @@ fn detect_pixels(
     let slots = match plan {
         DetectPlan::FullFrame => {
             return match run_model(&path, rgb, width, height, None, confidence) {
-                Ok((detections, classes)) => {
-                    let dinov2 =
-                        log_dinov2_embeddings(rgb, width, height, &detections, capture_references);
+                Ok((mut detections, classes)) => {
+                    let dinov2 = log_dinov2_embeddings(
+                        rgb,
+                        width,
+                        height,
+                        &mut detections,
+                        capture_references,
+                        cutoff,
+                    );
                     Ok(json!({
                         "detections": detections,
                         "classes": classes,
@@ -1549,9 +1585,15 @@ fn detect_pixels(
     let mut rows = Vec::with_capacity(slots.len());
     for (slot, roi) in slots {
         match run_model(&path, rgb, width, height, Some(&roi), confidence) {
-            Ok((detections, classes)) => {
-                let dinov2 =
-                    log_dinov2_embeddings(rgb, width, height, &detections, capture_references);
+            Ok((mut detections, classes)) => {
+                let dinov2 = log_dinov2_embeddings(
+                    rgb,
+                    width,
+                    height,
+                    &mut detections,
+                    capture_references,
+                    cutoff,
+                );
                 rows.push(json!({
                     "slot": slot,
                     "detections": detections,
@@ -1571,8 +1613,9 @@ fn log_dinov2_embeddings(
     rgb: &[u8],
     width: u32,
     height: u32,
-    detections: &[Detection],
+    detections: &mut [Detection],
     capture_references: bool,
+    match_threshold: f32,
 ) -> Vec<String> {
     if detections.is_empty() || !crate::dinov2::is_loaded() {
         return Vec::new();
@@ -1585,7 +1628,20 @@ fn log_dinov2_embeddings(
             bbox: item.bbox,
         })
         .collect();
-    crate::dinov2::debug_embed(rgb, width, height, &crops, capture_references)
+    let embedded = crate::dinov2::debug_embed(
+        rgb,
+        width,
+        height,
+        &crops,
+        capture_references,
+        match_threshold,
+    );
+    for (detection, counted) in detections.iter_mut().zip(embedded.counted) {
+        if let Some(counts) = counted {
+            detection.reference_match = Some(counts);
+        }
+    }
+    embedded.lines
 }
 
 fn detect_raw(frame: Option<RawFrame>, capture_references: bool) -> Result<Value, String> {
@@ -1900,6 +1956,11 @@ mod tests {
         assert!((confidence_value(&json!({"confidence": 0.10})) - 0.15).abs() < 0.0001);
         assert!((confidence_value(&json!({"confidence": 0.99})) - 0.80).abs() < 0.0001);
         assert!((confidence_value(&json!({"confidence": "nope"})) - 0.45).abs() < 0.0001);
+        assert!((match_threshold(&Value::Null) - 0.70).abs() < 0.0001);
+        assert!((match_threshold(&json!({"matchThreshold": 0.80})) - 0.80).abs() < 0.0001);
+        assert!((match_threshold(&json!({"matchThreshold": 0.10})) - 0.50).abs() < 0.0001);
+        assert!((match_threshold(&json!({"matchThreshold": 0.99})) - 0.95).abs() < 0.0001);
+        assert!((match_threshold(&json!({"matchThreshold": "nope"})) - 0.70).abs() < 0.0001);
     }
 
     #[test]
@@ -2329,7 +2390,7 @@ mod tests {
                 bbox: item.bbox,
             })
             .collect();
-        let lines = crate::dinov2::debug_embed(&rgb, width, height, &crops, false);
+        let lines = crate::dinov2::debug_embed(&rgb, width, height, &crops, false, 0.7).lines;
         assert_eq!(lines.len(), detections.len());
         for (line, item) in lines.iter().zip(&detections) {
             let prefix = format!("DINOv2 {} conf {:.4} norm ", item.ic, item.confidence);
@@ -2439,7 +2500,9 @@ mod tests {
                 bbox: reference.bbox,
             }],
             true,
-        );
+            0.7,
+        )
+        .lines;
         assert!(
             stored
                 .iter()
@@ -2485,7 +2548,8 @@ mod tests {
                     bbox: item.bbox,
                 })
                 .collect();
-            let lines = crate::dinov2::debug_embed(&second, second_w, second_h, &crops, false);
+            let lines =
+                crate::dinov2::debug_embed(&second, second_w, second_h, &crops, false, 0.7).lines;
             best_same = lines
                 .iter()
                 .filter_map(|line| logged_match(line, &reference_ic))

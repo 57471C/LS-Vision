@@ -16,6 +16,9 @@ vision/bom_queries.sql
 # Local settings written by the Settings page. Copy vision/config.example.json to start.
 vision/config.local.json
 vision/config.local.json.tmp
+# DINOv2 reference embeddings captured on this bench. Next to config.local.json.
+vision/dinov2-references.json
+vision/dinov2-references.json.tmp
 # Trained weights stay on the machine. Place best.pt in vision/models/.
 vision/models/*.pt
 vision/models/*.onnx

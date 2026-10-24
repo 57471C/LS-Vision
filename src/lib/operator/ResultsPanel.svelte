@@ -2,7 +2,7 @@
 // biome-ignore-all lint/correctness/noUnusedVariables: Biome 2.4 does not treat Svelte template references as uses
 
 import { panelsForSlots } from "$lib/detect-rois";
-import { detectionCounts, inspectionVerdict } from "$lib/operator/verdict";
+import { detectionCounts, inspectionVerdict, lineTally } from "$lib/operator/verdict";
 import { useOperator } from "$lib/stores/operator";
 import type { Detection, SlotDetections } from "$lib/stores/operator";
 
@@ -47,6 +47,12 @@ function partsOutsideBom(
 		.filter(([ic]) => !known.has(ic))
 		.sort((a, b) => a[0].localeCompare(b[0]))
 		.map(([ic, count]) => ({ ic, count, des: descriptions[ic] ?? "" }));
+}
+
+function tallyClass(status: "pass" | "short" | "extra"): string {
+	if (status === "pass") return "text-green-400";
+	if (status === "extra") return "text-amber-400";
+	return "text-red-400";
 }
 
 function hideBenchNote(text: string | undefined): boolean {
@@ -150,7 +156,8 @@ function slotVerdict(panel: SlotDetections): "pass" | "fail" | "incomplete" {
 				</div>
 				<p class="text-sm text-neutral-400">
 					Test mode is on. Choose an image file to detect parts for this kit. Save references
-					stores each detected part under its IC. The next image logs a match score.
+					stores each detected part under its IC and keeps it on this PC. A later image counts a
+					part when its match is above the saved threshold.
 				</p>
 			{/if}
 			{#if $operator.result.des}
@@ -170,11 +177,14 @@ function slotVerdict(panel: SlotDetections): "pass" | "fail" | "incomplete" {
 							<th class="py-2 text-right font-semibold">Qty</th>
 							{#if showSeen}
 								<th class="py-2 text-right font-semibold">Seen</th>
+								<th class="py-2 text-right font-semibold">Check</th>
 							{/if}
 						</tr>
 					</thead>
 					<tbody>
 						{#each $operator.result.parts as part, i (i)}
+							{@const seen = counts[part.ic] ?? 0}
+							{@const tally = lineTally(seen, part.qty)}
 							<tr class="border-b border-neutral-800">
 								<td class="py-2 pr-3 font-mono font-medium">{part.ic}</td>
 								<td class="py-2 pr-3 text-neutral-200">{part.des}</td>
@@ -183,11 +193,18 @@ function slotVerdict(panel: SlotDetections): "pass" | "fail" | "incomplete" {
 									<td
 										class="py-2 text-right font-semibold {$operator.detectState === 'running'
 											? 'text-neutral-500'
-											: (counts[part.ic] ?? 0) >= part.qty
+											: seen >= part.qty
 												? 'text-green-400'
 												: 'text-red-400'}"
 									>
-										{$operator.detectState === "running" ? "…" : (counts[part.ic] ?? 0)}
+										{$operator.detectState === "running" ? "…" : seen}
+									</td>
+									<td
+										class="py-2 text-right font-semibold uppercase {$operator.detectState === 'running'
+											? 'text-neutral-500'
+											: tallyClass(tally)}"
+									>
+										{$operator.detectState === "running" ? "…" : tally}
 									</td>
 								{/if}
 							</tr>
@@ -298,7 +315,8 @@ function slotVerdict(panel: SlotDetections): "pass" | "fail" | "incomplete" {
 						</div>
 						<p class="text-sm text-neutral-400">
 							Test mode is on. Choose an image file to detect parts for this kit. Save references
-							stores each detected part under its IC. The next image logs a match score.
+							stores each detected part under its IC and keeps it on this PC. A later image counts a
+					part when its match is above the saved threshold.
 						</p>
 					{/if}
 					{#if $operator.result.des}
@@ -316,11 +334,14 @@ function slotVerdict(panel: SlotDetections): "pass" | "fail" | "incomplete" {
 									<th class="py-2 text-right font-semibold">Qty</th>
 									{#if showSeen}
 										<th class="py-2 text-right font-semibold">Seen</th>
+										<th class="py-2 text-right font-semibold">Check</th>
 									{/if}
 								</tr>
 							</thead>
 							<tbody>
 								{#each $operator.result.parts as part, i (i)}
+									{@const seen = slotCounts[part.ic] ?? 0}
+									{@const tally = lineTally(seen, part.qty)}
 									<tr class="border-b border-neutral-800">
 										<td class="py-2 pr-3 font-mono font-medium">{part.ic}</td>
 										<td class="py-2 pr-3 text-neutral-200">{part.des}</td>
@@ -329,11 +350,18 @@ function slotVerdict(panel: SlotDetections): "pass" | "fail" | "incomplete" {
 											<td
 												class="py-2 text-right font-semibold {$operator.detectState === 'running'
 													? 'text-neutral-500'
-													: (slotCounts[part.ic] ?? 0) >= part.qty
+													: seen >= part.qty
 														? 'text-green-400'
 														: 'text-red-400'}"
 											>
-												{$operator.detectState === "running" ? "…" : (slotCounts[part.ic] ?? 0)}
+												{$operator.detectState === "running" ? "…" : seen}
+											</td>
+											<td
+												class="py-2 text-right font-semibold uppercase {$operator.detectState === 'running'
+													? 'text-neutral-500'
+													: tallyClass(tally)}"
+											>
+												{$operator.detectState === "running" ? "…" : tally}
 											</td>
 										{/if}
 									</tr>

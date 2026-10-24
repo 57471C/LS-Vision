@@ -21,6 +21,8 @@ export type PartBox = {
 	bbox: number[];
 	// True when this box was the child of a matching rule and was not rewritten.
 	consumed?: boolean;
+	// Kept from detection. A part rule rename does not clear it.
+	referenceMatch?: boolean;
 };
 
 export type PartComposition = {
