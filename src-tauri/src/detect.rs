@@ -305,7 +305,13 @@ fn crop_rgb(
 /// Horizontal sums stay in `i32` (`pixel * 11-bit coeff`). The 8-bit vertical
 /// step is the specialized form, not `(sum + bias) >> 22`:
 /// `((b0 * (row >> 4)) >> 16 + (b1 * (row >> 4)) >> 16 + 2) >> 2`.
-fn resize_linear(src: &[u8], src_w: usize, src_h: usize, dst_w: usize, dst_h: usize) -> Vec<u8> {
+pub(crate) fn resize_linear(
+    src: &[u8],
+    src_w: usize,
+    src_h: usize,
+    dst_w: usize,
+    dst_h: usize,
+) -> Vec<u8> {
     let channels = 3;
     if src_w == dst_w && src_h == dst_h {
         return src.to_vec();
@@ -399,14 +405,14 @@ fn clip_row(index: i32, height: usize) -> usize {
     }
 }
 
-struct Letterbox {
-    new_w: i32,
-    new_h: i32,
-    top: i32,
-    left: i32,
+pub(crate) struct Letterbox {
+    pub(crate) new_w: i32,
+    pub(crate) new_h: i32,
+    pub(crate) top: i32,
+    pub(crate) left: i32,
 }
 
-fn letterbox_geometry(width: i32, height: i32, size: i32) -> Letterbox {
+pub(crate) fn letterbox_geometry(width: i32, height: i32, size: i32) -> Letterbox {
     let shape_h = f64::from(height);
     let shape_w = f64::from(width);
     let target = f64::from(size);
@@ -1520,10 +1526,13 @@ fn detect_pixels(rgb: &[u8], width: u32, height: u32) -> Result<Value, String> {
     let slots = match plan {
         DetectPlan::FullFrame => {
             return match run_model(&path, rgb, width, height, None, confidence) {
-                Ok((detections, classes)) => Ok(json!({
-                    "detections": detections,
-                    "classes": classes,
-                })),
+                Ok((detections, classes)) => {
+                    log_dinov2_embeddings(rgb, width, height, &detections);
+                    Ok(json!({
+                        "detections": detections,
+                        "classes": classes,
+                    }))
+                }
                 Err(message) => Ok(failure(&model_status_message(&message))),
             };
         }
@@ -1533,15 +1542,35 @@ fn detect_pixels(rgb: &[u8], width: u32, height: u32) -> Result<Value, String> {
     let mut rows = Vec::with_capacity(slots.len());
     for (slot, roi) in slots {
         match run_model(&path, rgb, width, height, Some(&roi), confidence) {
-            Ok((detections, classes)) => rows.push(json!({
-                "slot": slot,
-                "detections": detections,
-                "classes": classes,
-            })),
+            Ok((detections, classes)) => {
+                log_dinov2_embeddings(rgb, width, height, &detections);
+                rows.push(json!({
+                    "slot": slot,
+                    "detections": detections,
+                    "classes": classes,
+                }));
+            }
             Err(message) => return Ok(failure(&model_status_message(&message))),
         }
     }
     Ok(Value::Array(rows))
+}
+
+/// Confidence and NMS have already dropped the other boxes. A missing DINOv2
+/// session returns without a log and does not change these detections.
+fn log_dinov2_embeddings(rgb: &[u8], width: u32, height: u32, detections: &[Detection]) {
+    if detections.is_empty() || !crate::dinov2::is_loaded() {
+        return;
+    }
+    let crops: Vec<crate::dinov2::DebugCrop<'_>> = detections
+        .iter()
+        .map(|item| crate::dinov2::DebugCrop {
+            class_name: &item.ic,
+            confidence: item.confidence,
+            bbox: item.bbox,
+        })
+        .collect();
+    crate::dinov2::debug_embed(rgb, width, height, &crops);
 }
 
 fn detect_raw(frame: Option<RawFrame>) -> Result<Value, String> {
@@ -2252,5 +2281,40 @@ mod tests {
             report.width,
             report.height
         );
+    }
+
+    #[test]
+    fn example3_logs_one_dinov2_line_per_surviving_box() {
+        let _hold = crate::dinov2::lock_for_test();
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let root = manifest.parent().expect("project root");
+        let model = root.join("vision").join("models").join("best.onnx");
+        let image = root.join("vision").join("test-images").join("Example3.jpg");
+        let dino = manifest.join("models").join("dinov2_vits14.onnx");
+        if !model.is_file() || !image.is_file() || !dino.is_file() {
+            eprintln!("skip: best.onnx, Example3.jpg, or dinov2_vits14.onnx is missing");
+            return;
+        }
+        crate::dinov2::load_at(&dino);
+        assert!(crate::dinov2::is_loaded());
+        let bytes = std::fs::read(&image).unwrap();
+        let (rgb, width, height) = decode_rgb(&bytes).unwrap();
+        let (detections, _) = run_model(&model, &rgb, width, height, None, 0.45).unwrap();
+        assert!(!detections.is_empty(), "Example3 produced no boxes at 0.45");
+        let crops: Vec<crate::dinov2::DebugCrop<'_>> = detections
+            .iter()
+            .map(|item| crate::dinov2::DebugCrop {
+                class_name: &item.ic,
+                confidence: item.confidence,
+                bbox: item.bbox,
+            })
+            .collect();
+        let lines = crate::dinov2::debug_embed(&rgb, width, height, &crops);
+        assert_eq!(lines.len(), detections.len());
+        for (line, item) in lines.iter().zip(&detections) {
+            let prefix = format!("DINOv2 {} conf {:.4} norm ", item.ic, item.confidence);
+            assert!(line.starts_with(&prefix), "{line}");
+            assert!(!line.contains("embed failed"), "{line}");
+        }
     }
 }
