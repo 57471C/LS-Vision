@@ -115,7 +115,7 @@ fn open_held(path: &Path) -> Result<(ort::session::Session, Dinov2Status), Strin
         ));
     }
     let (session, fallback) = open_dinov2(path)?;
-    let mut message = format!("DINOv2 session loaded from {}.", path.display());
+    let mut message = format!("DINOv2 session is ready. Loaded from {}.", path.display());
     if let Some(note) = fallback {
         message.push(' ');
         message.push_str(&note);
@@ -214,6 +214,11 @@ mod tests {
         }
         let status = load_at(&path);
         assert!(status.loaded, "{}", status.message);
+        assert!(
+            status.message.contains("DINOv2 session is ready"),
+            "{}",
+            status.message
+        );
         let input = status
             .inputs
             .iter()
