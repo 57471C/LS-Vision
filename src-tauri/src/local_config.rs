@@ -206,6 +206,7 @@ fn default_config() -> Value {
         "barcodeRoi": null,
         "model": "",
         "confidence": 0.45,
+        "matchThreshold": 0.7,
         "partRules": [],
         "inferenceEp": "directml",
         "trainingDir": "",
@@ -757,6 +758,7 @@ mod tests {
         assert_eq!(document["source"], "json");
         assert_eq!(document["model"], "");
         assert_eq!(document["confidence"], 0.45);
+        assert_eq!(document["matchThreshold"], 0.7);
         assert_eq!(document["partRules"], serde_json::json!([]));
         assert_eq!(document["inferenceEp"], "directml");
         assert_eq!(document["trainingDir"], "");

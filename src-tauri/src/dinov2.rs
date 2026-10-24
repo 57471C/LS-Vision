@@ -4,19 +4,23 @@
 //! A missing or unloadable file is a warning. Detection keeps using the YOLO session.
 //! After YOLO keeps a box, this module can crop it, letterbox it to 224, and log
 //! the embedding. A test-mode capture stores that vector under the box's IC.
+//! The map is kept in memory and written to `vision/dinov2-references.json`.
 //! A later detection logs the best cosine score against those references.
-//! The score is not a BoM quantity check.
+//! A box counts toward its IC only when that score is above the saved threshold.
 
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::detect;
 use crate::inference_ep::{self, Provider};
 
 const FILE_NAME: &str = "dinov2_vits14.onnx";
+const REFERENCES_FILE: &str = "dinov2-references.json";
+const REFERENCES_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Dinov2Port {
@@ -55,8 +59,10 @@ pub(crate) fn model_path() -> PathBuf {
 }
 
 /// Open the DINOv2 session once. A missing file does not touch the YOLO cache.
+/// Saved references load even when the model file is missing.
 pub(crate) fn load_on_startup() {
     load_at(&model_path());
+    load_saved_references();
 }
 
 pub(crate) fn load_at(path: &Path) -> Dinov2Status {
@@ -196,6 +202,13 @@ pub(crate) fn is_loaded() -> bool {
         .is_some_and(|state| state.session.is_some())
 }
 
+pub(crate) struct EmbedDebug {
+    pub lines: Vec<String>,
+    /// One entry per crop. `None` means this box has no reference to compare.
+    /// `Some` is whether the best cosine is above the threshold.
+    pub counted: Vec<Option<bool>>,
+}
+
 /// Crop, letterbox, and embed each box. A missing session returns no lines and
 /// prints nothing. Each returned line is also written to stderr.
 /// `store` keeps the vector under the box IC for a later cosine match.
@@ -205,12 +218,16 @@ pub(crate) fn debug_embed(
     height: u32,
     crops: &[DebugCrop<'_>],
     store: bool,
-) -> Vec<String> {
+    threshold: f32,
+) -> EmbedDebug {
     let mut guard = lock(&STATE);
     let Some(session) = guard.as_mut().and_then(|state| state.session.as_mut()) else {
-        return Vec::new();
+        return EmbedDebug {
+            lines: Vec::new(),
+            counted: Vec::new(),
+        };
     };
-    embed_crops(session, rgb, width, height, crops, store)
+    embed_crops(session, rgb, width, height, crops, store, threshold)
 }
 
 /// One crop through the loaded session. Used to compare a known box with a reference.
@@ -241,6 +258,15 @@ pub(crate) fn remember(class_name: &str, values: &[f32]) -> usize {
     list.len()
 }
 
+/// `Some(true)` when the score is above the threshold. `None` when there is no score.
+pub(crate) fn reference_counts(score: Option<f32>, threshold: f32) -> Option<bool> {
+    let score = score?;
+    if !score.is_finite() || !threshold.is_finite() {
+        return None;
+    }
+    Some(score > threshold)
+}
+
 /// Best cosine similarity against the references stored for this IC.
 pub(crate) fn best_similarity(class_name: &str, values: &[f32]) -> Option<f32> {
     let guard = lock(&REFERENCES);
@@ -253,6 +279,128 @@ pub(crate) fn best_similarity(class_name: &str, values: &[f32]) -> Option<f32> {
         best = Some(best.map(|current| current.max(score)).unwrap_or(score));
     }
     best
+}
+
+#[derive(Serialize, Deserialize)]
+struct ReferenceFile {
+    version: u32,
+    references: HashMap<String, Vec<Vec<f32>>>,
+}
+
+fn references_path() -> Result<PathBuf, String> {
+    let root = crate::local_config::project_root()?;
+    Ok(root.join("vision").join(REFERENCES_FILE))
+}
+
+/// Load the file next to config.local.json. A missing file leaves memory as it is.
+/// A bad file is a warning and also leaves memory as it is.
+pub(crate) fn load_saved_references() {
+    let path = match references_path() {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("warning: DINOv2 references were not loaded: {err}");
+            return;
+        }
+    };
+    match load_references_from(&path) {
+        Ok(true) => {
+            let classes = lock(&REFERENCES).len();
+            eprintln!(
+                "DINOv2 references loaded: {classes} classes from {}",
+                path.display()
+            );
+        }
+        Ok(false) => {}
+        Err(err) => eprintln!("warning: {err} In-memory references are unchanged."),
+    }
+}
+
+/// `Ok(true)` when a file was read. `Ok(false)` when the file is absent.
+pub(crate) fn load_references_from(path: &Path) -> Result<bool, String> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(format!("Could not read DINOv2 references: {err}")),
+    };
+    let file: ReferenceFile = serde_json::from_str(&text).map_err(|_| {
+        format!(
+            "DINOv2 references at {} are not valid JSON.",
+            path.display()
+        )
+    })?;
+    if file.version != REFERENCES_VERSION {
+        return Err(format!(
+            "DINOv2 references at {} use an unknown version.",
+            path.display()
+        ));
+    }
+    let mut clean = HashMap::new();
+    for (name, vectors) in file.references {
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let kept: Vec<Vec<f32>> = vectors
+            .into_iter()
+            .filter(|values| !values.is_empty() && values.iter().all(|value| value.is_finite()))
+            .collect();
+        if kept.is_empty() {
+            continue;
+        }
+        clean.insert(name.to_string(), kept);
+    }
+    *lock(&REFERENCES) = clean;
+    Ok(true)
+}
+
+pub(crate) fn save_references_to(path: &Path) -> Result<(), String> {
+    let file = ReferenceFile {
+        version: REFERENCES_VERSION,
+        references: lock(&REFERENCES).clone(),
+    };
+    let mut text = serde_json::to_string(&file)
+        .map_err(|_| "Could not write DINOv2 references.".to_string())?;
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Could not write DINOv2 references.".to_string())?;
+    fs::create_dir_all(parent)
+        .map_err(|err| format!("Could not write DINOv2 references: {err}"))?;
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, text.as_bytes())
+        .map_err(|err| format!("Could not write DINOv2 references: {err}"))?;
+    if fs::rename(&tmp, path).is_err() {
+        if path.exists() {
+            fs::remove_file(path).map_err(|err| {
+                let _ = fs::remove_file(&tmp);
+                format!("Could not replace DINOv2 references: {err}")
+            })?;
+        }
+        fs::rename(&tmp, path).map_err(|err| {
+            let _ = fs::remove_file(&tmp);
+            format!("Could not replace DINOv2 references: {err}")
+        })?;
+    }
+    Ok(())
+}
+
+fn persist_references() {
+    // Unit tests store vectors in memory and write only to a temp path.
+    if cfg!(test) {
+        return;
+    }
+    let path = match references_path() {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("warning: DINOv2 references stayed in memory: {err}");
+            return;
+        }
+    };
+    if let Err(err) = save_references_to(&path) {
+        eprintln!("warning: {err} In-memory references are unchanged.");
+    }
 }
 
 fn cosine(left: &[f32], right: &[f32]) -> Option<f32> {
@@ -282,27 +430,37 @@ fn embed_crops(
     height: u32,
     crops: &[DebugCrop<'_>],
     store: bool,
-) -> Vec<String> {
+    threshold: f32,
+) -> EmbedDebug {
     let mut lines = Vec::with_capacity(crops.len());
+    let mut counted = Vec::with_capacity(crops.len());
     let mut stored: HashMap<String, usize> = HashMap::new();
     for crop in crops {
-        let line = match embed_one(session, rgb, width, height, crop) {
+        let (line, counts) = match embed_one(session, rgb, width, height, crop) {
             Ok(values) => {
                 // Score against the references already stored, then append.
                 let matched = best_similarity(crop.class_name, &values);
+                let counts = reference_counts(matched, threshold);
                 if store {
                     let count = remember(crop.class_name, &values);
                     stored.insert(crop.class_name.to_string(), count);
                 }
-                embed_line(crop.class_name, crop.confidence, &values, matched)
+                (
+                    embed_line(crop.class_name, crop.confidence, &values, matched),
+                    counts,
+                )
             }
-            Err(err) => format!(
-                "DINOv2 {} conf {:.4} embed failed: {err}",
-                crop.class_name, crop.confidence
+            Err(err) => (
+                format!(
+                    "DINOv2 {} conf {:.4} embed failed: {err}",
+                    crop.class_name, crop.confidence
+                ),
+                None,
             ),
         };
         eprintln!("{line}");
         lines.push(line);
+        counted.push(counts);
     }
     if store {
         let mut names: Vec<String> = stored.keys().cloned().collect();
@@ -313,8 +471,9 @@ fn embed_crops(
             eprintln!("{line}");
             lines.push(line);
         }
+        persist_references();
     }
-    lines
+    EmbedDebug { lines, counted }
 }
 
 fn embed_one(
@@ -521,7 +680,7 @@ mod tests {
             bbox: [0, 0, 2, 2],
         }];
         let rgb = vec![0u8; 4 * 4 * 3];
-        assert!(debug_embed(&rgb, 4, 4, &crops, false).is_empty());
+        assert!(debug_embed(&rgb, 4, 4, &crops, false, 0.7).lines.is_empty());
     }
 
     #[test]
@@ -572,5 +731,51 @@ mod tests {
         let line = embed_line("2BBMNM08", 0.5, &[1.0, 0.0, 0.0, 0.0], Some(0.81234));
         assert!(line.contains(" match 0.8123"), "{line}");
         clear_references();
+    }
+
+    #[test]
+    fn a_score_above_the_threshold_counts_and_the_threshold_does_not() {
+        assert_eq!(reference_counts(Some(0.7001), 0.7), Some(true));
+        assert_eq!(reference_counts(Some(0.7), 0.7), Some(false));
+        assert_eq!(reference_counts(Some(0.26), 0.7), Some(false));
+        assert_eq!(reference_counts(None, 0.7), None);
+        assert_eq!(reference_counts(Some(f32::NAN), 0.7), None);
+    }
+
+    #[test]
+    fn saved_references_load_after_memory_is_cleared() {
+        let _hold = lock_for_test();
+        clear_references();
+        remember("2BBMNM08", &[1.0, 0.0, 0.0, 0.0]);
+        let path =
+            std::env::temp_dir().join(format!("ls-vision-dino-refs-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        save_references_to(&path).unwrap();
+        clear_references();
+        assert!(best_similarity("2BBMNM08", &[1.0, 0.0, 0.0, 0.0]).is_none());
+        assert_eq!(load_references_from(&path).unwrap(), true);
+        assert_eq!(
+            best_similarity("2BBMNM08", &[1.0, 0.0, 0.0, 0.0]),
+            Some(1.0)
+        );
+        std::fs::write(&path, b"not json").unwrap();
+        let err = load_references_from(&path).unwrap_err();
+        assert!(err.contains("not valid JSON"), "{err}");
+        assert_eq!(
+            best_similarity("2BBMNM08", &[1.0, 0.0, 0.0, 0.0]),
+            Some(1.0)
+        );
+        let missing = std::env::temp_dir().join(format!(
+            "ls-vision-dino-refs-missing-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&missing);
+        assert_eq!(load_references_from(&missing).unwrap(), false);
+        assert_eq!(
+            best_similarity("2BBMNM08", &[1.0, 0.0, 0.0, 0.0]),
+            Some(1.0)
+        );
+        clear_references();
+        let _ = std::fs::remove_file(&path);
     }
 }

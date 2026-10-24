@@ -46,6 +46,9 @@ export type Detection = {
 	bbox: number[];
 	// Set when a matching part rule used this box as its child.
 	consumed?: boolean;
+	// False when saved references for this class scored at or below the threshold.
+	// Absent when that class has no reference, so the box still counts.
+	referenceMatch?: boolean;
 };
 
 export type SlotDetections = {
