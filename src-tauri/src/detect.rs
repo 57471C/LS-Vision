@@ -1503,7 +1503,12 @@ fn raw_rgb(frame: &RawFrame) -> Result<(&[u8], u32, u32), String> {
     Ok((&frame.data[..expected], frame.width, frame.height))
 }
 
-fn detect_pixels(rgb: &[u8], width: u32, height: u32) -> Result<Value, String> {
+fn detect_pixels(
+    rgb: &[u8],
+    width: u32,
+    height: u32,
+    capture_references: bool,
+) -> Result<Value, String> {
     let root = match local_config::project_root() {
         Ok(root) => root,
         Err(message) => return Ok(failure(&message)),
@@ -1527,10 +1532,12 @@ fn detect_pixels(rgb: &[u8], width: u32, height: u32) -> Result<Value, String> {
         DetectPlan::FullFrame => {
             return match run_model(&path, rgb, width, height, None, confidence) {
                 Ok((detections, classes)) => {
-                    log_dinov2_embeddings(rgb, width, height, &detections);
+                    let dinov2 =
+                        log_dinov2_embeddings(rgb, width, height, &detections, capture_references);
                     Ok(json!({
                         "detections": detections,
                         "classes": classes,
+                        "dinov2": dinov2,
                     }))
                 }
                 Err(message) => Ok(failure(&model_status_message(&message))),
@@ -1543,11 +1550,13 @@ fn detect_pixels(rgb: &[u8], width: u32, height: u32) -> Result<Value, String> {
     for (slot, roi) in slots {
         match run_model(&path, rgb, width, height, Some(&roi), confidence) {
             Ok((detections, classes)) => {
-                log_dinov2_embeddings(rgb, width, height, &detections);
+                let dinov2 =
+                    log_dinov2_embeddings(rgb, width, height, &detections, capture_references);
                 rows.push(json!({
                     "slot": slot,
                     "detections": detections,
                     "classes": classes,
+                    "dinov2": dinov2,
                 }));
             }
             Err(message) => return Ok(failure(&model_status_message(&message))),
@@ -1558,9 +1567,15 @@ fn detect_pixels(rgb: &[u8], width: u32, height: u32) -> Result<Value, String> {
 
 /// Confidence and NMS have already dropped the other boxes. A missing DINOv2
 /// session returns without a log and does not change these detections.
-fn log_dinov2_embeddings(rgb: &[u8], width: u32, height: u32, detections: &[Detection]) {
+fn log_dinov2_embeddings(
+    rgb: &[u8],
+    width: u32,
+    height: u32,
+    detections: &[Detection],
+    capture_references: bool,
+) -> Vec<String> {
     if detections.is_empty() || !crate::dinov2::is_loaded() {
-        return;
+        return Vec::new();
     }
     let crops: Vec<crate::dinov2::DebugCrop<'_>> = detections
         .iter()
@@ -1570,10 +1585,10 @@ fn log_dinov2_embeddings(rgb: &[u8], width: u32, height: u32, detections: &[Dete
             bbox: item.bbox,
         })
         .collect();
-    crate::dinov2::debug_embed(rgb, width, height, &crops);
+    crate::dinov2::debug_embed(rgb, width, height, &crops, capture_references)
 }
 
-fn detect_raw(frame: Option<RawFrame>) -> Result<Value, String> {
+fn detect_raw(frame: Option<RawFrame>, capture_references: bool) -> Result<Value, String> {
     let Some(frame) = frame else {
         return Ok(failure("No frame"));
     };
@@ -1581,10 +1596,10 @@ fn detect_raw(frame: Option<RawFrame>) -> Result<Value, String> {
         Ok(rgb) => rgb,
         Err(message) => return Ok(failure(&message)),
     };
-    detect_pixels(rgb, width, height)
+    detect_pixels(rgb, width, height, capture_references)
 }
 
-fn detect_encoded(text: &str) -> Result<Value, String> {
+fn detect_encoded(text: &str, capture_references: bool) -> Result<Value, String> {
     let bytes = match payload_bytes(text) {
         Ok(bytes) => bytes,
         Err(message) => return Ok(failure(&message)),
@@ -1593,26 +1608,31 @@ fn detect_encoded(text: &str) -> Result<Value, String> {
         Ok(decoded) => decoded,
         Err(message) => return Ok(failure(&message)),
     };
-    detect_pixels(&rgb, width, height)
+    detect_pixels(&rgb, width, height, capture_references)
 }
 
 #[tauri::command]
 pub async fn detect_image(
     state: tauri::State<'_, FrameState>,
     image: Option<String>,
+    capture_references: Option<bool>,
 ) -> Result<Value, String> {
     // Test mode passes the chosen file. A live detect leaves this empty and
-    // uses the raw frame stored by capture_snapshot.
+    // uses the raw frame stored by capture_snapshot. Saving references stores
+    // each surviving box's embedding under its IC. It does not change the result.
+    let capture_references = capture_references.unwrap_or(false);
     if let Some(text) = image.filter(|value| !value.trim().is_empty()) {
-        return tauri::async_runtime::spawn_blocking(move || detect_encoded(&text))
-            .await
-            .map_err(|_| "Detect failed".to_string())?;
+        return tauri::async_runtime::spawn_blocking(move || {
+            detect_encoded(&text, capture_references)
+        })
+        .await
+        .map_err(|_| "Detect failed".to_string())?;
     }
     let frame = {
         let guard = state.latest.lock().unwrap_or_else(|err| err.into_inner());
         guard.clone()
     };
-    tauri::async_runtime::spawn_blocking(move || detect_raw(frame))
+    tauri::async_runtime::spawn_blocking(move || detect_raw(frame, capture_references))
         .await
         .map_err(|_| "Detect failed".to_string())?
 }
@@ -2309,12 +2329,181 @@ mod tests {
                 bbox: item.bbox,
             })
             .collect();
-        let lines = crate::dinov2::debug_embed(&rgb, width, height, &crops);
+        let lines = crate::dinov2::debug_embed(&rgb, width, height, &crops, false);
         assert_eq!(lines.len(), detections.len());
         for (line, item) in lines.iter().zip(&detections) {
             let prefix = format!("DINOv2 {} conf {:.4} norm ", item.ic, item.confidence);
             assert!(line.starts_with(&prefix), "{line}");
             assert!(!line.contains("embed failed"), "{line}");
         }
+    }
+
+    fn inset_rgb(rgb: &[u8], width: u32, height: u32, margin: u32) -> (Vec<u8>, u32, u32) {
+        if margin == 0 {
+            return (rgb.to_vec(), width, height);
+        }
+        let x0 = margin as usize;
+        let y0 = margin as usize;
+        let crop_w = width as usize - margin as usize * 2;
+        let crop_h = height as usize - margin as usize * 2;
+        let frame_w = width as usize;
+        let mut pixels = Vec::with_capacity(crop_w * crop_h * 3);
+        for row in 0..crop_h {
+            let start = ((y0 + row) * frame_w + x0) * 3;
+            pixels.extend_from_slice(&rgb[start..start + crop_w * 3]);
+        }
+        (pixels, crop_w as u32, crop_h as u32)
+    }
+
+    fn jpeg_rgb(rgb: &[u8], width: u32, height: u32, quality: i32) -> Vec<u8> {
+        let image = turbojpeg::Image {
+            pixels: rgb,
+            width: width as usize,
+            pitch: (width as usize).saturating_mul(3),
+            height: height as usize,
+            format: turbojpeg::PixelFormat::RGB,
+        };
+        turbojpeg::compress(image, quality, turbojpeg::Subsamp::Sub2x2)
+            .expect("jpeg")
+            .as_ref()
+            .to_vec()
+    }
+
+    fn logged_match(line: &str, class_name: &str) -> Option<f32> {
+        let head = format!("DINOv2 {class_name} ");
+        if !line.starts_with(&head) {
+            return None;
+        }
+        let token = line.split(" match ").nth(1)?.split_whitespace().next()?;
+        token.parse().ok()
+    }
+
+    #[test]
+    fn example3_reference_scores_the_same_class_above_a_different_one() {
+        struct ClearReferences;
+        impl Drop for ClearReferences {
+            fn drop(&mut self) {
+                crate::dinov2::clear_references();
+            }
+        }
+        let _hold = crate::dinov2::lock_for_test();
+        let _clear = ClearReferences;
+        crate::dinov2::clear_references();
+
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let root = manifest.parent().expect("project root");
+        let model = root.join("vision").join("models").join("best.onnx");
+        let image = root.join("vision").join("test-images").join("Example3.jpg");
+        let dino = manifest.join("models").join("dinov2_vits14.onnx");
+        if !model.is_file() || !image.is_file() || !dino.is_file() {
+            eprintln!("skip: best.onnx, Example3.jpg, or dinov2_vits14.onnx is missing");
+            return;
+        }
+        crate::dinov2::load_at(&dino);
+        assert!(crate::dinov2::is_loaded());
+        let bytes = std::fs::read(&image).unwrap();
+        let (rgb, width, height) = decode_rgb(&bytes).unwrap();
+        let (detections, _) = run_model(&model, &rgb, width, height, None, 0.45).unwrap();
+        assert!(
+            detections.len() >= 2,
+            "Example3 produced fewer than two boxes at 0.45"
+        );
+
+        let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for item in &detections {
+            *counts.entry(item.ic.as_str()).or_default() += 1;
+        }
+        let reference_ic = counts
+            .iter()
+            .max_by(|left, right| left.1.cmp(right.1).then_with(|| right.0.cmp(left.0)))
+            .map(|(name, _)| (*name).to_string())
+            .expect("a class");
+        let reference = detections
+            .iter()
+            .filter(|item| item.ic == reference_ic)
+            .max_by(|left, right| left.confidence.total_cmp(&right.confidence))
+            .expect("reference box");
+        let wrong = detections
+            .iter()
+            .filter(|item| item.ic != reference_ic)
+            .max_by(|left, right| left.confidence.total_cmp(&right.confidence))
+            .expect("Example3 needs a second class");
+
+        let stored = crate::dinov2::debug_embed(
+            &rgb,
+            width,
+            height,
+            &[crate::dinov2::DebugCrop {
+                class_name: &reference.ic,
+                confidence: reference.confidence,
+                bbox: reference.bbox,
+            }],
+            true,
+        );
+        assert!(
+            stored
+                .iter()
+                .any(|line| line == &format!("DINOv2 reference {reference_ic} stored 1")),
+            "{stored:?}"
+        );
+
+        let wrong_values = crate::dinov2::embed_debug_crop(
+            &rgb,
+            width,
+            height,
+            &crate::dinov2::DebugCrop {
+                class_name: &wrong.ic,
+                confidence: wrong.confidence,
+                bbox: wrong.bbox,
+            },
+        )
+        .expect("wrong-class embed");
+        let wrong_score = crate::dinov2::best_similarity(&reference_ic, &wrong_values)
+            .expect("reference was stored");
+
+        // Same kit, a second file: inset the photo, then fall back to a recompress.
+        let attempts = [(48_u32, 80_i32), (16, 90), (0, 75)];
+        let mut best_same: Option<f32> = None;
+        for (margin, quality) in attempts {
+            if margin > 0 && (width <= margin * 2 + 32 || height <= margin * 2 + 32) {
+                continue;
+            }
+            let (crop, crop_w, crop_h) = inset_rgb(&rgb, width, height, margin);
+            let jpeg = jpeg_rgb(&crop, crop_w, crop_h, quality);
+            let (second, second_w, second_h) = decode_rgb(&jpeg).expect("second image");
+            let (found, _) =
+                run_model(&model, &second, second_w, second_h, None, 0.45).expect("second detect");
+            if !found.iter().any(|item| item.ic == reference_ic) {
+                eprintln!("DINOv2 second image margin {margin} lost {reference_ic}");
+                continue;
+            }
+            let crops: Vec<crate::dinov2::DebugCrop<'_>> = found
+                .iter()
+                .map(|item| crate::dinov2::DebugCrop {
+                    class_name: &item.ic,
+                    confidence: item.confidence,
+                    bbox: item.bbox,
+                })
+                .collect();
+            let lines = crate::dinov2::debug_embed(&second, second_w, second_h, &crops, false);
+            best_same = lines
+                .iter()
+                .filter_map(|line| logged_match(line, &reference_ic))
+                .reduce(f32::max);
+            if best_same.is_some() {
+                eprintln!("DINOv2 second image margin {margin} quality {quality}");
+                break;
+            }
+        }
+        let best_same = best_same.expect("the second image logged no match for the reference IC");
+        eprintln!(
+            "DINOv2 match {reference_ic} same {best_same:.4} other {} {wrong_score:.4}",
+            wrong.ic
+        );
+        assert!(
+            best_same > wrong_score,
+            "same-class {best_same:.4} did not beat {reference_ic} vs {} {wrong_score:.4}",
+            wrong.ic
+        );
     }
 }

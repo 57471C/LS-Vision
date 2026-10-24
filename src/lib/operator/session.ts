@@ -360,14 +360,27 @@ function attachSession(
 		image_base64?: unknown;
 		message?: unknown;
 		slot?: unknown;
+		dinov2?: unknown;
 	};
 
-	async function requestDetections(image?: string): Promise<unknown> {
+	function noteDinov2(value: unknown) {
+		if (!Array.isArray(value)) return;
+		for (const line of value) {
+			if (typeof line === "string" && line.trim()) writeConsole(line);
+		}
+	}
+
+	async function requestDetections(
+		image?: string,
+		captureReferences = false,
+	): Promise<unknown> {
 		// .onnx runs in Rust. A live detect uses the latest raw frame. Test mode
-		// passes the chosen file. A .pt file is not detected.
+		// passes the chosen file. A .pt file is not detected. Saving references
+		// stores each surviving box under its IC and does not change the result.
 		if (op.modelName.toLowerCase().endsWith(".onnx")) {
 			return await invoke("detect_image", {
 				image: image && image.trim() ? image : null,
+				captureReferences,
 			});
 		}
 		return {
@@ -644,6 +657,7 @@ function attachSession(
 		generation: number,
 		image?: string,
 		keepPanels = false,
+		captureReferences = false,
 	) {
 		if (generation !== detectGeneration) return;
 		const viewAtStart = op.result;
@@ -655,7 +669,7 @@ function attachSession(
 		op.partDescriptions = {};
 		op.detectMessage = "";
 		try {
-			const payload = await requestDetections(image);
+			const payload = await requestDetections(image, captureReferences);
 			if (generation !== detectGeneration || !pageAlive) return;
 			if (Array.isArray(payload)) {
 				const parsed: { slot: number; detections: Detection[] }[] = [];
@@ -664,6 +678,7 @@ function attachSession(
 				let checked = false;
 				for (const entry of payload) {
 					if (!isDetectObject(entry)) continue;
+					noteDinov2(entry.dinov2);
 					const slot = detectSlotNumber(entry.slot);
 					if (slot === null) continue;
 					const composed = await composeDetections(
@@ -691,6 +706,7 @@ function attachSession(
 				applyDetectedStill(null);
 			} else {
 				if (!isDetectObject(payload)) throw new Error("Detect failed");
+				noteDinov2(payload.dinov2);
 				const composed = await composeDetections(
 					fitDetections(asDetections(payload.detections)),
 					modelClassList(payload.classes),
@@ -1880,7 +1896,7 @@ function attachSession(
 		});
 	}
 
-	async function chooseAndDetect() {
+	async function chooseImageAndDetect(captureReferences: boolean) {
 		if (!op.bom || !op.testMode) return;
 		const kitCode = op.bom.kitCode;
 		const file = await chooseImageFile();
@@ -1891,12 +1907,20 @@ function attachSession(
 			// Boxes stay in this file's pixels. The camera frame is not the photo.
 			scaleToPreview = false;
 			const generation = holdStill(dataUrl, kitCode);
-			await runDetect(generation, dataUrl);
+			await runDetect(generation, dataUrl, false, captureReferences);
 		} catch (err: unknown) {
 			if (!pageAlive) return;
 			op.detectMessage = errorMessage(err, "Could not read the image");
 			op.detectState = "done";
 		}
+	}
+
+	function chooseAndDetect() {
+		return chooseImageAndDetect(false);
+	}
+
+	function chooseAndSaveReferences() {
+		return chooseImageAndDetect(true);
 	}
 
 	async function openErp() {
@@ -2329,6 +2353,7 @@ function attachSession(
 		onRoiPointerMove,
 		onRoiPointerUp,
 		chooseAndDetect,
+		chooseAndSaveReferences,
 		onImagePicked,
 		onImageCancel,
 		toggleModelMenu,

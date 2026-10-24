@@ -6,7 +6,7 @@ import { detectionCounts, inspectionVerdict } from "$lib/operator/verdict";
 import { useOperator } from "$lib/stores/operator";
 import type { Detection, SlotDetections } from "$lib/stores/operator";
 
-const { chooseAndDetect, operator } = useOperator();
+const { chooseAndDetect, chooseAndSaveReferences, operator } = useOperator();
 
 type Part = { ic: string; des: string; qty: number };
 
@@ -132,15 +132,25 @@ function slotVerdict(panel: SlotDetections): "pass" | "fail" | "incomplete" {
 				</p>
 			{/if}
 			{#if $operator.testMode && isLoadedBom($operator.result, $operator.bom)}
-				<button
-					type="button"
-					class="inline-flex min-h-11 w-fit items-center border border-blue-500 bg-blue-600 px-4 text-sm font-semibold text-white"
-					on:click={chooseAndDetect}
-				>
-					Choose image
-				</button>
+				<div class="flex flex-wrap gap-2">
+					<button
+						type="button"
+						class="inline-flex min-h-11 w-fit items-center border border-blue-500 bg-blue-600 px-4 text-sm font-semibold text-white"
+						on:click={chooseAndDetect}
+					>
+						Choose image
+					</button>
+					<button
+						type="button"
+						class="inline-flex min-h-11 w-fit items-center border border-neutral-500 bg-neutral-800 px-4 text-sm font-semibold text-white"
+						on:click={chooseAndSaveReferences}
+					>
+						Save references
+					</button>
+				</div>
 				<p class="text-sm text-neutral-400">
-					Test mode is on. Choose an image file to detect parts for this kit.
+					Test mode is on. Choose an image file to detect parts for this kit. Save references
+					stores each detected part under its IC. The next image logs a match score.
 				</p>
 			{/if}
 			{#if $operator.result.des}
@@ -270,15 +280,25 @@ function slotVerdict(panel: SlotDetections): "pass" | "fail" | "incomplete" {
 						</p>
 					{/if}
 					{#if panelIndex === 0 && $operator.testMode && bomLoaded}
-						<button
-							type="button"
-							class="inline-flex min-h-11 w-fit items-center border border-blue-500 bg-blue-600 px-4 text-sm font-semibold text-white"
-							on:click={chooseAndDetect}
-						>
-							Choose image
-						</button>
+						<div class="flex flex-wrap gap-2">
+							<button
+								type="button"
+								class="inline-flex min-h-11 w-fit items-center border border-blue-500 bg-blue-600 px-4 text-sm font-semibold text-white"
+								on:click={chooseAndDetect}
+							>
+								Choose image
+							</button>
+							<button
+								type="button"
+								class="inline-flex min-h-11 w-fit items-center border border-neutral-500 bg-neutral-800 px-4 text-sm font-semibold text-white"
+								on:click={chooseAndSaveReferences}
+							>
+								Save references
+							</button>
+						</div>
 						<p class="text-sm text-neutral-400">
-							Test mode is on. Choose an image file to detect parts for this kit.
+							Test mode is on. Choose an image file to detect parts for this kit. Save references
+							stores each detected part under its IC. The next image logs a match score.
 						</p>
 					{/if}
 					{#if $operator.result.des}

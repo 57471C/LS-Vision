@@ -3,10 +3,13 @@
 //! Startup opens `src-tauri/models/dinov2_vits14.onnx` when that file is present.
 //! A missing or unloadable file is a warning. Detection keeps using the YOLO session.
 //! After YOLO keeps a box, this module can crop it, letterbox it to 224, and log
-//! the embedding. Those values are not stored and are not compared with a BoM.
+//! the embedding. A test-mode capture stores that vector under the box's IC.
+//! A later detection logs the best cosine score against those references.
+//! The score is not a BoM quantity check.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 
 use serde::Serialize;
 
@@ -37,6 +40,8 @@ struct State {
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
+static REFERENCES: LazyLock<Mutex<HashMap<String, Vec<Vec<f32>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|err| err.into_inner())
@@ -193,17 +198,81 @@ pub(crate) fn is_loaded() -> bool {
 
 /// Crop, letterbox, and embed each box. A missing session returns no lines and
 /// prints nothing. Each returned line is also written to stderr.
+/// `store` keeps the vector under the box IC for a later cosine match.
 pub(crate) fn debug_embed(
     rgb: &[u8],
     width: u32,
     height: u32,
     crops: &[DebugCrop<'_>],
+    store: bool,
 ) -> Vec<String> {
     let mut guard = lock(&STATE);
     let Some(session) = guard.as_mut().and_then(|state| state.session.as_mut()) else {
         return Vec::new();
     };
-    embed_crops(session, rgb, width, height, crops)
+    embed_crops(session, rgb, width, height, crops, store)
+}
+
+/// One crop through the loaded session. Used to compare a known box with a reference.
+#[cfg(test)]
+pub(crate) fn embed_debug_crop(
+    rgb: &[u8],
+    width: u32,
+    height: u32,
+    crop: &DebugCrop<'_>,
+) -> Result<Vec<f32>, String> {
+    let mut guard = lock(&STATE);
+    let Some(session) = guard.as_mut().and_then(|state| state.session.as_mut()) else {
+        return Err("DINOv2 session is not loaded".to_string());
+    };
+    embed_one(session, rgb, width, height, crop)
+}
+
+#[cfg(test)]
+pub(crate) fn clear_references() {
+    lock(&REFERENCES).clear();
+}
+
+/// Append one reference. Returns how many vectors are now stored for this IC.
+pub(crate) fn remember(class_name: &str, values: &[f32]) -> usize {
+    let mut guard = lock(&REFERENCES);
+    let list = guard.entry(class_name.to_string()).or_default();
+    list.push(values.to_vec());
+    list.len()
+}
+
+/// Best cosine similarity against the references stored for this IC.
+pub(crate) fn best_similarity(class_name: &str, values: &[f32]) -> Option<f32> {
+    let guard = lock(&REFERENCES);
+    let list = guard.get(class_name)?;
+    let mut best: Option<f32> = None;
+    for reference in list {
+        let Some(score) = cosine(values, reference) else {
+            continue;
+        };
+        best = Some(best.map(|current| current.max(score)).unwrap_or(score));
+    }
+    best
+}
+
+fn cosine(left: &[f32], right: &[f32]) -> Option<f32> {
+    if left.len() != right.len() || left.is_empty() {
+        return None;
+    }
+    let mut dot = 0.0f32;
+    let mut left_norm = 0.0f32;
+    let mut right_norm = 0.0f32;
+    for (a, b) in left.iter().zip(right) {
+        dot += a * b;
+        left_norm += a * a;
+        right_norm += b * b;
+    }
+    let scale = left_norm.sqrt() * right_norm.sqrt();
+    if !scale.is_finite() || scale == 0.0 {
+        return None;
+    }
+    let score = dot / scale;
+    if score.is_finite() { Some(score) } else { None }
 }
 
 fn embed_crops(
@@ -212,11 +281,21 @@ fn embed_crops(
     width: u32,
     height: u32,
     crops: &[DebugCrop<'_>],
+    store: bool,
 ) -> Vec<String> {
     let mut lines = Vec::with_capacity(crops.len());
+    let mut stored: HashMap<String, usize> = HashMap::new();
     for crop in crops {
         let line = match embed_one(session, rgb, width, height, crop) {
-            Ok(values) => embed_line(crop.class_name, crop.confidence, &values),
+            Ok(values) => {
+                // Score against the references already stored, then append.
+                let matched = best_similarity(crop.class_name, &values);
+                if store {
+                    let count = remember(crop.class_name, &values);
+                    stored.insert(crop.class_name.to_string(), count);
+                }
+                embed_line(crop.class_name, crop.confidence, &values, matched)
+            }
             Err(err) => format!(
                 "DINOv2 {} conf {:.4} embed failed: {err}",
                 crop.class_name, crop.confidence
@@ -224,6 +303,16 @@ fn embed_crops(
         };
         eprintln!("{line}");
         lines.push(line);
+    }
+    if store {
+        let mut names: Vec<String> = stored.keys().cloned().collect();
+        names.sort();
+        for name in names {
+            let count = stored[&name];
+            let line = format!("DINOv2 reference {name} stored {count}");
+            eprintln!("{line}");
+            lines.push(line);
+        }
     }
     lines
 }
@@ -325,11 +414,14 @@ fn imagenet_letterbox(rgb: &[u8], width: usize, height: usize) -> Result<Vec<f32
     Ok(data)
 }
 
-fn embed_line(class_name: &str, confidence: f64, values: &[f32]) -> String {
+fn embed_line(class_name: &str, confidence: f64, values: &[f32], matched: Option<f32>) -> String {
     let norm = values.iter().map(|value| value * value).sum::<f32>().sqrt();
     let at = |index| values.get(index).copied().unwrap_or(0.0);
+    let score = matched
+        .map(|value| format!(" match {value:.4}"))
+        .unwrap_or_default();
     format!(
-        "DINOv2 {class_name} conf {confidence:.4} norm {norm:.4} {:+.4} {:+.4} {:+.4} {:+.4}",
+        "DINOv2 {class_name} conf {confidence:.4} norm {norm:.4}{score} {:+.4} {:+.4} {:+.4} {:+.4}",
         at(0),
         at(1),
         at(2),
@@ -429,7 +521,7 @@ mod tests {
             bbox: [0, 0, 2, 2],
         }];
         let rgb = vec![0u8; 4 * 4 * 3];
-        assert!(debug_embed(&rgb, 4, 4, &crops).is_empty());
+        assert!(debug_embed(&rgb, 4, 4, &crops, false).is_empty());
     }
 
     #[test]
@@ -457,11 +549,28 @@ mod tests {
     #[test]
     fn embed_line_reports_class_confidence_norm_and_four_values() {
         let values = [0.1_f32, -0.2, 0.3, -0.4, 9.0];
-        let line = embed_line("2BBMNM08", 0.8123, &values);
+        let line = embed_line("2BBMNM08", 0.8123, &values, None);
         let norm = values.iter().map(|value| value * value).sum::<f32>().sqrt();
         assert_eq!(
             line,
             format!("DINOv2 2BBMNM08 conf 0.8123 norm {norm:.4} +0.1000 -0.2000 +0.3000 -0.4000")
         );
+    }
+
+    #[test]
+    fn cosine_match_is_one_for_the_same_vector_and_lower_for_another() {
+        let _hold = lock_for_test();
+        clear_references();
+        remember("2BBMNM08", &[1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(
+            best_similarity("2BBMNM08", &[1.0, 0.0, 0.0, 0.0]),
+            Some(1.0)
+        );
+        let wrong = best_similarity("2BBMNM08", &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        assert!(wrong.abs() < 0.001, "{wrong}");
+        assert!(best_similarity("OTHER", &[1.0, 0.0, 0.0, 0.0]).is_none());
+        let line = embed_line("2BBMNM08", 0.5, &[1.0, 0.0, 0.0, 0.0], Some(0.81234));
+        assert!(line.contains(" match 0.8123"), "{line}");
+        clear_references();
     }
 }
