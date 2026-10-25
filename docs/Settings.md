@@ -28,6 +28,8 @@ Settings are stored in `vision/config.local.json` (gitignored). The unlock passw
 
 Training lists `.pt` and `.onnx` files in the app data models folder. Update model copies an `.onnx` file over the selected `.onnx` name, or over `best.onnx`. The selected basename is `model` in `vision/config.local.json`. Detection runs only for `.onnx`, and the next run loads the copied file.
 
+Update references, under that control, copies a chosen `dinov2-references.json` over `vision/dinov2-references.json` and loads those embeddings. The status line is "References loaded N ICs." The next detection uses them. A file that is not a valid reference file is refused, and the saved file stays in place.
+
 ## Part rules
 
 Settings > Parts stores `partRules` in `vision/config.local.json`. Each row is a parent class, a child class, a condition (`contains` or `no child`), and a result IC. Parent and child are chosen from the active ONNX model's class list. Type in the field to filter that list. Add and remove rows, then Save. Up and Down set the order. Rules run from top to bottom and the first match wins.

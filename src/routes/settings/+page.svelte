@@ -92,6 +92,8 @@ let modelActive = "best.onnx";
 let modelNotice = "";
 let savingModel = false;
 let updatingModel = false;
+let updatingReferences = false;
+let referenceNotice = "";
 const CONFIDENCE_MIN = 0.15;
 const CONFIDENCE_MAX = 0.8;
 const CONFIDENCE_DEFAULT = 0.45;
@@ -960,6 +962,32 @@ async function updateModel() {
 		modelNotice = invokeError(err, "Could not update the model");
 	} finally {
 		updatingModel = false;
+	}
+}
+
+function referenceNoticeClass(text: string): string {
+	if (text.startsWith("References loaded ") || text === "No file selected.") {
+		return "text-neutral-200";
+	}
+	return "text-red-300";
+}
+
+async function updateReferences() {
+	updatingReferences = true;
+	referenceNotice = "";
+	try {
+		const data = await invokeRust<{
+			classes?: unknown;
+			message?: unknown;
+		}>("update_references");
+		referenceNotice =
+			typeof data.message === "string" && data.message
+				? data.message
+				: "References loaded.";
+	} catch (err: unknown) {
+		referenceNotice = invokeError(err, "Could not update the references");
+	} finally {
+		updatingReferences = false;
 	}
 }
 
@@ -3196,6 +3224,22 @@ onDestroy(() => {
 							{#if modelNotice}
 								<p class="break-all text-sm {modelNoticeClass(modelNotice)}">{modelNotice}</p>
 							{/if}
+							<div class="flex flex-col items-start gap-2">
+								<button
+									type="button"
+									class="inline-flex min-h-11 w-fit items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100 disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
+									on:click={updateReferences}
+									disabled={updatingReferences}
+								>
+									{updatingReferences ? "Updating..." : "Update references"}
+								</button>
+								<p class="text-sm text-neutral-400">
+									Replaces the saved DINOv2 references. The next detection uses the loaded embeddings.
+								</p>
+								{#if referenceNotice}
+									<p class="text-sm {referenceNoticeClass(referenceNotice)}">{referenceNotice}</p>
+								{/if}
+							</div>
 						</form>
 						<form
 							class="flex flex-col gap-4 border border-neutral-700 bg-neutral-900 p-4"

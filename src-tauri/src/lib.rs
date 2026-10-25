@@ -63,6 +63,7 @@ pub fn run() {
             detect::benchmark_detect,
             detect::model_class_names,
             dinov2::dinov2_status,
+            dinov2::update_references,
             dinov2::save_detection_references,
             dinov2::embed_marquee,
             dinov2::save_marquee_reference,

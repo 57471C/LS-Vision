@@ -19,6 +19,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 use serde::{Deserialize, Serialize};
+use tauri::AppHandle;
+use tauri_plugin_dialog::DialogExt;
 
 use crate::detect;
 use crate::inference_ep::{self, Provider};
@@ -398,24 +400,10 @@ pub(crate) fn load_saved_references() {
     }
 }
 
-/// `Ok(true)` when a file was read. `Ok(false)` when the file is absent.
-pub(crate) fn load_references_from(path: &Path) -> Result<bool, String> {
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(err) => return Err(format!("Could not read DINOv2 references: {err}")),
-    };
-    let file: ReferenceFile = serde_json::from_str(&text).map_err(|_| {
-        format!(
-            "DINOv2 references at {} are not valid JSON.",
-            path.display()
-        )
-    })?;
+fn parse_reference_map(text: &str) -> Result<HashMap<String, Vec<Vec<f32>>>, &'static str> {
+    let file: ReferenceFile = serde_json::from_str(text).map_err(|_| "json")?;
     if file.version != REFERENCES_VERSION {
-        return Err(format!(
-            "DINOv2 references at {} use an unknown version.",
-            path.display()
-        ));
+        return Err("version");
     }
     let mut clean = HashMap::new();
     for (name, vectors) in file.references {
@@ -432,28 +420,43 @@ pub(crate) fn load_references_from(path: &Path) -> Result<bool, String> {
         }
         clean.insert(name.to_string(), kept);
     }
+    Ok(clean)
+}
+
+/// `Ok(true)` when a file was read. `Ok(false)` when the file is absent.
+pub(crate) fn load_references_from(path: &Path) -> Result<bool, String> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(format!("Could not read DINOv2 references: {err}")),
+    };
+    let clean = match parse_reference_map(&text) {
+        Ok(clean) => clean,
+        Err("version") => {
+            return Err(format!(
+                "DINOv2 references at {} use an unknown version.",
+                path.display()
+            ));
+        }
+        Err(_) => {
+            return Err(format!(
+                "DINOv2 references at {} are not valid JSON.",
+                path.display()
+            ));
+        }
+    };
     *lock(&REFERENCES) = clean;
     Ok(true)
 }
 
-pub(crate) fn save_references_to(path: &Path) -> Result<(), String> {
-    let file = ReferenceFile {
-        version: REFERENCES_VERSION,
-        references: lock(&REFERENCES).clone(),
-    };
-    let mut text = serde_json::to_string(&file)
-        .map_err(|_| "Could not write DINOv2 references.".to_string())?;
-    if !text.ends_with('\n') {
-        text.push('\n');
-    }
+fn replace_reference_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| "Could not write DINOv2 references.".to_string())?;
     fs::create_dir_all(parent)
         .map_err(|err| format!("Could not write DINOv2 references: {err}"))?;
     let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, text.as_bytes())
-        .map_err(|err| format!("Could not write DINOv2 references: {err}"))?;
+    fs::write(&tmp, bytes).map_err(|err| format!("Could not write DINOv2 references: {err}"))?;
     if fs::rename(&tmp, path).is_err() {
         if path.exists() {
             fs::remove_file(path).map_err(|err| {
@@ -467,6 +470,95 @@ pub(crate) fn save_references_to(path: &Path) -> Result<(), String> {
         })?;
     }
     Ok(())
+}
+
+fn same_file(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+/// Copy a valid reference file over `dest` and replace the in-memory map.
+/// A file that does not parse leaves both the destination and memory unchanged.
+/// The returned count is the number of ICs now stored.
+pub(crate) fn install_reference_file(source: &Path, dest: &Path) -> Result<usize, String> {
+    let bytes = fs::read(source).map_err(|err| format!("Could not read DINOv2 references: {err}"))?;
+    let text = String::from_utf8(bytes).map_err(|_| {
+        "Selected file is not a valid DINOv2 reference file.".to_string()
+    })?;
+    let clean = parse_reference_map(&text).map_err(|_| {
+        "Selected file is not a valid DINOv2 reference file.".to_string()
+    })?;
+    if !same_file(source, dest) {
+        replace_reference_bytes(dest, text.as_bytes())?;
+    }
+    let count = clean.len();
+    *lock(&REFERENCES) = clean;
+    Ok(count)
+}
+
+pub(crate) fn references_loaded_message(classes: usize) -> String {
+    format!("References loaded {classes} ICs.")
+}
+
+#[derive(Clone, Serialize)]
+pub struct ReferenceUpdate {
+    pub classes: usize,
+    pub message: String,
+}
+
+/// Replace `vision/dinov2-references.json` with the chosen file and load it.
+/// Cancel leaves the saved file and the in-memory map as they are.
+/// The next detection uses the loaded embeddings. The app does not need a restart.
+#[tauri::command]
+pub fn update_references(app: AppHandle) -> Result<ReferenceUpdate, String> {
+    let picked = app
+        .dialog()
+        .file()
+        .add_filter("dinov2-references.json", &["json"])
+        .set_title("Update references")
+        .blocking_pick_file();
+    let Some(picked) = picked else {
+        return Ok(ReferenceUpdate {
+            classes: lock(&REFERENCES).len(),
+            message: "No file selected.".to_string(),
+        });
+    };
+    let source = match picked.into_path() {
+        Ok(path) => path,
+        Err(_) => return Err("Could not read the selected file.".to_string()),
+    };
+    if !source
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+    {
+        return Err("Selected file is not a valid DINOv2 reference file.".to_string());
+    }
+    let dest = references_path()?;
+    let classes = install_reference_file(&source, &dest)?;
+    eprintln!(
+        "DINOv2 references loaded: {classes} classes from {}",
+        dest.display()
+    );
+    Ok(ReferenceUpdate {
+        classes,
+        message: references_loaded_message(classes),
+    })
+}
+
+pub(crate) fn save_references_to(path: &Path) -> Result<(), String> {
+    let file = ReferenceFile {
+        version: REFERENCES_VERSION,
+        references: lock(&REFERENCES).clone(),
+    };
+    let mut text = serde_json::to_string(&file)
+        .map_err(|_| "Could not write DINOv2 references.".to_string())?;
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    replace_reference_bytes(path, text.as_bytes())
 }
 
 fn persist_references() {
@@ -1267,5 +1359,80 @@ mod tests {
         clear_held();
         clear_held_frame();
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn imported_file_replaces_memory_and_the_saved_references() {
+        let _hold = lock_for_test();
+        clear_references();
+        remember("OLD", &[0.0, 1.0, 0.0, 0.0]);
+        let dir = std::env::temp_dir().join(format!(
+            "ls-vision-dino-import-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("dinov2-references.json");
+        let dest = dir.join("installed").join("dinov2-references.json");
+        let body = concat!(
+            r#"{"version":1,"references":{"#,
+            r#"" ":[[1.0,0.0]],"#,
+            r#""OK":[[],[1.0,0.0,0.0,0.0]],"#,
+            r#""6PBB33":[[0.0,0.0,1.0,0.0]]"#,
+            "}}"
+        );
+        std::fs::write(&source, body).unwrap();
+        let count = install_reference_file(&source, &dest).unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(references_loaded_message(count), "References loaded 2 ICs.");
+        assert!(best_similarity("OLD", &[0.0, 1.0, 0.0, 0.0]).is_none());
+        assert_eq!(best_similarity("OK", &[1.0, 0.0, 0.0, 0.0]), Some(1.0));
+        assert_eq!(
+            best_similarity("6PBB33", &[0.0, 0.0, 1.0, 0.0]),
+            Some(1.0)
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), std::fs::read(&source).unwrap());
+
+        clear_references();
+        assert!(best_similarity("OK", &[1.0, 0.0, 0.0, 0.0]).is_none());
+        assert_eq!(load_references_from(&dest).unwrap(), true);
+        assert_eq!(best_similarity("OK", &[1.0, 0.0, 0.0, 0.0]), Some(1.0));
+
+        let kept = std::fs::read(&dest).unwrap();
+        let bad = dir.join("bad.json");
+        std::fs::write(&bad, b"not json").unwrap();
+        let err = install_reference_file(&bad, &dest).unwrap_err();
+        assert!(err.contains("not a valid"), "{err}");
+        assert_eq!(std::fs::read(&dest).unwrap(), kept);
+        assert_eq!(best_similarity("OK", &[1.0, 0.0, 0.0, 0.0]), Some(1.0));
+        std::fs::write(
+            &bad,
+            r#"{"version":2,"references":{"NEW":[[1.0,0.0,0.0,0.0]]}}"#,
+        )
+        .unwrap();
+        assert!(install_reference_file(&bad, &dest).is_err());
+        assert!(best_similarity("NEW", &[1.0, 0.0, 0.0, 0.0]).is_none());
+        assert_eq!(std::fs::read(&dest).unwrap(), kept);
+
+        let only = dir.join("one.json");
+        std::fs::write(
+            &only,
+            r#"{"version":1,"references":{"2BBMNM08":[[0.0,1.0,0.0,0.0]]}}"#,
+        )
+        .unwrap();
+        assert_eq!(install_reference_file(&only, &dest).unwrap(), 1);
+        assert!(best_similarity("OK", &[1.0, 0.0, 0.0, 0.0]).is_none());
+        assert_eq!(
+            best_similarity("2BBMNM08", &[0.0, 1.0, 0.0, 0.0]),
+            Some(1.0)
+        );
+        assert_eq!(references_loaded_message(1), "References loaded 1 ICs.");
+
+        clear_references();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
