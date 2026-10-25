@@ -24,7 +24,9 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": [
+      "nsis"
+    ],
     "resources": [
       "models/*",
       "openvino/*"
