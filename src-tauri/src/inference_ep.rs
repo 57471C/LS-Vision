@@ -75,6 +75,29 @@ struct Observed {
 static AVAILABLE: Mutex<Option<Vec<Provider>>> = Mutex::new(None);
 static OBSERVED: Mutex<Option<Observed>> = Mutex::new(None);
 
+const OPENVINO_READY: &str = "Using OpenVINO.";
+const OPENVINO_UNAVAILABLE: &str = "OpenVINO is not available. Using ONNX Runtime.";
+const OPENVINO_FAILED: &str = "OpenVINO did not start. Using ONNX Runtime.";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpenVinoRun {
+    Off,
+    Pending,
+    Active,
+    Fallback,
+}
+
+#[derive(Clone)]
+struct OpenVinoObserved {
+    run: OpenVinoRun,
+    message: String,
+}
+
+static OPENVINO: Mutex<OpenVinoObserved> = Mutex::new(OpenVinoObserved {
+    run: OpenVinoRun::Off,
+    message: String::new(),
+});
+
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|err| err.into_inner())
 }
@@ -108,6 +131,111 @@ fn read_saved() -> Option<Provider> {
         .and_then(parse_provider)
 }
 
+/// Missing, or any value that is not a JSON boolean, stays off.
+pub(crate) fn use_openvino_value(value: Option<&serde_json::Value>) -> bool {
+    value.and_then(serde_json::Value::as_bool).unwrap_or(false)
+}
+
+pub(crate) fn read_use_openvino() -> bool {
+    let Ok(root) = local_config::project_root() else {
+        return false;
+    };
+    let Ok(document) = local_config::load_document(&root) else {
+        return false;
+    };
+    use_openvino_value(document.get("useOpenVino"))
+}
+
+fn store_use_openvino(enabled: bool) -> Result<(), String> {
+    let root = local_config::project_root()?;
+    let mut document = local_config::load_document(&root)?;
+    let object = document
+        .as_object_mut()
+        .ok_or_else(|| "Config must be a JSON object.".to_string())?;
+    object.insert(
+        "useOpenVino".to_string(),
+        serde_json::Value::Bool(enabled),
+    );
+    local_config::save_document(&root, &document)
+}
+
+/// Saved switch is on, and the OpenVINO provider can be registered.
+pub(crate) fn wants_openvino() -> bool {
+    let run = lock(&OPENVINO).run;
+    matches!(run, OpenVinoRun::Pending | OpenVinoRun::Active)
+}
+
+pub(crate) fn openvino_is_active() -> bool {
+    lock(&OPENVINO).run == OpenVinoRun::Active
+}
+
+fn openvino_in_runtime() -> bool {
+    ort::ep::OpenVINO::is_available().unwrap_or(false)
+}
+
+/// Read the switch and decide whether the next session may use OpenVINO.
+/// Off leaves the ONNX Runtime path alone. On, but missing from this runtime,
+/// records the fallback line and stays on ONNX Runtime.
+pub(crate) fn prepare_openvino() {
+    if !read_use_openvino() {
+        *lock(&OPENVINO) = OpenVinoObserved {
+            run: OpenVinoRun::Off,
+            message: String::new(),
+        };
+        return;
+    }
+    let available = crate::detect::ensure_runtime() && openvino_in_runtime();
+    if !read_use_openvino() {
+        *lock(&OPENVINO) = OpenVinoObserved {
+            run: OpenVinoRun::Off,
+            message: String::new(),
+        };
+        return;
+    }
+    if available {
+        *lock(&OPENVINO) = OpenVinoObserved {
+            run: OpenVinoRun::Pending,
+            message: String::new(),
+        };
+        return;
+    }
+    eprintln!("{OPENVINO_UNAVAILABLE}");
+    *lock(&OPENVINO) = OpenVinoObserved {
+        run: OpenVinoRun::Fallback,
+        message: OPENVINO_UNAVAILABLE.to_string(),
+    };
+}
+
+pub(crate) fn mark_openvino_started() {
+    *lock(&OPENVINO) = OpenVinoObserved {
+        run: OpenVinoRun::Active,
+        message: OPENVINO_READY.to_string(),
+    };
+}
+
+pub(crate) fn mark_openvino_failed(err: &str) {
+    eprintln!("OpenVINO did not start: {err}");
+    *lock(&OPENVINO) = OpenVinoObserved {
+        run: OpenVinoRun::Fallback,
+        message: OPENVINO_FAILED.to_string(),
+    };
+}
+
+fn compose_message(provider_message: String, openvino: &OpenVinoObserved) -> String {
+    match openvino.run {
+        OpenVinoRun::Off | OpenVinoRun::Pending => provider_message,
+        OpenVinoRun::Active | OpenVinoRun::Fallback => {
+            if provider_message.is_empty() {
+                openvino.message.clone()
+            } else if openvino.message.is_empty() {
+                provider_message
+            } else {
+                format!("{} {provider_message}", openvino.message)
+            }
+        }
+    }
+}
+
 fn store(provider: Provider) -> Result<(), String> {
     let root = local_config::project_root()?;
     let mut document = local_config::load_document(&root)?;
@@ -127,6 +255,10 @@ pub(crate) struct InferenceView {
     pub selected: &'static str,
     pub active: &'static str,
     pub message: String,
+    #[serde(rename = "useOpenVino")]
+    pub use_open_vino: bool,
+    #[serde(rename = "openVinoActive")]
+    pub open_vino_active: bool,
 }
 
 pub(crate) fn view(refresh: bool) -> InferenceView {
@@ -136,15 +268,18 @@ pub(crate) fn view(refresh: bool) -> InferenceView {
         let guard = lock(&OBSERVED);
         (*guard).clone()
     };
-    let (active, message) = match observed {
+    let (active, provider_message) = match observed {
         Some(item) if item.requested == selected => (item.active, item.message),
         _ => (selected, String::new()),
     };
+    let openvino = lock(&OPENVINO).clone();
     InferenceView {
         providers: providers.iter().copied().map(Provider::id).collect(),
         selected: selected.id(),
         active: active.id(),
-        message,
+        message: compose_message(provider_message, &openvino),
+        use_open_vino: read_use_openvino(),
+        open_vino_active: openvino.run == OpenVinoRun::Active,
     }
 }
 
@@ -164,7 +299,29 @@ pub fn set_inference_ep(provider: String) -> Result<InferenceView, String> {
     }
     store(choice)?;
     *lock(&OBSERVED) = None;
-    crate::detect::reload_session()?;
+    let openvino = read_use_openvino();
+    if openvino {
+        prepare_openvino();
+    }
+    let reloaded = crate::detect::reload_session();
+    if openvino {
+        crate::dinov2::reload_session();
+    }
+    reloaded?;
+    Ok(view(false))
+}
+
+/// Save Use OpenVINO and reload YOLO and DINOv2.
+/// The saved switch stays on when the provider is missing. The status line
+/// says the session stayed on ONNX Runtime.
+#[tauri::command]
+pub fn set_use_openvino(enabled: bool) -> Result<InferenceView, String> {
+    store_use_openvino(enabled)?;
+    *lock(&OBSERVED) = None;
+    prepare_openvino();
+    let reloaded = crate::detect::reload_session();
+    crate::dinov2::reload_session();
+    reloaded?;
     Ok(view(false))
 }
 
@@ -336,6 +493,44 @@ mod tests {
         assert_eq!(
             choose(&[Provider::Cpu], Some(Provider::DirectMl)),
             Provider::Cpu
+        );
+    }
+
+    #[test]
+    fn use_openvino_is_off_unless_the_json_boolean_is_true() {
+        assert!(!use_openvino_value(None));
+        assert!(!use_openvino_value(Some(&serde_json::Value::Null)));
+        assert!(!use_openvino_value(Some(&serde_json::json!(false))));
+        assert!(!use_openvino_value(Some(&serde_json::json!("true"))));
+        assert!(use_openvino_value(Some(&serde_json::json!(true))));
+    }
+
+    #[test]
+    fn openvino_fallback_line_stays_with_the_provider_message() {
+        let fallback = OpenVinoObserved {
+            run: OpenVinoRun::Fallback,
+            message: OPENVINO_UNAVAILABLE.to_string(),
+        };
+        assert_eq!(
+            compose_message(
+                "DirectML did not start. Using CPU.".to_string(),
+                &fallback
+            ),
+            "OpenVINO is not available. Using ONNX Runtime. DirectML did not start. Using CPU."
+        );
+        assert_eq!(
+            compose_message(String::new(), &fallback),
+            OPENVINO_UNAVAILABLE
+        );
+        assert_eq!(
+            compose_message(
+                String::new(),
+                &OpenVinoObserved {
+                    run: OpenVinoRun::Off,
+                    message: String::new(),
+                }
+            ),
+            ""
         );
     }
 

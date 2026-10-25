@@ -30,6 +30,7 @@
 	"matchThreshold": 0.7,
 	"partRules": [],
 	"inferenceEp": "directml",
+	"useOpenVino": false,
 	"trainingDir": "",
 	"trainingImageName": "",
 	"camera": {

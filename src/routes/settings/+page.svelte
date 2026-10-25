@@ -132,6 +132,8 @@ let matchChain: Promise<void> = Promise.resolve();
 let inferenceProviders: string[] = ["cpu"];
 let inferenceEp = "cpu";
 let inferenceActive = "cpu";
+let useOpenVino = false;
+let openVinoActive = false;
 let inferenceNotice = "";
 let inferenceReady = false;
 let savingInference = false;
@@ -782,14 +784,19 @@ function modelNoticeClass(text: string): string {
 function inferenceLabel(id: string): string {
 	if (id === "directml") return "DirectML";
 	if (id === "cuda") return "CUDA";
+	if (id === "openvino") return "OpenVINO";
 	return "CPU";
 }
+
+$: inferenceBackend = openVinoActive ? "OpenVINO" : inferenceLabel(inferenceActive);
 
 function applyInference(data: {
 	providers?: unknown;
 	selected?: unknown;
 	active?: unknown;
 	message?: unknown;
+	useOpenVino?: unknown;
+	openVinoActive?: unknown;
 }) {
 	const providers = Array.isArray(data.providers)
 		? data.providers.filter(
@@ -804,6 +811,8 @@ function applyInference(data: {
 		: inferenceProviders[0];
 	const active = typeof data.active === "string" ? data.active : "";
 	inferenceActive = inferenceProviders.includes(active) ? active : inferenceEp;
+	useOpenVino = data.useOpenVino === true;
+	openVinoActive = data.openVinoActive === true;
 	inferenceNotice = typeof data.message === "string" ? data.message : "";
 	inferenceReady = true;
 }
@@ -816,6 +825,8 @@ async function loadInference() {
 			selected?: unknown;
 			active?: unknown;
 			message?: unknown;
+			useOpenVino?: unknown;
+			openVinoActive?: unknown;
 		}>("inference_status");
 		if (generation !== inferenceGeneration || savingInference) return;
 		applyInference(data);
@@ -824,6 +835,8 @@ async function loadInference() {
 		inferenceProviders = ["cpu"];
 		inferenceEp = "cpu";
 		inferenceActive = "cpu";
+		useOpenVino = false;
+		openVinoActive = false;
 		inferenceNotice = invokeError(err, "Could not list inference providers.");
 		inferenceReady = true;
 	}
@@ -846,6 +859,8 @@ async function persistInference(choice: string, generation: number) {
 			selected?: unknown;
 			active?: unknown;
 			message?: unknown;
+			useOpenVino?: unknown;
+			openVinoActive?: unknown;
 		}>("set_inference_ep", { provider: choice });
 		if (generation !== inferenceGeneration) return;
 		applyInference(data);
@@ -858,6 +873,8 @@ async function persistInference(choice: string, generation: number) {
 				selected?: unknown;
 				active?: unknown;
 				message?: unknown;
+				useOpenVino?: unknown;
+				openVinoActive?: unknown;
 			}>("inference_status");
 			if (generation !== inferenceGeneration) return;
 			applyInference(data);
@@ -865,6 +882,55 @@ async function persistInference(choice: string, generation: number) {
 			inferenceProviders = inferenceProviders.includes(choice)
 				? inferenceProviders
 				: ["cpu"];
+		}
+		inferenceNotice = message;
+	} finally {
+		if (generation === inferenceGeneration) savingInference = false;
+	}
+}
+
+function onOpenVinoChange(event: Event) {
+	const input = event.currentTarget;
+	if (!(input instanceof HTMLInputElement)) return;
+	const enabled = input.checked;
+	useOpenVino = enabled;
+	const generation = ++inferenceGeneration;
+	inferenceChain = inferenceChain
+		.catch(() => undefined)
+		.then(() => persistOpenVino(enabled, generation));
+}
+
+async function persistOpenVino(enabled: boolean, generation: number) {
+	savingInference = true;
+	inferenceNotice = "Starting the session...";
+	try {
+		const data = await invokeRust<{
+			providers?: unknown;
+			selected?: unknown;
+			active?: unknown;
+			message?: unknown;
+			useOpenVino?: unknown;
+			openVinoActive?: unknown;
+		}>("set_use_openvino", { enabled });
+		if (generation !== inferenceGeneration) return;
+		applyInference(data);
+	} catch (err: unknown) {
+		if (generation !== inferenceGeneration) return;
+		const message = invokeError(err, "Could not save OpenVINO.");
+		try {
+			const data = await invokeRust<{
+				providers?: unknown;
+				selected?: unknown;
+				active?: unknown;
+				message?: unknown;
+				useOpenVino?: unknown;
+				openVinoActive?: unknown;
+			}>("inference_status");
+			if (generation !== inferenceGeneration) return;
+			applyInference(data);
+		} catch {
+			useOpenVino = !enabled;
+			openVinoActive = false;
 		}
 		inferenceNotice = message;
 	} finally {
@@ -2531,7 +2597,7 @@ onDestroy(() => {
 					class="truncate text-xs font-medium uppercase tracking-widest text-neutral-300"
 					title={inferenceNotice || undefined}
 				>
-					Inference {inferenceLabel(inferenceActive)}
+					Inference {inferenceBackend}
 				</p>
 			{/if}
 		</div>
@@ -3514,12 +3580,23 @@ onDestroy(() => {
 									</select>
 								</label>
 								<p class="text-sm text-neutral-200">
-									Active: {inferenceReady
-										? inferenceLabel(inferenceActive)
-										: "Checking..."}
+									Active: {inferenceReady ? inferenceBackend : "Checking..."}
 								</p>
 								<p class="text-sm text-neutral-400">
 									CPU is always listed. DirectML and CUDA are listed only when this PC can run them.
+								</p>
+								<label class="flex items-center gap-3 text-sm font-medium text-neutral-100">
+									<input
+										type="checkbox"
+										class="h-5 w-5 accent-blue-500"
+										checked={useOpenVino}
+										on:change={onOpenVinoChange}
+										disabled={savingInference || !inferenceReady}
+									/>
+									Use OpenVINO (Arc)
+								</label>
+								<p class="text-sm text-neutral-400">
+									Loads the same ONNX files through OpenVINO on Arc. If OpenVINO does not start, detection keeps the Inference EP above and the status line says so.
 								</p>
 								<button
 									type="button"

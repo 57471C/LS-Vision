@@ -209,6 +209,7 @@ fn default_config() -> Value {
         "matchThreshold": 0.7,
         "partRules": [],
         "inferenceEp": "directml",
+        "useOpenVino": false,
         "trainingDir": "",
         "trainingImageName": "",
         "camera": {
@@ -761,6 +762,7 @@ mod tests {
         assert_eq!(document["matchThreshold"], 0.7);
         assert_eq!(document["partRules"], serde_json::json!([]));
         assert_eq!(document["inferenceEp"], "directml");
+        assert_eq!(document["useOpenVino"], false);
         assert_eq!(document["trainingDir"], "");
         assert_eq!(document["trainingImageName"], "");
         assert_eq!(document["scanSeconds"], 8);
