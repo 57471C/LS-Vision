@@ -3596,7 +3596,7 @@ onDestroy(() => {
 									Use OpenVINO (Arc)
 								</label>
 								<p class="text-sm text-neutral-400">
-									Loads the same ONNX files through OpenVINO on Arc. If OpenVINO does not start, detection keeps the Inference EP above and the status line says so.
+									Loads the same ONNX files through the OpenVINO plugin on Arc. If the plugin is missing or does not start, detection keeps the Inference EP above and the status line says so.
 								</p>
 								<button
 									type="button"

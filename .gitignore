@@ -32,3 +32,5 @@ runs/
 
 # Optional DINOv2 weights next to the Tauri crate. YOLO models stay in app data.
 src-tauri/models/
+# OpenVINO runtime the installer copies next to the exe. Too large for git.
+src-tauri/openvino/

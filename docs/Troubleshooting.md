@@ -12,8 +12,8 @@ The button ignores extra clicks for 1.52 seconds. It reads Please wait, stays di
 
 ## Inference EP missing
 
-- DirectML requires a Direct3D 12 adapter and DirectML.dll.
-- CUDA requires an NVIDIA adapter plus the CUDA execution provider libraries. This build does not ship those libraries.
+- This OpenVINO prebuilt does not contain DirectML or CUDA, so the dropdown lists CPU.
+- OpenVINO needs the provider DLL in `openvino/` next to the exe, with `openvino.dll` and the TBB DLLs in that same folder. A missing plugin says `OpenVINO is not available. Using ONNX Runtime.`
 - CPU is always available and is the fallback. The saved provider is kept when fallback happens, so the next launch tries it again.
 
 ## A .pt model does not detect

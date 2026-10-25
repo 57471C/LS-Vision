@@ -1166,19 +1166,20 @@ fn input_image_size(session: &ort::session::Session) -> usize {
     DEFAULT_IMAGE_SIZE
 }
 
-/// Same `.onnx` file, registered on OpenVINO's GPU device (Arc iGPU).
+/// Same `.onnx` file, on the registered OpenVINO plugin's GPU device (Arc iGPU).
 pub(crate) fn open_openvino_session(
     env: &ort::environment::Environment,
     path: &Path,
 ) -> Result<ort::session::Session, String> {
     let name = file_name(path);
-    let provider = ort::ep::OpenVINO::default()
-        .with_device_type("GPU")
-        .build()
-        .error_on_failure();
+    let Some(device) = env.devices().find(openvino_gpu_device) else {
+        return Err(format!(
+            "{name} failed to load with OpenVINO: GPU device was not found"
+        ));
+    };
     let session = ort::session::Session::builder(env)
         .map_err(|err| format!("{name} failed to load: {}", short_error(&err.to_string())))?
-        .with_execution_providers([provider])
+        .with_devices([device], None)
         .map_err(|err| {
             format!(
                 "{name} failed to load with OpenVINO: {}",
@@ -1196,11 +1197,18 @@ pub(crate) fn open_openvino_session(
     Ok(session)
 }
 
+fn openvino_gpu_device(device: &ort::device::Device<'_>) -> bool {
+    let Ok(name) = device.ep() else {
+        return false;
+    };
+    name == "OpenVINOExecutionProvider"
+        && device.hardware_device().ty() == ort::memory::DeviceType::GPU
+}
+
 fn execution_provider(provider: Provider) -> ort::ep::ExecutionProviderDispatch {
     match provider {
-        Provider::DirectMl => ort::ep::DirectML::default().build(),
-        Provider::Cuda => ort::ep::CUDA::default().build(),
-        Provider::Cpu => ort::ep::CPU::default().build(),
+        // This prebuilt is OpenVINO only, so DirectML and CUDA are not in the crate.
+        Provider::DirectMl | Provider::Cuda | Provider::Cpu => ort::ep::CPU::default().build(),
     }
 }
 

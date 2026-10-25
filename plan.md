@@ -32,6 +32,7 @@ Independent bench stations (NUCs) that:
 - **Working distance**: ~1200 mm covering the full 590 mm × 1400 mm scannable bench area.
 - **Station PC**: ASUS NUC 16 Pro (RNUC16GDKX76C4N3) — Core Ultra X7 358H, Arc B390 iGPU, 32 GB RAM, 1 TB NVMe, Windows 11 Pro, dual 2.5 GbE.
 - Inference runs on the NUC (OpenVINO / ONNX Runtime targeting the Arc iGPU).
+- OpenVINO loads `onnxruntime_providers_openvino_plugin.dll`, or `onnxruntime_providers_openvino.dll`, from `openvino/` next to the exe, then from beside the exe, then from `resources/openvino`. `openvino.dll`, the Intel device plugins, and the TBB runtime (`tbb12.dll`, `tbbmalloc.dll`, `tbbmalloc_proxy.dll`, `tbbbind_2_5.dll`) have to sit in the same folder as that provider DLL. The installer resources are `models/*` and `openvino/*`, placed in those folders next to the exe. DINOv2 loads `models/dinov2_vits14.onnx` from that directory. ORT 1.31 does not read `ORT_OPENVINO_DLL`. The current crate is the OpenVINO prebuilt only, so DirectML is not listed and a CUDA choice still opens the CPU session.
 
 ### UI structure (Svelte)
 - **Operator view** (`src/routes/+page.svelte` and related)  
@@ -145,7 +146,7 @@ Train several options, compare on validation set (especially close variants), pi
 yolo export model=best.pt format=onnx
 ```
 
-Copy the `.onnx` file into the app data models folder with Settings > Training > Update model. Weight files stay out of git and out of the installer.
+Copy the `.onnx` file into the app data models folder with Settings > Training > Update model. YOLO weight files stay out of git and out of the installer. `src-tauri/models/dinov2_vits14.onnx` is gitignored and is bundled when it is present at build time.
 
 **Phase 1 (done on this branch).** `.onnx` detection runs in Rust through ONNX Runtime (`detect_image`). The operator page calls that command when the active model name ends in `.onnx`. An empty model selection uses `best.onnx` when that file is present, then `best.pt`. The detection JSON is `{ detections: [{ ic, confidence, bbox }], classes }`. `detect_image` reads the latest raw frame and does not return `image_base64`. The page still draws the boxes.
 
@@ -157,7 +158,7 @@ Python `YOLO(best.pt)` and `YOLO(best.onnx)` already disagree on `vision/test-im
 - Barcode: the page tries the native detector and ZXing on the preview JPEG, then `decode_barcode` reads the raw frame. A crop whose long edge is over 1920 pixels is halved until it fits, and that smaller image is read first. It does not call the sidecar for a frame.
 - BoM: JSON uses `load_bom_json`, the job-card API uses `post_bom_api`, and MSSQL uses `inspect_bom` (ODBC Driver 18, `Encrypt=optional;TrustServerCertificate=yes`). The SQL file is still `vision/bom_queries.sql`, with the example file as the fallback. The Rust path does not set the pyodbc `attrs_before` values. A missing kit is still `Barcode not found in BoM`.
 - A `.pt` model does not detect. The page returns no boxes and the message `{name} is a .pt file. Choose an .onnx model to detect parts.` Choosing a model saves the basename in `vision/config.local.json`. Detection loads that `.onnx` file in Rust.
-- Settings lists an Inference EP dropdown for the providers this PC can run. CPU is always listed. DirectML is listed when the DirectML runtime and a Direct3D 12 GPU are present. CUDA is listed when an NVIDIA GPU and the CUDA execution provider libraries load. The saved `inferenceEp` is used when the ONNX session is created, and a provider that fails to start falls back to CPU.
+- Settings lists an Inference EP dropdown for the providers this PC can run. CPU is always listed. DirectML is listed when the DirectML runtime and a Direct3D 12 GPU are present. CUDA is listed when an NVIDIA GPU and the CUDA execution provider libraries load. The OpenVINO-only prebuilt does not contain those providers, so this build lists CPU and uses the OpenVINO switch for the Arc GPU. The saved `inferenceEp` is used when the ONNX session is created, and a provider that fails to start falls back to CPU.
 - The FastAPI sidecar is gone. `vision/main.py` is not in the repo, Settings has no Kill button, and the app does not call port 8008. Offline training still uses `vision/requirements.txt` (`opencv-python`, `ultralytics`, `numpy`, `pillow`).
 - Part rules (`partRules` in `vision/config.local.json`, edited in Settings > Parts) run on the operator page after `detect_image` returns. A matching parent box is renamed to the result IC before the BoM count and the overlay. A child box used by that match is left out of the BoM comparison. Operators do not see its box. Admin sees a thin outline. A rule whose parent or named child is not in that model's class list is skipped, and the operator page shows a dismissible notice. The model output itself stays the trained class names. An empty list does not rewrite.
 

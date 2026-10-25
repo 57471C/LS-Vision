@@ -9,7 +9,6 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use ort::ep::ExecutionProvider;
 use serde::Serialize;
 
 use crate::local_config;
@@ -78,6 +77,12 @@ static OBSERVED: Mutex<Option<Observed>> = Mutex::new(None);
 const OPENVINO_READY: &str = "Using OpenVINO.";
 const OPENVINO_UNAVAILABLE: &str = "OpenVINO is not available. Using ONNX Runtime.";
 const OPENVINO_FAILED: &str = "OpenVINO did not start. Using ONNX Runtime.";
+/// Name passed to `Environment::register_ep_library`. Devices then report this EP.
+const OPENVINO_PLUGIN_NAME: &str = "OpenVINOExecutionProvider";
+/// Separate plugin package name. The pyke `openvino` prebuilt does not ship this file.
+const OPENVINO_PLUGIN_DLL: &str = "onnxruntime_providers_openvino_plugin.dll";
+/// Provider DLL from the pyke `openvino` prebuilt. It exports `CreateEpFactories`.
+const OPENVINO_PROVIDER_DLL: &str = "onnxruntime_providers_openvino.dll";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OpenVinoRun {
@@ -97,6 +102,8 @@ static OPENVINO: Mutex<OpenVinoObserved> = Mutex::new(OpenVinoObserved {
     run: OpenVinoRun::Off,
     message: String::new(),
 });
+/// Kept for the process. Dropping the handle does not unregister the plugin.
+static OPENVINO_PLUGIN: Mutex<Option<ort::ep::ExecutionProviderLibrary>> = Mutex::new(None);
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|err| err.into_inner())
@@ -159,7 +166,7 @@ fn store_use_openvino(enabled: bool) -> Result<(), String> {
     local_config::save_document(&root, &document)
 }
 
-/// Saved switch is on, and the OpenVINO provider can be registered.
+/// Saved switch is on, and the OpenVINO plugin registered.
 pub(crate) fn wants_openvino() -> bool {
     let run = lock(&OPENVINO).run;
     matches!(run, OpenVinoRun::Pending | OpenVinoRun::Active)
@@ -169,13 +176,81 @@ pub(crate) fn openvino_is_active() -> bool {
     lock(&OPENVINO).run == OpenVinoRun::Active
 }
 
-fn openvino_in_runtime() -> bool {
-    ort::ep::OpenVINO::is_available().unwrap_or(false)
+/// `openvino/` next to the exe (the installer resource folder), then beside the
+/// exe, then `resources/openvino`. The `*_plugin.dll` name wins inside a folder.
+/// Otherwise the pyke provider DLL is used. The bundled folder wins over a lone
+/// provider DLL beside the exe, because `openvino.dll` and TBB sit in that folder.
+/// ORT 1.31 does not read `ORT_OPENVINO_DLL`.
+pub(crate) fn find_openvino_plugin(exe_dir: &std::path::Path) -> Option<PathBuf> {
+    let names = [OPENVINO_PLUGIN_DLL, OPENVINO_PROVIDER_DLL];
+    let bundled = exe_dir.join("openvino");
+    for name in names {
+        let path = bundled.join(name);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    for name in names {
+        let beside = exe_dir.join(name);
+        if beside.is_file() {
+            return Some(beside);
+        }
+    }
+    let nested_dir = exe_dir.join("resources").join("openvino");
+    for name in names {
+        let nested = nested_dir.join(name);
+        if nested.is_file() {
+            return Some(nested);
+        }
+    }
+    None
 }
 
-/// Read the switch and decide whether the next session may use OpenVINO.
-/// Off leaves the ONNX Runtime path alone. On, but missing from this runtime,
-/// records the fallback line and stays on ONNX Runtime.
+fn register_openvino_plugin() -> Result<(), String> {
+    let mut registered = lock(&OPENVINO_PLUGIN);
+    if registered.is_some() {
+        return Ok(());
+    }
+    let exe = std::env::current_exe().map_err(|_| "Could not find the app directory.".to_string())?;
+    let Some(dir) = exe.parent() else {
+        return Err("Could not find the app directory.".to_string());
+    };
+    let Some(path) = find_openvino_plugin(dir) else {
+        return Err(format!(
+            "{OPENVINO_PLUGIN_DLL} or {OPENVINO_PROVIDER_DLL} was not found next to the app."
+        ));
+    };
+    let env = crate::detect::runtime()?;
+    let library = with_plugin_dll_directory(path.parent(), || {
+        env.register_ep_library(OPENVINO_PLUGIN_NAME, &path)
+    })
+    .map_err(|err| {
+        format!(
+            "could not register {}: {}",
+            path.display(),
+            one_line(&err.to_string())
+        )
+    })?;
+    eprintln!("OpenVINO plugin {}", path.display());
+    *registered = Some(library);
+    Ok(())
+}
+
+fn one_line(text: &str) -> String {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.is_empty() {
+        return "unknown error".to_string();
+    }
+    if text.chars().count() <= 240 {
+        return text;
+    }
+    let trimmed: String = text.chars().take(237).collect();
+    format!("{trimmed}...")
+}
+
+/// Read the switch and register the OpenVINO plugin when it is on.
+/// Off leaves the ONNX Runtime path alone. A missing DLL or a failed
+/// registration records the fallback line and stays on ONNX Runtime.
 pub(crate) fn prepare_openvino() {
     if !read_use_openvino() {
         *lock(&OPENVINO) = OpenVinoObserved {
@@ -184,7 +259,10 @@ pub(crate) fn prepare_openvino() {
         };
         return;
     }
-    let available = crate::detect::ensure_runtime() && openvino_in_runtime();
+    if !crate::detect::ensure_runtime() {
+        note_openvino_unavailable("ONNX Runtime did not start.");
+        return;
+    }
     if !read_use_openvino() {
         *lock(&OPENVINO) = OpenVinoObserved {
             run: OpenVinoRun::Off,
@@ -192,18 +270,67 @@ pub(crate) fn prepare_openvino() {
         };
         return;
     }
-    if available {
-        *lock(&OPENVINO) = OpenVinoObserved {
-            run: OpenVinoRun::Pending,
-            message: String::new(),
-        };
+    if let Err(err) = register_openvino_plugin() {
+        note_openvino_unavailable(&err);
         return;
     }
+    *lock(&OPENVINO) = OpenVinoObserved {
+        run: OpenVinoRun::Pending,
+        message: String::new(),
+    };
+}
+
+fn note_openvino_unavailable(err: &str) {
+    eprintln!("OpenVINO plugin: {err}");
     eprintln!("{OPENVINO_UNAVAILABLE}");
     *lock(&OPENVINO) = OpenVinoObserved {
         run: OpenVinoRun::Fallback,
         message: OPENVINO_UNAVAILABLE.to_string(),
     };
+}
+
+/// Windows looks for the plugin's OpenVINO and TBB imports in the exe directory.
+/// A plugin under `resources/openvino` also needs that folder on the search path.
+fn with_plugin_dll_directory<T>(dir: Option<&std::path::Path>, run: impl FnOnce() -> T) -> T {
+    let _guard = dir.and_then(push_dll_directory);
+    run()
+}
+
+fn push_dll_directory(dir: &std::path::Path) -> Option<DllDirectoryGuard> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
+        use windows::core::PCWSTR;
+
+        let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        if unsafe { SetDllDirectoryW(PCWSTR(wide.as_ptr())) }.is_err() {
+            None
+        } else {
+            Some(DllDirectoryGuard)
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = dir;
+        None
+    }
+}
+
+struct DllDirectoryGuard;
+
+impl Drop for DllDirectoryGuard {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        {
+            use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
+            use windows::core::PCWSTR;
+
+            unsafe {
+                let _ = SetDllDirectoryW(PCWSTR(std::ptr::null()));
+            }
+        }
+    }
 }
 
 pub(crate) fn mark_openvino_started() {
@@ -399,7 +526,8 @@ fn directml_usable(facts: &GpuFacts) -> bool {
 }
 
 fn directml_api_present() -> bool {
-    ort::ep::directml::api().is_some()
+    // The OpenVINO prebuilt does not include the DirectML execution provider.
+    false
 }
 
 fn cuda_usable(facts: &GpuFacts) -> bool {
@@ -407,10 +535,11 @@ fn cuda_usable(facts: &GpuFacts) -> bool {
 }
 
 fn cuda_libraries_load() -> bool {
-    if let Some(path) = find_cuda_provider_dll() {
-        return library_loads(path.as_os_str());
-    }
-    ort::ep::CUDA::is_available().unwrap_or(false) && library_name_loads("nvcuda.dll")
+    // The OpenVINO prebuilt does not include the CUDA execution provider.
+    let Some(path) = find_cuda_provider_dll() else {
+        return false;
+    };
+    library_loads(path.as_os_str())
 }
 
 fn find_cuda_provider_dll() -> Option<PathBuf> {
@@ -532,6 +661,47 @@ mod tests {
             ),
             ""
         );
+    }
+
+    #[test]
+    fn openvino_plugin_dll_is_beside_the_exe_or_under_resources() {
+        let root = std::env::temp_dir().join(format!(
+            "ls-vision-ov-plugin-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("resources").join("openvino")).unwrap();
+        assert!(find_openvino_plugin(&root).is_none());
+        let nested_provider = root
+            .join("resources")
+            .join("openvino")
+            .join("onnxruntime_providers_openvino.dll");
+        std::fs::write(&nested_provider, b"provider").unwrap();
+        assert_eq!(
+            find_openvino_plugin(&root).as_deref(),
+            Some(nested_provider.as_path())
+        );
+        let nested = root
+            .join("resources")
+            .join("openvino")
+            .join("onnxruntime_providers_openvino_plugin.dll");
+        std::fs::write(&nested, b"plugin").unwrap();
+        assert_eq!(find_openvino_plugin(&root).as_deref(), Some(nested.as_path()));
+        let beside_provider = root.join("onnxruntime_providers_openvino.dll");
+        std::fs::write(&beside_provider, b"provider").unwrap();
+        assert_eq!(
+            find_openvino_plugin(&root).as_deref(),
+            Some(beside_provider.as_path())
+        );
+        let beside = root.join("onnxruntime_providers_openvino_plugin.dll");
+        std::fs::write(&beside, b"plugin").unwrap();
+        assert_eq!(find_openvino_plugin(&root).as_deref(), Some(beside.as_path()));
+        let bundled_dir = root.join("openvino");
+        std::fs::create_dir_all(&bundled_dir).unwrap();
+        let bundled = bundled_dir.join("onnxruntime_providers_openvino.dll");
+        std::fs::write(&bundled, b"bundled").unwrap();
+        assert_eq!(find_openvino_plugin(&root).as_deref(), Some(bundled.as_path()));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

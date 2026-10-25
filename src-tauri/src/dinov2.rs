@@ -1,6 +1,7 @@
 //! Optional DINOv2 ONNX session, stored beside the YOLO session.
 //!
-//! Startup opens `src-tauri/models/dinov2_vits14.onnx` when that file is present.
+//! Startup opens `models/dinov2_vits14.onnx` next to the exe when the installer
+//! shipped it, and otherwise `src-tauri/models/dinov2_vits14.onnx`.
 //! A missing or unloadable file is a warning. Detection keeps using the YOLO session.
 //! After YOLO keeps a box, this module can crop it, letterbox it to 224, and log
 //! the embedding. A test-mode capture stores that vector under the box's IC.
@@ -98,11 +99,24 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|err| err.into_inner())
 }
 
-/// `src-tauri/models/dinov2_vits14.onnx`, from the crate directory baked in at compile time.
+/// On Windows the resource directory is the exe directory, so the installer
+/// copy is `models/dinov2_vits14.onnx` beside `ls-vision.exe`.
+/// Dev and tests use `src-tauri/models/dinov2_vits14.onnx` when that bundled file is absent.
 pub(crate) fn model_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("models")
-        .join(FILE_NAME)
+    resolve_model_path(
+        std::env::current_exe().ok().as_deref(),
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+    )
+}
+
+fn resolve_model_path(exe: Option<&Path>, manifest_dir: &Path) -> PathBuf {
+    if let Some(dir) = exe.and_then(|path| path.parent()) {
+        let bundled = dir.join("models").join(FILE_NAME);
+        if bundled.is_file() {
+            return bundled;
+        }
+    }
+    manifest_dir.join("models").join(FILE_NAME)
 }
 
 /// Open the DINOv2 session once. A missing file does not touch the YOLO cache.
@@ -1265,6 +1279,33 @@ pub(crate) fn lock_for_test() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_model_next_to_the_exe_wins_over_the_crate_copy() {
+        let root = std::env::temp_dir().join(format!(
+            "ls-vision-dino-bundle-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let exe_dir = root.join("app");
+        let manifest = root.join("crate");
+        std::fs::create_dir_all(exe_dir.join("models")).unwrap();
+        std::fs::create_dir_all(manifest.join("models")).unwrap();
+        let bundled = exe_dir.join("models").join(FILE_NAME);
+        let crate_copy = manifest.join("models").join(FILE_NAME);
+        std::fs::write(&crate_copy, b"crate").unwrap();
+        assert_eq!(
+            resolve_model_path(Some(&exe_dir.join("ls-vision.exe")), &manifest),
+            crate_copy
+        );
+        std::fs::write(&bundled, b"bundled").unwrap();
+        assert_eq!(
+            resolve_model_path(Some(&exe_dir.join("ls-vision.exe")), &manifest),
+            bundled
+        );
+        assert_eq!(resolve_model_path(None, &manifest), crate_copy);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn missing_model_warns_and_a_present_model_reports_shapes() {
