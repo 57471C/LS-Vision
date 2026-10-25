@@ -1,7 +1,7 @@
 <script lang="ts">
 // biome-ignore-all lint/correctness/noUnusedVariables: Biome 2.4 does not treat Svelte template references as uses
 
-import { onDestroy, onMount } from "svelte";
+import { onDestroy, onMount, tick } from "svelte";
 import ClassPicker from "$lib/ClassPicker.svelte";
 import {
 	activateCamera,
@@ -94,6 +94,23 @@ let savingModel = false;
 let updatingModel = false;
 let updatingReferences = false;
 let referenceNotice = "";
+let referencePath = "";
+type ReferenceRow = {
+	ic: string;
+	threshold: number | null;
+	count: number;
+};
+let referencesOpen = false;
+let referencesLoading = false;
+let referencesNotice = "";
+let referenceRows: ReferenceRow[] = [];
+let referenceDrafts: Record<string, string> = {};
+let referenceSort: "ic" | "threshold" = "ic";
+let referenceSortDir: "asc" | "desc" = "asc";
+let savingReferenceIc = "";
+let deletingReferenceIc = "";
+let referencesGeneration = 0;
+let referencesClose: HTMLButtonElement | null = null;
 const CONFIDENCE_MIN = 0.15;
 const CONFIDENCE_MAX = 0.8;
 const CONFIDENCE_DEFAULT = 0.45;
@@ -979,7 +996,13 @@ async function updateReferences() {
 		const data = await invokeRust<{
 			classes?: unknown;
 			message?: unknown;
+			path?: unknown;
 		}>("update_references");
+		if (!data || typeof data !== "object") {
+			referenceNotice = "Could not update the references";
+			return;
+		}
+		if (typeof data.path === "string" && data.path) referencePath = data.path;
 		referenceNotice =
 			typeof data.message === "string" && data.message
 				? data.message
@@ -990,6 +1013,221 @@ async function updateReferences() {
 		updatingReferences = false;
 	}
 }
+
+function readReferenceRow(value: unknown): ReferenceRow | null {
+	if (!value || typeof value !== "object") return null;
+	const record = value as Record<string, unknown>;
+	const ic = typeof record.ic === "string" ? record.ic.trim() : "";
+	if (!ic) return null;
+	const count =
+		typeof record.count === "number" && Number.isFinite(record.count)
+			? record.count
+			: 0;
+	const threshold =
+		typeof record.threshold === "number" && Number.isFinite(record.threshold)
+			? record.threshold
+			: null;
+	return { ic, threshold, count };
+}
+
+function readReferenceRows(value: unknown): ReferenceRow[] {
+	if (!Array.isArray(value)) return [];
+	const rows: ReferenceRow[] = [];
+	for (const item of value) {
+		const row = readReferenceRow(item);
+		if (row) rows.push(row);
+	}
+	return rows;
+}
+
+function readReferenceList(
+	value: unknown,
+): { path: string; rows: ReferenceRow[]; rawCount: number } | null {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+	const record = value as Record<string, unknown>;
+	const path = typeof record.path === "string" ? record.path : "";
+	const rawCount = Array.isArray(record.rows) ? record.rows.length : -1;
+	return { path, rows: readReferenceRows(record.rows), rawCount };
+}
+
+function effectiveReferenceThreshold(row: ReferenceRow): number {
+	return row.threshold ?? matchThreshold;
+}
+
+function sortReferenceRows(
+	rows: ReferenceRow[],
+	key: "ic" | "threshold",
+	dir: "asc" | "desc",
+	fallback: number,
+): ReferenceRow[] {
+	const copy = [...rows];
+	copy.sort((left, right) => {
+		let order = 0;
+		if (key === "ic") {
+			order = left.ic.localeCompare(right.ic);
+		} else {
+			order = (left.threshold ?? fallback) - (right.threshold ?? fallback);
+			if (order === 0) order = left.ic.localeCompare(right.ic);
+		}
+		return dir === "asc" ? order : -order;
+	});
+	return copy;
+}
+
+function showReferenceRows(rows: ReferenceRow[]) {
+	referenceRows = rows;
+	const drafts: Record<string, string> = {};
+	for (const row of rows) {
+		drafts[row.ic] = effectiveReferenceThreshold(row).toFixed(2);
+	}
+	referenceDrafts = drafts;
+}
+
+function referencesNoticeClass(text: string): string {
+	if (text.startsWith("Saved.") || text.startsWith("Removed "))
+		return "text-neutral-200";
+	return "text-red-300";
+}
+
+async function openReferences() {
+	referencesOpen = true;
+	referencesNotice = "";
+	referencesLoading = true;
+	const generation = ++referencesGeneration;
+	try {
+		const data = await invokeRust<unknown>("list_references");
+		if (generation !== referencesGeneration || !referencesOpen) return;
+		const list = readReferenceList(data);
+		if (!list) {
+			referenceRows = [];
+			referenceDrafts = {};
+			referencesNotice = "Could not load the references";
+			return;
+		}
+		if (list.path) referencePath = list.path;
+		if (list.rawCount < 0 || (list.rawCount > 0 && list.rows.length === 0)) {
+			referenceRows = [];
+			referenceDrafts = {};
+			referencesNotice = "Could not load the references";
+			return;
+		}
+		showReferenceRows(list.rows);
+	} catch (err: unknown) {
+		if (generation !== referencesGeneration || !referencesOpen) return;
+		referenceRows = [];
+		referenceDrafts = {};
+		referencesNotice = invokeError(err, "Could not load the references");
+	} finally {
+		if (generation === referencesGeneration) referencesLoading = false;
+	}
+	if (referencesOpen && generation === referencesGeneration) {
+		await tick();
+		referencesClose?.focus();
+	}
+}
+
+function closeReferences() {
+	referencesOpen = false;
+	referencesGeneration += 1;
+	referencesLoading = false;
+}
+
+function onReferencesKey(event: KeyboardEvent) {
+	if (!referencesOpen || event.key !== "Escape") return;
+	event.preventDefault();
+	closeReferences();
+}
+
+function sortReferencesBy(key: "ic" | "threshold") {
+	if (referenceSort === key) {
+		referenceSortDir = referenceSortDir === "asc" ? "desc" : "asc";
+		return;
+	}
+	referenceSort = key;
+	referenceSortDir = "asc";
+}
+
+function setReferenceDraft(ic: string, value: string) {
+	referenceDrafts = { ...referenceDrafts, [ic]: value };
+}
+
+function showReferenceDraft(
+	ic: string,
+	shown: string,
+	field?: HTMLInputElement,
+) {
+	setReferenceDraft(ic, shown);
+	if (field) field.value = shown;
+}
+
+async function commitReferenceThreshold(ic: string, field?: HTMLInputElement) {
+	const row = referenceRows.find((item) => item.ic === ic);
+	if (!row || savingReferenceIc || deletingReferenceIc) return;
+	const parsed = Number(referenceDrafts[ic] ?? "");
+	if (!Number.isFinite(parsed)) {
+		showReferenceDraft(ic, effectiveReferenceThreshold(row).toFixed(2), field);
+		referencesNotice = "Enter a threshold from 0.50 to 0.95.";
+		return;
+	}
+	const next = Math.min(
+		MATCH_MAX,
+		Math.max(MATCH_MIN, Math.round(parsed * 100) / 100),
+	);
+	const current = effectiveReferenceThreshold(row);
+	if (Math.abs(next - current) < 0.001) {
+		showReferenceDraft(ic, current.toFixed(2), field);
+		return;
+	}
+	savingReferenceIc = ic;
+	referencesNotice = "";
+	try {
+		const data = await invokeRust<unknown>("set_reference_threshold", {
+			ic,
+			threshold: next,
+		});
+		const saved = readReferenceRow(data);
+		if (!saved) {
+			showReferenceDraft(ic, current.toFixed(2), field);
+			referencesNotice = "Could not save the threshold.";
+			return;
+		}
+		referenceRows = referenceRows.map((item) =>
+			item.ic === ic ? saved : item,
+		);
+		showReferenceDraft(saved.ic, (saved.threshold ?? next).toFixed(2), field);
+		referencesNotice = `Saved. ${saved.ic} threshold is ${(saved.threshold ?? next).toFixed(2)}.`;
+	} catch (err: unknown) {
+		showReferenceDraft(ic, current.toFixed(2), field);
+		referencesNotice = invokeError(err, "Could not save the threshold");
+	} finally {
+		savingReferenceIc = "";
+	}
+}
+
+async function deleteReferenceRow(ic: string) {
+	if (savingReferenceIc || deletingReferenceIc) return;
+	deletingReferenceIc = ic;
+	referencesNotice = "";
+	try {
+		await invokeRust("delete_reference", { ic });
+		referenceRows = referenceRows.filter((item) => item.ic !== ic);
+		const drafts = { ...referenceDrafts };
+		delete drafts[ic];
+		referenceDrafts = drafts;
+		referencesNotice = `Removed ${ic}.`;
+	} catch (err: unknown) {
+		referencesNotice = invokeError(err, "Could not delete the reference");
+	} finally {
+		deletingReferenceIc = "";
+	}
+}
+
+$: sortedReferenceRows = sortReferenceRows(
+	referenceRows,
+	referenceSort,
+	referenceSortDir,
+	matchThreshold,
+);
 
 async function loadScan() {
 	try {
@@ -2281,6 +2519,8 @@ onDestroy(() => {
 	</style>
 </svelte:head>
 
+<svelte:window on:keydown={onReferencesKey} />
+
 <div class="settings-root flex h-dvh max-h-dvh flex-col overflow-hidden overscroll-none bg-neutral-950 text-neutral-100">
 	<header class="flex shrink-0 items-center justify-between gap-3 border-b border-neutral-800 bg-neutral-900 px-4 py-2">
 		<div class="flex min-w-0 items-baseline gap-3">
@@ -3195,7 +3435,7 @@ onDestroy(() => {
 									Current value <span class="font-mono text-neutral-100">{matchThreshold.toFixed(2)}</span>
 								</p>
 								<p class="text-sm text-neutral-400">
-									A part with saved references counts toward the BoM only when its best match is above this score. Range 0.50 to 0.95. A part with no reference still counts.
+									A part with saved references counts toward the BoM only when its best match is above this score. View references can set a different score for one IC. Range 0.50 to 0.95. A part with no reference still counts.
 								</p>
 								{#if matchNotice}
 									<p class="text-sm text-neutral-200">{matchNotice}</p>
@@ -3233,11 +3473,22 @@ onDestroy(() => {
 								>
 									{updatingReferences ? "Updating..." : "Update references"}
 								</button>
+								<button
+									type="button"
+									class="inline-flex min-h-11 w-fit items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100 disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
+									on:click={openReferences}
+									disabled={updatingReferences}
+								>
+									View references
+								</button>
 								<p class="text-sm text-neutral-400">
 									Replaces the saved DINOv2 references. The next detection uses the loaded embeddings.
 								</p>
 								{#if referenceNotice}
 									<p class="text-sm {referenceNoticeClass(referenceNotice)}">{referenceNotice}</p>
+								{/if}
+								{#if referencePath}
+									<p class="break-all font-mono text-xs text-neutral-500">{referencePath}</p>
 								{/if}
 							</div>
 						</form>
@@ -3676,6 +3927,136 @@ onDestroy(() => {
 		</div>
 	{/if}
 </div>
+
+{#if referencesOpen}
+	<div
+		class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
+		on:click={closeReferences}
+	>
+		<div
+			class="flex max-h-[80vh] w-full max-w-3xl flex-col border border-neutral-700 bg-neutral-900 p-4"
+			role="dialog"
+			aria-modal="true"
+			aria-labelledby="references-title"
+			on:click|stopPropagation
+		>
+			<h2 id="references-title" class="text-lg font-semibold tracking-tight">DINOv2 references</h2>
+			<p class="mt-2 text-sm text-neutral-400">
+				Each IC uses its saved threshold. An IC without one uses the Training match score,
+				currently <span class="font-mono text-neutral-100">{matchThreshold.toFixed(2)}</span>.
+				The next detection uses a change without a restart.
+			</p>
+			{#if referencePath}
+				<p class="mt-2 break-all font-mono text-xs text-neutral-500">{referencePath}</p>
+			{/if}
+			{#if referencesNotice}
+				<p class="mt-3 text-sm {referencesNoticeClass(referencesNotice)}">{referencesNotice}</p>
+			{/if}
+			<div class="mt-4 min-h-0 flex-1 overflow-auto">
+				{#if referencesLoading}
+					<p class="text-sm text-neutral-200">Loading...</p>
+				{:else if referenceRows.length === 0}
+					{#if !referencesNotice || referencesNotice.startsWith("Removed ")}
+						<p class="text-sm text-neutral-200">No references loaded.</p>
+					{/if}
+				{:else}
+					<table class="w-full border-collapse text-left text-sm">
+						<thead class="sticky top-0 bg-neutral-900">
+							<tr class="border-b border-neutral-700 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+								<th
+									class="px-2 py-2"
+									aria-sort={referenceSort === "ic"
+										? referenceSortDir === "asc"
+											? "ascending"
+											: "descending"
+										: "none"}
+								>
+									<button
+										type="button"
+										class="inline-flex items-center gap-1 uppercase tracking-widest"
+										on:click={() => sortReferencesBy("ic")}
+									>
+										IC
+										{#if referenceSort === "ic"}
+											{referenceSortDir === "asc" ? "↑" : "↓"}
+										{/if}
+									</button>
+								</th>
+								<th
+									class="px-2 py-2"
+									aria-sort={referenceSort === "threshold"
+										? referenceSortDir === "asc"
+											? "ascending"
+											: "descending"
+										: "none"}
+								>
+									<button
+										type="button"
+										class="inline-flex items-center gap-1 uppercase tracking-widest"
+										on:click={() => sortReferencesBy("threshold")}
+									>
+										Threshold
+										{#if referenceSort === "threshold"}
+											{referenceSortDir === "asc" ? "↑" : "↓"}
+										{/if}
+									</button>
+								</th>
+								<th class="px-2 py-2 text-right">Embeddings</th>
+								<th class="px-2 py-2"><span class="sr-only">Delete</span></th>
+							</tr>
+						</thead>
+						<tbody>
+							{#each sortedReferenceRows as row (row.ic)}
+								<tr class="border-b border-neutral-800">
+									<td class="px-2 py-2 font-mono text-neutral-100">{row.ic}</td>
+									<td class="px-2 py-2">
+										<input
+											type="text"
+											inputmode="decimal"
+											class="h-9 w-20 border border-neutral-600 bg-neutral-950 text-center font-mono text-sm text-neutral-100 disabled:text-neutral-500"
+											aria-label="Threshold for {row.ic}"
+											value={referenceDrafts[row.ic] ?? effectiveReferenceThreshold(row).toFixed(2)}
+											disabled={savingReferenceIc === row.ic || deletingReferenceIc === row.ic}
+											on:input={(event) => setReferenceDraft(row.ic, event.currentTarget.value)}
+											on:blur={(event) =>
+												commitReferenceThreshold(row.ic, event.currentTarget)}
+											on:keydown={(event) => {
+												if (event.key !== "Enter") return;
+												event.preventDefault();
+												commitReferenceThreshold(row.ic, event.currentTarget);
+											}}
+										/>
+									</td>
+									<td class="px-2 py-2 text-right font-mono text-neutral-100">{row.count}</td>
+									<td class="px-2 py-2 text-right">
+										<button
+											type="button"
+											class="inline-flex min-h-9 items-center border border-neutral-600 bg-neutral-800 px-3 text-sm font-semibold text-neutral-100 disabled:border-neutral-700 disabled:text-neutral-500"
+											on:click={() => deleteReferenceRow(row.ic)}
+											disabled={deletingReferenceIc === row.ic || savingReferenceIc === row.ic}
+										>
+											{deletingReferenceIc === row.ic ? "Deleting..." : "Delete"}
+										</button>
+									</td>
+								</tr>
+							{/each}
+						</tbody>
+					</table>
+				{/if}
+			</div>
+			<div class="mt-4 flex justify-end">
+				<button
+					type="button"
+					bind:this={referencesClose}
+					class="inline-flex min-h-11 items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100"
+					on:click={closeReferences}
+				>
+					Close
+				</button>
+			</div>
+		</div>
+	</div>
+{/if}
 
 <style>
 	.settings-root {
