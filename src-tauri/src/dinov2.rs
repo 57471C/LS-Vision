@@ -5,14 +5,17 @@
 //! After YOLO keeps a box, this module can crop it, letterbox it to 224, and log
 //! the embedding. A test-mode capture stores that vector under the box's IC.
 //! The camera preview can hold the same vectors and store only the boxes an
-//! admin selects, appending them or replacing that IC. The map is kept in
-//! memory and written to `vision/dinov2-references.json`.
+//! admin selects, appending them or replacing that IC. That same preview detect
+//! keeps a copy of the RGB frame. An admin marquee crops that copy and embeds
+//! it with DINOv2 only, then stores the one vector under an IC they choose.
+//! The map is kept in memory and written to `vision/dinov2-references.json`.
 //! A later detection logs the best cosine score against those references.
 //! A box counts toward its IC only when that score is above the saved threshold.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -49,6 +52,19 @@ static STATE: Mutex<Option<State>> = Mutex::new(None);
 static REFERENCES: LazyLock<Mutex<HashMap<String, Vec<Vec<f32>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static HELD: LazyLock<Mutex<Vec<Option<HeldEmbed>>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+static FRAME: LazyLock<Mutex<Option<HeldFrame>>> = LazyLock::new(|| Mutex::new(None));
+static MARQUEE: LazyLock<Mutex<Option<Vec<f32>>>> = LazyLock::new(|| Mutex::new(None));
+static MARQUEE_TOKEN: AtomicU64 = AtomicU64::new(0);
+static FRAME_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// RGB copy of the preview detect that asked to hold references.
+/// A marquee crops this still, so a later camera frame cannot change it.
+#[derive(Clone)]
+struct HeldFrame {
+    rgb: Vec<u8>,
+    width: u32,
+    height: u32,
+}
 
 /// One crop embedding kept from the latest preview detect. `None` means that
 /// box had no vector, so it cannot be saved.
@@ -269,9 +285,52 @@ pub(crate) fn hold_embeddings(items: Vec<Option<HeldEmbed>>) {
     *lock(&HELD) = items;
 }
 
+/// Keep the RGB frame from a preview detect. Clears any marquee vector, because
+/// that vector belonged to the previous still.
+pub(crate) fn hold_frame(rgb: &[u8], width: u32, height: u32) {
+    invalidate_marquee();
+    FRAME_GEN.fetch_add(1, Ordering::SeqCst);
+    let expected = (width as usize)
+        .saturating_mul(height as usize)
+        .saturating_mul(3);
+    if width == 0 || height == 0 || expected == 0 || rgb.len() < expected {
+        *lock(&FRAME) = None;
+        return;
+    }
+    *lock(&FRAME) = Some(HeldFrame {
+        rgb: rgb[..expected].to_vec(),
+        width,
+        height,
+    });
+}
+
+/// Drop the held still and any marquee vector. Box embeddings are left as they are.
+pub(crate) fn clear_held_frame() {
+    invalidate_marquee();
+    FRAME_GEN.fetch_add(1, Ordering::SeqCst);
+    *lock(&FRAME) = None;
+}
+
+fn invalidate_marquee() {
+    MARQUEE_TOKEN.fetch_add(1, Ordering::SeqCst);
+    *lock(&MARQUEE) = None;
+}
+
+/// The latest marquee claim. An older embed sees a different token and does not store.
+fn claim_marquee() -> u64 {
+    let token = MARQUEE_TOKEN.fetch_add(1, Ordering::SeqCst) + 1;
+    *lock(&MARQUEE) = None;
+    token
+}
+
 #[cfg(test)]
 pub(crate) fn clear_held() {
     lock(&HELD).clear();
+}
+
+#[cfg(test)]
+pub(crate) fn hold_marquee(values: Vec<f32>) {
+    *lock(&MARQUEE) = Some(values);
 }
 
 /// Append one reference. Returns how many vectors are now stored for this IC.
@@ -551,6 +610,15 @@ pub(crate) fn apply_selected_references(
         }
         grouped.entry(ic).or_default().push(values);
     }
+    Ok(store_grouped(grouped, order, replace))
+}
+
+/// Append or replace the vectors for each listed IC. Other ICs stay.
+fn store_grouped(
+    mut grouped: HashMap<String, Vec<Vec<f32>>>,
+    order: Vec<String>,
+    replace: bool,
+) -> Vec<(String, usize)> {
     let mut guard = lock(&REFERENCES);
     for ic in &order {
         let Some(vectors) = grouped.remove(ic) else {
@@ -570,7 +638,7 @@ pub(crate) fn apply_selected_references(
         })
         .collect();
     rows.sort_by(|left, right| left.0.cmp(&right.0));
-    Ok(rows)
+    rows
 }
 
 fn saved_message(rows: &[(String, usize)], replace: bool) -> String {
@@ -607,6 +675,117 @@ pub fn save_detection_references(
         eprintln!("DINOv2 reference {name} stored {count}");
     }
     Ok(saved_message(&rows, replace))
+}
+
+fn marquee_bbox(x: f64, y: f64, w: f64, h: f64) -> Result<[i32; 4], String> {
+    if !x.is_finite() || !y.is_finite() || !w.is_finite() || !h.is_finite() {
+        return Err("Draw a larger region.".to_string());
+    }
+    if w < 1.0 || h < 1.0 || x.abs() > 100_000.0 || y.abs() > 100_000.0 {
+        return Err("Draw a larger region.".to_string());
+    }
+    let x1 = x.round() as i32;
+    let y1 = y.round() as i32;
+    let x2 = (x + w).round() as i32;
+    let y2 = (y + h).round() as i32;
+    if x2 <= x1 || y2 <= y1 {
+        return Err("Draw a larger region.".to_string());
+    }
+    Ok([x1, y1, x2, y2])
+}
+
+/// Crop the held preview frame and run DINOv2 only. YOLO is not used.
+/// The vector stays unlabelled until `save_marquee_reference` assigns an IC.
+#[tauri::command]
+pub fn embed_marquee(x: f64, y: f64, w: f64, h: f64) -> Result<(), String> {
+    let bbox = marquee_bbox(x, y, w, h)?;
+    let token = claim_marquee();
+    let frame_gen = FRAME_GEN.load(Ordering::SeqCst);
+    let frame = lock(&FRAME).clone();
+    let Some(frame) = frame else {
+        return Err("Detect again before saving a reference.".to_string());
+    };
+    let values = {
+        let mut guard = lock(&STATE);
+        let Some(session) = guard.as_mut().and_then(|state| state.session.as_mut()) else {
+            return Err("DINOv2 is not loaded.".to_string());
+        };
+        let crop = DebugCrop {
+            class_name: "",
+            confidence: 0.0,
+            bbox,
+        };
+        embed_one(session, &frame.rgb, frame.width, frame.height, &crop).map_err(|err| {
+            if err == "empty crop" {
+                "Draw a larger region.".to_string()
+            } else {
+                err
+            }
+        })?
+    };
+    if MARQUEE_TOKEN.load(Ordering::SeqCst) != token || FRAME_GEN.load(Ordering::SeqCst) != frame_gen
+    {
+        return Err("Detect again before saving a reference.".to_string());
+    }
+    if values.is_empty() || values.iter().any(|value| !value.is_finite()) {
+        return Err("That region has no DINOv2 embedding.".to_string());
+    }
+    let norm = values.iter().map(|value| value * value).sum::<f32>().sqrt();
+    eprintln!("DINOv2 marquee norm {norm:.4}");
+    *lock(&MARQUEE) = Some(values);
+    Ok(())
+}
+
+/// Store the pending marquee vector under `ic`.
+/// Append adds it. Replace swaps that IC only. Other ICs stay.
+pub(crate) fn apply_marquee_reference(
+    ic: &str,
+    replace: bool,
+) -> Result<Vec<(String, usize)>, String> {
+    let ic = ic.trim();
+    if ic.is_empty() {
+        return Err("Enter an IC.".to_string());
+    }
+    let values = lock(&MARQUEE)
+        .clone()
+        .ok_or_else(|| "Draw a region before saving a reference.".to_string())?;
+    if values.is_empty() || values.iter().any(|value| !value.is_finite()) {
+        return Err("That region has no DINOv2 embedding.".to_string());
+    }
+    let rows = store_grouped(
+        HashMap::from([(ic.to_string(), vec![values.clone()])]),
+        vec![ic.to_string()],
+        replace,
+    );
+    let mut guard = lock(&MARQUEE);
+    if guard.as_ref() == Some(&values) {
+        *guard = None;
+    }
+    Ok(rows)
+}
+
+/// Save the marquee crop under the IC the admin typed or picked.
+#[tauri::command]
+pub fn save_marquee_reference(ic: String, replace: Option<bool>) -> Result<String, String> {
+    let replace = replace.unwrap_or(false);
+    let rows = apply_marquee_reference(&ic, replace)?;
+    write_references()?;
+    for (name, count) in &rows {
+        eprintln!("DINOv2 reference {name} stored {count}");
+    }
+    Ok(saved_message(&rows, replace))
+}
+
+/// Drop a marquee vector the preview discarded. The held frame stays.
+#[tauri::command]
+pub fn clear_marquee_reference() {
+    invalidate_marquee();
+}
+
+/// Drop the held still when the preview overlay closes.
+#[tauri::command]
+pub fn release_preview_frame() {
+    clear_held_frame();
 }
 
 fn embed_one(
@@ -990,6 +1169,103 @@ mod tests {
 
         clear_references();
         clear_held();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn marquee_vector_appends_or_replaces_one_class_and_reloads() {
+        let _hold = lock_for_test();
+        clear_references();
+        clear_held();
+        clear_held_frame();
+        remember("OTHER", &[0.0, 1.0, 0.0, 0.0]);
+        remember("2BBMNM08", &[0.0, 1.0, 0.0, 0.0]);
+        hold_embeddings(vec![Some(HeldEmbed {
+            ic: "2BBMNM08".to_string(),
+            values: vec![1.0, 0.0, 0.0, 0.0],
+        })]);
+        hold_marquee(vec![1.0, 0.0, 0.0, 0.0]);
+        let rows = apply_marquee_reference("2BBMNM08", false).unwrap();
+        assert_eq!(rows, vec![("2BBMNM08".to_string(), 2)]);
+        assert!(lock(&MARQUEE).is_none());
+        assert_eq!(
+            best_similarity("2BBMNM08", &[1.0, 0.0, 0.0, 0.0]),
+            Some(1.0)
+        );
+        assert_eq!(best_similarity("2BBMNM08", &[0.0, 1.0, 0.0, 0.0]), Some(1.0));
+        assert_eq!(best_similarity("OTHER", &[0.0, 1.0, 0.0, 0.0]), Some(1.0));
+        assert_eq!(
+            apply_selected_references(&[0], false).unwrap(),
+            vec![("2BBMNM08".to_string(), 3)]
+        );
+
+        hold_marquee(vec![0.0, 0.0, 1.0, 0.0]);
+        let rows = apply_marquee_reference("2BBMNM08", true).unwrap();
+        assert_eq!(rows, vec![("2BBMNM08".to_string(), 1)]);
+        assert!(
+            best_similarity("2BBMNM08", &[0.0, 1.0, 0.0, 0.0])
+                .unwrap()
+                .abs()
+                < 0.001
+        );
+        assert_eq!(
+            best_similarity("2BBMNM08", &[0.0, 0.0, 1.0, 0.0]),
+            Some(1.0)
+        );
+        assert_eq!(best_similarity("OTHER", &[0.0, 1.0, 0.0, 0.0]), Some(1.0));
+
+        hold_marquee(vec![1.0, 0.0, 0.0, 0.0]);
+        let rows = apply_marquee_reference(" 6PBB33 ", false).unwrap();
+        assert_eq!(rows, vec![("6PBB33".to_string(), 1)]);
+        assert_eq!(
+            saved_message(&rows, false),
+            "Saved 6PBB33 (1)."
+        );
+
+        let path = std::env::temp_dir().join(format!(
+            "ls-vision-dino-marquee-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        save_references_to(&path).unwrap();
+        clear_references();
+        assert!(best_similarity("6PBB33", &[1.0, 0.0, 0.0, 0.0]).is_none());
+        assert_eq!(load_references_from(&path).unwrap(), true);
+        assert_eq!(
+            best_similarity("6PBB33", &[1.0, 0.0, 0.0, 0.0]),
+            Some(1.0)
+        );
+        assert_eq!(
+            best_similarity("2BBMNM08", &[0.0, 0.0, 1.0, 0.0]),
+            Some(1.0)
+        );
+        assert_eq!(best_similarity("OTHER", &[0.0, 1.0, 0.0, 0.0]), Some(1.0));
+
+        hold_marquee(vec![1.0, 0.0, 0.0, 0.0]);
+        let blank = apply_marquee_reference("  ", false).unwrap_err();
+        assert!(blank.contains("Enter an IC"), "{blank}");
+        assert!(lock(&MARQUEE).is_some());
+        clear_marquee_reference();
+        let missing = apply_marquee_reference("2BBMNM08", false).unwrap_err();
+        assert!(missing.contains("Draw a region"), "{missing}");
+
+        hold_marquee(vec![f32::NAN, 1.0]);
+        let bad = apply_marquee_reference("2BBMNM08", false).unwrap_err();
+        assert!(bad.contains("no DINOv2"), "{bad}");
+
+        hold_marquee(vec![1.0, 0.0, 0.0, 0.0]);
+        hold_frame(&[9, 9, 9, 8, 8, 8, 7, 7, 7, 6, 6, 6], 2, 2);
+        assert!(lock(&MARQUEE).is_none());
+        assert!(lock(&FRAME).is_some());
+        hold_frame(&[], 0, 0);
+        assert!(lock(&FRAME).is_none());
+        assert_eq!(marquee_bbox(1.2, 3.4, 10.0, 12.0).unwrap(), [1, 3, 11, 15]);
+        assert!(marquee_bbox(0.0, 0.0, 0.4, 10.0).is_err());
+        assert!(marquee_bbox(f64::NAN, 0.0, 10.0, 10.0).is_err());
+
+        clear_references();
+        clear_held();
+        clear_held_frame();
         let _ = std::fs::remove_file(&path);
     }
 }
