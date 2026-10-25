@@ -107,9 +107,20 @@ pub(crate) fn model_path() -> PathBuf {
 
 /// Open the DINOv2 session once. A missing file does not touch the YOLO cache.
 /// Saved references load even when the model file is missing.
+/// Use OpenVINO, when saved, is decided before this session opens. Off leaves
+/// the ONNX Runtime session path unchanged.
 pub(crate) fn load_on_startup() {
+    if inference_ep::read_use_openvino() {
+        inference_ep::prepare_openvino();
+        let _ = detect::reload_session();
+    }
     load_at(&model_path());
     load_saved_references();
+}
+
+/// Reopen the DINOv2 file with the current backend. References stay in memory.
+pub(crate) fn reload_session() {
+    load_at(&model_path());
 }
 
 pub(crate) fn load_at(path: &Path) -> Dinov2Status {
@@ -195,6 +206,21 @@ fn open_dinov2(path: &Path) -> Result<(ort::session::Session, Option<String>), S
         format!("DINOv2 model failed to load ({err}). YOLO detection is unchanged.")
     })?;
     let requested = inference_ep::selected_provider();
+    if inference_ep::wants_openvino() {
+        match detect::open_openvino_session(&env, path) {
+            Ok(session) => {
+                inference_ep::mark_openvino_started();
+                return Ok((session, None));
+            }
+            Err(err) => {
+                let was_active = inference_ep::openvino_is_active();
+                inference_ep::mark_openvino_failed(&err);
+                if was_active {
+                    detect::forget_session();
+                }
+            }
+        }
+    }
     match detect::open_session(&env, path, requested) {
         Ok(session) => Ok((session, None)),
         Err(err) if requested != Provider::Cpu => {

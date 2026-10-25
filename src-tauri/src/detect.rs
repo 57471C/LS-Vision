@@ -92,6 +92,7 @@ struct CacheKey {
     mtime_ns: u128,
     len: u64,
     requested: Provider,
+    openvino: bool,
 }
 
 struct LoadedModel {
@@ -101,6 +102,7 @@ struct LoadedModel {
     end_to_end: bool,
     requested: Provider,
     provider: Provider,
+    openvino: bool,
     session: ort::session::Session,
 }
 
@@ -1071,6 +1073,7 @@ fn cache_key(path: &Path, requested: Provider) -> Result<CacheKey, String> {
         mtime_ns,
         len: meta.len(),
         requested,
+        openvino: false,
     })
 }
 
@@ -1163,6 +1166,36 @@ fn input_image_size(session: &ort::session::Session) -> usize {
     DEFAULT_IMAGE_SIZE
 }
 
+/// Same `.onnx` file, registered on OpenVINO's GPU device (Arc iGPU).
+pub(crate) fn open_openvino_session(
+    env: &ort::environment::Environment,
+    path: &Path,
+) -> Result<ort::session::Session, String> {
+    let name = file_name(path);
+    let provider = ort::ep::OpenVINO::default()
+        .with_device_type("GPU")
+        .build()
+        .error_on_failure();
+    let session = ort::session::Session::builder(env)
+        .map_err(|err| format!("{name} failed to load: {}", short_error(&err.to_string())))?
+        .with_execution_providers([provider])
+        .map_err(|err| {
+            format!(
+                "{name} failed to load with OpenVINO: {}",
+                short_error(&err.to_string())
+            )
+        })?
+        .commit_from_file(path)
+        .map_err(|err| {
+            format!(
+                "{name} failed to load with OpenVINO: {}",
+                short_error(&err.to_string())
+            )
+        })?;
+    eprintln!("OpenVINO session {name} on GPU");
+    Ok(session)
+}
+
 fn execution_provider(provider: Provider) -> ort::ep::ExecutionProviderDispatch {
     match provider {
         Provider::DirectMl => ort::ep::DirectML::default().build(),
@@ -1206,6 +1239,7 @@ fn finish_model(
     key: CacheKey,
     requested: Provider,
     provider: Provider,
+    openvino: bool,
     session: ort::session::Session,
 ) -> Result<LoadedModel, String> {
     let name = file_name(path);
@@ -1241,18 +1275,32 @@ fn finish_model(
         end_to_end,
         requested,
         provider,
+        openvino,
         session,
     })
 }
 
-fn load_model(path: &Path, key: CacheKey, requested: Provider) -> Result<LoadedModel, String> {
+fn load_model(path: &Path, mut key: CacheKey, requested: Provider) -> Result<LoadedModel, String> {
     let env = runtime()?;
+    if inference_ep::wants_openvino() {
+        match open_openvino_session(&env, path) {
+            Ok(session) => {
+                inference_ep::mark_openvino_started();
+                key.openvino = true;
+                return finish_model(path, key, requested, requested, true, session);
+            }
+            Err(err) => {
+                inference_ep::mark_openvino_failed(&err);
+                key.openvino = false;
+            }
+        }
+    }
     match open_session(&env, path, requested) {
-        Ok(session) => finish_model(path, key, requested, requested, session),
+        Ok(session) => finish_model(path, key, requested, requested, false, session),
         Err(err) if requested != Provider::Cpu => {
             let session = open_session(&env, path, Provider::Cpu)
                 .map_err(|cpu_err| format!("{err} {cpu_err}"))?;
-            let mut model = finish_model(path, key, requested, Provider::Cpu, session)?;
+            let mut model = finish_model(path, key, requested, Provider::Cpu, false, session)?;
             model.key.requested = requested;
             inference_ep::remember(
                 requested,
@@ -1275,7 +1323,8 @@ fn with_model<T>(
 ) -> Result<T, String> {
     let mut guard = MODEL_CACHE.lock().unwrap_or_else(|err| err.into_inner());
     let requested = inference_ep::selected_provider();
-    let key = cache_key(path, requested)?;
+    let mut key = cache_key(path, requested)?;
+    key.openvino = inference_ep::wants_openvino();
     let stale = guard.as_ref().is_none_or(|engine| engine.key != key);
     if stale {
         *guard = Some(load_model(path, key, requested)?);
@@ -1893,6 +1942,8 @@ fn benchmark_files(model_path: &Path, image_path: &Path) -> Result<DetectBenchma
                     model.session = open_session(&env, model_path, Provider::Cpu)
                         .map_err(|cpu_err| format!("{message} {cpu_err}"))?;
                     model.provider = Provider::Cpu;
+                    model.openvino = false;
+                    model.key.openvino = false;
                     let detail = message
                         .strip_prefix("Detect failed: ")
                         .unwrap_or(message.as_str());
@@ -1910,11 +1961,16 @@ fn benchmark_files(model_path: &Path, image_path: &Path) -> Result<DetectBenchma
                 Err(message) => return Err(message),
             }
         }
-        Ok((model.provider, times))
+        let provider = if model.openvino {
+            "openvino".to_string()
+        } else {
+            model.provider.id().to_string()
+        };
+        Ok((provider, times))
     })?;
     let (average_ms, min_ms, max_ms) = summarize_times(&times)?;
     Ok(DetectBenchmark {
-        provider: provider.id().to_string(),
+        provider: provider,
         average_ms,
         min_ms,
         max_ms,
@@ -2422,7 +2478,7 @@ mod tests {
         assert!(report.average_ms > 0.0);
         assert!(matches!(
             report.provider.as_str(),
-            "cpu" | "directml" | "cuda"
+            "cpu" | "directml" | "cuda" | "openvino"
         ));
         eprintln!(
             "benchmark provider={} average_ms={:.1} min_ms={:.1} max_ms={:.1} {}x{}",

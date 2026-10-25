@@ -22,6 +22,7 @@ Settings are stored in `vision/config.local.json` (gitignored). The unlock passw
 - The dropdown lists only providers this PC can run. CPU is always listed. DirectML is listed when a Direct3D 12 adapter is present. CUDA is listed when an NVIDIA adapter and the CUDA execution provider libraries load.
 - The choice is saved as `inferenceEp`.
 - If the selected provider fails, the session falls back to CPU and the header updates. The saved choice is kept.
+- **Use OpenVINO (Arc)** is `useOpenVino`, default off. Off keeps the ONNX Runtime provider above. On loads the same `.onnx` files with the OpenVINO execution provider on GPU. If OpenVINO is missing or does not start, the session stays on ONNX Runtime and the status line says so. The switch stays saved.
 - Benchmark times the active provider on a fixed image.
 
 ## Models

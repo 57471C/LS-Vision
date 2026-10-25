@@ -74,6 +74,7 @@ pub fn run() {
             dinov2::release_preview_frame,
             inference_ep::inference_status,
             inference_ep::set_inference_ep,
+            inference_ep::set_use_openvino,
             results::save_result,
             results::post_inspection_result,
             results::list_results,
