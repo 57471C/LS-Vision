@@ -933,7 +933,7 @@ mod tests {
     }
 
     #[test]
-    fn installer_config_does_not_bundle_onnx_models() {
+    fn installer_bundles_dinov2_and_openvino_dlls_beside_the_exe() {
         let text = fs::read_to_string(
             project_root()
                 .unwrap()
@@ -942,12 +942,22 @@ mod tests {
         )
         .unwrap();
         let value: Value = serde_json::from_str(&text).unwrap();
-        let resources = &value["bundle"]["resources"];
-        let empty = resources.is_null()
-            || resources.as_array().is_some_and(|items| items.is_empty())
-            || resources.as_object().is_some_and(|map| map.is_empty());
-        assert!(empty, "{resources}");
-        assert!(!text.to_ascii_lowercase().contains(".onnx"));
+        let resources = value["bundle"]["resources"]
+            .as_array()
+            .expect("bundle.resources");
+        let entries: Vec<_> = resources
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(entries.contains(&"models/*"), "{entries:?}");
+        assert!(entries.contains(&"openvino/*"), "{entries:?}");
+        assert!(
+            !entries.iter().any(|entry| entry.contains("best.onnx")),
+            "{entries:?}"
+        );
+        let lower = text.to_ascii_lowercase();
+        assert!(!lower.contains("best.onnx"));
+        assert!(!lower.contains("vision/models"));
     }
 
     fn onnx_bytes(payload: &[u8]) -> Vec<u8> {
