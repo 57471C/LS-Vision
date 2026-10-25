@@ -63,6 +63,7 @@ pub fn run() {
             detect::benchmark_detect,
             detect::model_class_names,
             dinov2::dinov2_status,
+            dinov2::save_detection_references,
             inference_ep::inference_status,
             inference_ep::set_inference_ep,
             results::save_result,

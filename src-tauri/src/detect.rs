@@ -55,6 +55,10 @@ struct Detection {
         skip_serializing_if = "Option::is_none"
     )]
     reference_match: Option<bool>,
+    /// Set when a preview detect holds this box for an admin reference save.
+    /// True when a finite embedding was kept. Absent on a normal inspection.
+    #[serde(default, rename = "embed", skip_serializing_if = "Option::is_none")]
+    embed: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -950,6 +954,7 @@ fn detections_from_output(
                 scaled[3] + frame.origin_y,
             ],
             reference_match: None,
+            embed: None,
         });
     }
     Ok(detections)
@@ -1534,6 +1539,7 @@ fn detect_pixels(
     width: u32,
     height: u32,
     capture_references: bool,
+    hold_references: bool,
 ) -> Result<Value, String> {
     let root = match local_config::project_root() {
         Ok(root) => root,
@@ -1562,14 +1568,18 @@ fn detect_pixels(
         DetectPlan::FullFrame => {
             return match run_model(&path, rgb, width, height, None, confidence) {
                 Ok((mut detections, classes)) => {
-                    let dinov2 = log_dinov2_embeddings(
+                    let (dinov2, held) = log_dinov2_embeddings(
                         rgb,
                         width,
                         height,
                         &mut detections,
                         capture_references,
                         cutoff,
+                        hold_references,
                     );
+                    if hold_references {
+                        crate::dinov2::hold_embeddings(held);
+                    }
                     Ok(json!({
                         "detections": detections,
                         "classes": classes,
@@ -1579,21 +1589,31 @@ fn detect_pixels(
                 Err(message) => Ok(failure(&model_status_message(&message))),
             };
         }
-        DetectPlan::Idle => return Ok(json!([])),
+        DetectPlan::Idle => {
+            if hold_references {
+                crate::dinov2::hold_embeddings(Vec::new());
+            }
+            return Ok(json!([]));
+        }
         DetectPlan::Slots(slots) => slots,
     };
     let mut rows = Vec::with_capacity(slots.len());
+    let mut held_all = Vec::new();
     for (slot, roi) in slots {
         match run_model(&path, rgb, width, height, Some(&roi), confidence) {
             Ok((mut detections, classes)) => {
-                let dinov2 = log_dinov2_embeddings(
+                let (dinov2, held) = log_dinov2_embeddings(
                     rgb,
                     width,
                     height,
                     &mut detections,
                     capture_references,
                     cutoff,
+                    hold_references,
                 );
+                if hold_references {
+                    held_all.extend(held);
+                }
                 rows.push(json!({
                     "slot": slot,
                     "detections": detections,
@@ -1604,11 +1624,15 @@ fn detect_pixels(
             Err(message) => return Ok(failure(&model_status_message(&message))),
         }
     }
+    if hold_references {
+        crate::dinov2::hold_embeddings(held_all);
+    }
     Ok(Value::Array(rows))
 }
 
 /// Confidence and NMS have already dropped the other boxes. A missing DINOv2
 /// session returns without a log and does not change these detections.
+/// When `hold` is set, each box keeps its vector for a later admin save.
 fn log_dinov2_embeddings(
     rgb: &[u8],
     width: u32,
@@ -1616,9 +1640,15 @@ fn log_dinov2_embeddings(
     detections: &mut [Detection],
     capture_references: bool,
     match_threshold: f32,
-) -> Vec<String> {
+    hold: bool,
+) -> (Vec<String>, Vec<Option<crate::dinov2::HeldEmbed>>) {
     if detections.is_empty() || !crate::dinov2::is_loaded() {
-        return Vec::new();
+        let held = if hold {
+            vec![None; detections.len()]
+        } else {
+            Vec::new()
+        };
+        return (Vec::new(), held);
     }
     let crops: Vec<crate::dinov2::DebugCrop<'_>> = detections
         .iter()
@@ -1636,15 +1666,43 @@ fn log_dinov2_embeddings(
         capture_references,
         match_threshold,
     );
-    for (detection, counted) in detections.iter_mut().zip(embedded.counted) {
+    let mut held = Vec::with_capacity(detections.len());
+    for (detection, (counted, values)) in detections
+        .iter_mut()
+        .zip(embedded.counted.into_iter().zip(embedded.vectors))
+    {
         if let Some(counts) = counted {
             detection.reference_match = Some(counts);
         }
+        if !hold {
+            continue;
+        }
+        let kept = values.and_then(|vector| held_embed(&detection.ic, vector));
+        detection.embed = Some(kept.is_some());
+        held.push(kept);
     }
-    embedded.lines
+    if hold && held.len() < detections.len() {
+        held.resize_with(detections.len(), || None);
+    }
+    (embedded.lines, if hold { held } else { Vec::new() })
 }
 
-fn detect_raw(frame: Option<RawFrame>, capture_references: bool) -> Result<Value, String> {
+fn held_embed(ic: &str, values: Vec<f32>) -> Option<crate::dinov2::HeldEmbed> {
+    let ic = ic.trim();
+    if ic.is_empty() || values.is_empty() || values.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    Some(crate::dinov2::HeldEmbed {
+        ic: ic.to_string(),
+        values,
+    })
+}
+
+fn detect_raw(
+    frame: Option<RawFrame>,
+    capture_references: bool,
+    hold_references: bool,
+) -> Result<Value, String> {
     let Some(frame) = frame else {
         return Ok(failure("No frame"));
     };
@@ -1652,10 +1710,14 @@ fn detect_raw(frame: Option<RawFrame>, capture_references: bool) -> Result<Value
         Ok(rgb) => rgb,
         Err(message) => return Ok(failure(&message)),
     };
-    detect_pixels(rgb, width, height, capture_references)
+    detect_pixels(rgb, width, height, capture_references, hold_references)
 }
 
-fn detect_encoded(text: &str, capture_references: bool) -> Result<Value, String> {
+fn detect_encoded(
+    text: &str,
+    capture_references: bool,
+    hold_references: bool,
+) -> Result<Value, String> {
     let bytes = match payload_bytes(text) {
         Ok(bytes) => bytes,
         Err(message) => return Ok(failure(&message)),
@@ -1664,7 +1726,7 @@ fn detect_encoded(text: &str, capture_references: bool) -> Result<Value, String>
         Ok(decoded) => decoded,
         Err(message) => return Ok(failure(&message)),
     };
-    detect_pixels(&rgb, width, height, capture_references)
+    detect_pixels(&rgb, width, height, capture_references, hold_references)
 }
 
 #[tauri::command]
@@ -1672,14 +1734,17 @@ pub async fn detect_image(
     state: tauri::State<'_, FrameState>,
     image: Option<String>,
     capture_references: Option<bool>,
+    hold_references: Option<bool>,
 ) -> Result<Value, String> {
     // Test mode passes the chosen file. A live detect leaves this empty and
     // uses the raw frame stored by capture_snapshot. Saving references stores
     // each surviving box's embedding under its IC. It does not change the result.
+    // The preview asks to hold those vectors, then saves only the selected boxes.
     let capture_references = capture_references.unwrap_or(false);
+    let hold_references = hold_references.unwrap_or(false);
     if let Some(text) = image.filter(|value| !value.trim().is_empty()) {
         return tauri::async_runtime::spawn_blocking(move || {
-            detect_encoded(&text, capture_references)
+            detect_encoded(&text, capture_references, hold_references)
         })
         .await
         .map_err(|_| "Detect failed".to_string())?;
@@ -1688,9 +1753,11 @@ pub async fn detect_image(
         let guard = state.latest.lock().unwrap_or_else(|err| err.into_inner());
         guard.clone()
     };
-    tauri::async_runtime::spawn_blocking(move || detect_raw(frame, capture_references))
-        .await
-        .map_err(|_| "Detect failed".to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        detect_raw(frame, capture_references, hold_references)
+    })
+    .await
+    .map_err(|_| "Detect failed".to_string())?
 }
 
 const BENCHMARK_RUNS: usize = 5;

@@ -1036,6 +1036,7 @@ function unlock() {
 	gateMessage = "";
 	unlocked = true;
 	sessionStorage.setItem(UNLOCK_KEY, "1");
+	postPreviewAdmin();
 	loadSource();
 	void loadInference();
 	if (section === "camera") void loadCameraSettings();
@@ -1054,6 +1055,7 @@ function lock() {
 	gateMessage = "";
 	mssqlPassword = "";
 	sessionStorage.removeItem(UNLOCK_KEY);
+	postPreviewAdmin();
 }
 
 async function saveScan() {
@@ -2073,6 +2075,19 @@ function patchCameraFocus(
 	document.camera = camera;
 }
 
+function postPreviewAdmin() {
+	const channel = new BroadcastChannel(PREVIEW_CHANNEL);
+	channel.postMessage({ admin: unlocked });
+	channel.close();
+}
+
+function onPreviewMessage(event: MessageEvent) {
+	onPreviewFocus(event);
+	const data = event.data;
+	if (!data || typeof data !== "object" || data.ready !== true) return;
+	postPreviewAdmin();
+}
+
 function onPreviewFocus(event: MessageEvent) {
 	const data = event.data;
 	if (!data || typeof data !== "object" || !("focus" in data)) return;
@@ -2103,6 +2118,7 @@ function postPreviewIndex(index: number) {
 	channel.postMessage({
 		index,
 		displayFps: readDisplayFps(cameraDisplayFps),
+		admin: unlocked,
 	});
 	channel.close();
 }
@@ -2156,7 +2172,7 @@ async function openPreview() {
 		previewNotice = "Choose a camera first.";
 		return;
 	}
-	const url = `/camera-preview?index=${index}`;
+	const url = `/camera-preview?index=${index}${unlocked ? "&admin=1" : ""}`;
 	if (!inTauri()) {
 		const popup = window.open(url, PREVIEW_LABEL, "popup,width=800,height=600");
 		if (!popup) {
@@ -2209,7 +2225,7 @@ function onWindowFocus() {
 
 onMount(() => {
 	previewChannel = new BroadcastChannel(PREVIEW_CHANNEL);
-	previewChannel.onmessage = onPreviewFocus;
+	previewChannel.onmessage = onPreviewMessage;
 	window.addEventListener("focus", onWindowFocus);
 	void loadInference();
 	if (!unlocked) {
