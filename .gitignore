@@ -34,3 +34,8 @@ runs/
 src-tauri/models/
 # OpenVINO runtime the installer copies next to the exe. Too large for git.
 src-tauri/openvino/
+# Local OpenVINO plugin hunt: error log, pyke archive, and the Python wheel extract.
+/ov-error.txt
+src-tauri/ov-extract/
+vision/ov_wheel/
+vision/*.whl
