@@ -10,7 +10,8 @@
 //! it with DINOv2 only, then stores the one vector under an IC they choose.
 //! The map is kept in memory and written to `vision/dinov2-references.json`.
 //! A later detection logs the best cosine score against those references.
-//! A box counts toward its IC only when that score is above the saved threshold.
+//! A box counts toward its IC only when that score is above that IC's threshold.
+//! An IC with no saved threshold uses the Training match score.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -19,7 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 use serde::{Deserialize, Serialize};
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 use tauri_plugin_dialog::DialogExt;
 
 use crate::detect;
@@ -28,6 +29,23 @@ use crate::inference_ep::{self, Provider};
 const FILE_NAME: &str = "dinov2_vits14.onnx";
 const REFERENCES_FILE: &str = "dinov2-references.json";
 const REFERENCES_VERSION: u32 = 1;
+const MIN_REFERENCE_THRESHOLD: f32 = 0.50;
+const MAX_REFERENCE_THRESHOLD: f32 = 0.95;
+
+/// Vectors for each IC, plus an optional threshold that overrides the Training score.
+struct ReferenceBook {
+    vectors: HashMap<String, Vec<Vec<f32>>>,
+    thresholds: HashMap<String, f32>,
+}
+
+impl ReferenceBook {
+    fn empty() -> Self {
+        Self {
+            vectors: HashMap::new(),
+            thresholds: HashMap::new(),
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Dinov2Port {
@@ -51,8 +69,8 @@ struct State {
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
-static REFERENCES: LazyLock<Mutex<HashMap<String, Vec<Vec<f32>>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static REFERENCES: LazyLock<Mutex<ReferenceBook>> =
+    LazyLock::new(|| Mutex::new(ReferenceBook::empty()));
 static HELD: LazyLock<Mutex<Vec<Option<HeldEmbed>>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 static FRAME: LazyLock<Mutex<Option<HeldFrame>>> = LazyLock::new(|| Mutex::new(None));
 static MARQUEE: LazyLock<Mutex<Option<Vec<f32>>>> = LazyLock::new(|| Mutex::new(None));
@@ -279,7 +297,7 @@ pub(crate) fn embed_debug_crop(
 
 #[cfg(test)]
 pub(crate) fn clear_references() {
-    lock(&REFERENCES).clear();
+    *lock(&REFERENCES) = ReferenceBook::empty();
 }
 
 /// Replace the vectors held for a later admin save. One entry per detection.
@@ -338,7 +356,7 @@ pub(crate) fn hold_marquee(values: Vec<f32>) {
 /// Append one reference. Returns how many vectors are now stored for this IC.
 pub(crate) fn remember(class_name: &str, values: &[f32]) -> usize {
     let mut guard = lock(&REFERENCES);
-    let list = guard.entry(class_name.to_string()).or_default();
+    let list = guard.vectors.entry(class_name.to_string()).or_default();
     list.push(values.to_vec());
     list.len()
 }
@@ -352,10 +370,21 @@ pub(crate) fn reference_counts(score: Option<f32>, threshold: f32) -> Option<boo
     Some(score > threshold)
 }
 
+/// The threshold the next detection uses for this IC.
+/// A saved value overrides the Training match score passed as `fallback`.
+pub(crate) fn threshold_for(class_name: &str, fallback: f32) -> f32 {
+    lock(&REFERENCES)
+        .thresholds
+        .get(class_name)
+        .copied()
+        .filter(|value| value.is_finite())
+        .unwrap_or(fallback)
+}
+
 /// Best cosine similarity against the references stored for this IC.
 pub(crate) fn best_similarity(class_name: &str, values: &[f32]) -> Option<f32> {
     let guard = lock(&REFERENCES);
-    let list = guard.get(class_name)?;
+    let list = guard.vectors.get(class_name)?;
     let mut best: Option<f32> = None;
     for reference in list {
         let Some(score) = cosine(values, reference) else {
@@ -370,11 +399,32 @@ pub(crate) fn best_similarity(class_name: &str, values: &[f32]) -> Option<f32> {
 struct ReferenceFile {
     version: u32,
     references: HashMap<String, Vec<Vec<f32>>>,
+    /// Per-IC overrides. Missing means the Training match score.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    thresholds: HashMap<String, f32>,
+}
+
+/// Keep a finite score inside 0.50 to 0.95, rounded to two decimal places.
+fn stored_threshold(value: f32) -> Option<f32> {
+    if !value.is_finite() {
+        return None;
+    }
+    let clamped = value.clamp(MIN_REFERENCE_THRESHOLD, MAX_REFERENCE_THRESHOLD);
+    let rounded = (clamped * 100.0).round() / 100.0;
+    if rounded.is_finite() {
+        Some(rounded)
+    } else {
+        None
+    }
 }
 
 fn references_path() -> Result<PathBuf, String> {
     let root = crate::local_config::project_root()?;
     Ok(root.join("vision").join(REFERENCES_FILE))
+}
+
+fn log_references_path(path: &Path) {
+    eprintln!("DINOv2 references path: {}", path.display());
 }
 
 /// Load the file next to config.local.json. A missing file leaves memory as it is.
@@ -389,7 +439,7 @@ pub(crate) fn load_saved_references() {
     };
     match load_references_from(&path) {
         Ok(true) => {
-            let classes = lock(&REFERENCES).len();
+            let classes = lock(&REFERENCES).vectors.len();
             eprintln!(
                 "DINOv2 references loaded: {classes} classes from {}",
                 path.display()
@@ -400,27 +450,41 @@ pub(crate) fn load_saved_references() {
     }
 }
 
-fn parse_reference_map(text: &str) -> Result<HashMap<String, Vec<Vec<f32>>>, &'static str> {
+fn parse_reference_map(text: &str) -> Result<ReferenceBook, &'static str> {
     let file: ReferenceFile = serde_json::from_str(text).map_err(|_| "json")?;
     if file.version != REFERENCES_VERSION {
         return Err("version");
     }
-    let mut clean = HashMap::new();
-    for (name, vectors) in file.references {
+    let mut vectors = HashMap::new();
+    for (name, list) in file.references {
         let name = name.trim();
         if name.is_empty() {
             continue;
         }
-        let kept: Vec<Vec<f32>> = vectors
+        let kept: Vec<Vec<f32>> = list
             .into_iter()
             .filter(|values| !values.is_empty() && values.iter().all(|value| value.is_finite()))
             .collect();
         if kept.is_empty() {
             continue;
         }
-        clean.insert(name.to_string(), kept);
+        vectors.insert(name.to_string(), kept);
     }
-    Ok(clean)
+    let mut thresholds = HashMap::new();
+    for (name, value) in file.thresholds {
+        let name = name.trim();
+        if name.is_empty() || !vectors.contains_key(name) {
+            continue;
+        }
+        let Some(stored) = stored_threshold(value) else {
+            continue;
+        };
+        thresholds.insert(name.to_string(), stored);
+    }
+    Ok(ReferenceBook {
+        vectors,
+        thresholds,
+    })
 }
 
 /// `Ok(true)` when a file was read. `Ok(false)` when the file is absent.
@@ -493,7 +557,7 @@ pub(crate) fn install_reference_file(source: &Path, dest: &Path) -> Result<usize
     if !same_file(source, dest) {
         replace_reference_bytes(dest, text.as_bytes())?;
     }
-    let count = clean.len();
+    let count = clean.vectors.len();
     *lock(&REFERENCES) = clean;
     Ok(count)
 }
@@ -506,24 +570,40 @@ pub(crate) fn references_loaded_message(classes: usize) -> String {
 pub struct ReferenceUpdate {
     pub classes: usize,
     pub message: String,
+    pub path: String,
 }
 
-/// Replace `vision/dinov2-references.json` with the chosen file and load it.
-/// Cancel leaves the saved file and the in-memory map as they are.
-/// The next detection uses the loaded embeddings. The app does not need a restart.
-#[tauri::command]
-pub fn update_references(app: AppHandle) -> Result<ReferenceUpdate, String> {
-    let picked = app
+fn reference_update(path: &Path, classes: usize, message: String) -> ReferenceUpdate {
+    ReferenceUpdate {
+        classes,
+        message,
+        path: path.display().to_string(),
+    }
+}
+
+/// Native JSON picker, then replace the saved file and the in-memory book.
+/// The dialog runs off the main thread. A panic becomes a status string.
+fn install_picked_references(app: AppHandle, dest: PathBuf) -> Result<ReferenceUpdate, String> {
+    let mut picker = app
         .dialog()
         .file()
-        .add_filter("dinov2-references.json", &["json"])
-        .set_title("Update references")
-        .blocking_pick_file();
+        .add_filter("JSON", &["json"])
+        .set_title("Update references");
+    if let Some(window) = app.get_webview_window("main") {
+        picker = picker.set_parent(&window);
+    }
+    if let Some(dir) = dest.parent() {
+        if dir.is_dir() {
+            picker = picker.set_directory(dir);
+        }
+    }
+    let picked = picker.blocking_pick_file();
     let Some(picked) = picked else {
-        return Ok(ReferenceUpdate {
-            classes: lock(&REFERENCES).len(),
-            message: "No file selected.".to_string(),
-        });
+        return Ok(reference_update(
+            &dest,
+            lock(&REFERENCES).vectors.len(),
+            "No file selected.".to_string(),
+        ));
     };
     let source = match picked.into_path() {
         Ok(path) => path,
@@ -536,23 +616,157 @@ pub fn update_references(app: AppHandle) -> Result<ReferenceUpdate, String> {
     {
         return Err("Selected file is not a valid DINOv2 reference file.".to_string());
     }
-    let dest = references_path()?;
     let classes = install_reference_file(&source, &dest)?;
     eprintln!(
         "DINOv2 references loaded: {classes} classes from {}",
         dest.display()
     );
-    Ok(ReferenceUpdate {
+    Ok(reference_update(
+        &dest,
         classes,
-        message: references_loaded_message(classes),
+        references_loaded_message(classes),
+    ))
+}
+
+/// Replace `vision/dinov2-references.json` with the chosen file and load it.
+/// Cancel leaves the saved file and the in-memory map as they are.
+/// The next detection uses the loaded embeddings. The app does not need a restart.
+///
+/// The picker is the native file dialog and accepts `.json`. It does not run on
+/// the main thread: a sync command blocks that thread, and the dialog waits for it.
+#[tauri::command]
+pub async fn update_references(app: AppHandle) -> Result<ReferenceUpdate, String> {
+    let dest = references_path()?;
+    log_references_path(&dest);
+    let joined = tauri::async_runtime::spawn_blocking(move || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            install_picked_references(app, dest)
+        }))
+    })
+    .await;
+    match joined {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) | Err(_) => Err("Could not update the references".to_string()),
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ReferenceRow {
+    pub ic: String,
+    /// Saved override. Absent when this IC uses the Training match score.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<f32>,
+    pub count: usize,
+}
+
+/// One row per saved IC, sorted by IC.
+pub(crate) fn reference_rows() -> Vec<ReferenceRow> {
+    let guard = lock(&REFERENCES);
+    let mut rows: Vec<ReferenceRow> = guard
+        .vectors
+        .iter()
+        .map(|(ic, vectors)| ReferenceRow {
+            ic: ic.clone(),
+            threshold: guard.thresholds.get(ic).copied(),
+            count: vectors.len(),
+        })
+        .collect();
+    rows.sort_by(|left, right| left.ic.cmp(&right.ic));
+    rows
+}
+
+/// Store one IC's threshold and write the reference file.
+/// The next detection reads this value from memory.
+pub(crate) fn apply_reference_threshold(ic: &str, threshold: f32) -> Result<ReferenceRow, String> {
+    let ic = ic.trim();
+    if ic.is_empty() {
+        return Err("That IC is not saved.".to_string());
+    }
+    let Some(stored) = stored_threshold(threshold) else {
+        return Err("Enter a threshold from 0.50 to 0.95.".to_string());
+    };
+    let row = {
+        let mut guard = lock(&REFERENCES);
+        if !guard.vectors.contains_key(ic) {
+            return Err("That IC is not saved.".to_string());
+        }
+        guard.thresholds.insert(ic.to_string(), stored);
+        ReferenceRow {
+            ic: ic.to_string(),
+            threshold: Some(stored),
+            count: guard.vectors.get(ic).map(Vec::len).unwrap_or(0),
+        }
+    };
+    persist_references();
+    Ok(row)
+}
+
+/// Remove one IC from memory and from the reference file.
+pub(crate) fn remove_reference(ic: &str) -> Result<(), String> {
+    let ic = ic.trim();
+    {
+        let mut guard = lock(&REFERENCES);
+        if guard.vectors.remove(ic).is_none() {
+            return Err("That IC is not saved.".to_string());
+        }
+        guard.thresholds.remove(ic);
+    }
+    persist_references();
+    Ok(())
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ReferenceList {
+    pub path: String,
+    pub rows: Vec<ReferenceRow>,
+}
+
+/// Read one reference file into memory and return its rows.
+/// A missing file is an empty list and does not clear memory.
+/// Invalid JSON and permission errors are returned and leave memory unchanged.
+pub(crate) fn reference_list_from(path: &Path) -> Result<ReferenceList, String> {
+    let rows = match load_references_from(path)? {
+        true => reference_rows(),
+        false => Vec::new(),
+    };
+    Ok(ReferenceList {
+        path: path.display().to_string(),
+        rows,
     })
 }
 
+#[tauri::command]
+pub async fn list_references() -> Result<ReferenceList, String> {
+    let path = references_path()?;
+    log_references_path(&path);
+    let joined = tauri::async_runtime::spawn_blocking(move || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| reference_list_from(&path)))
+    })
+    .await;
+    match joined {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) | Err(_) => Err("Could not load the references".to_string()),
+    }
+}
+
+#[tauri::command]
+pub fn set_reference_threshold(ic: String, threshold: f64) -> Result<ReferenceRow, String> {
+    apply_reference_threshold(&ic, threshold as f32)
+}
+
+#[tauri::command]
+pub fn delete_reference(ic: String) -> Result<(), String> {
+    remove_reference(&ic)
+}
+
 pub(crate) fn save_references_to(path: &Path) -> Result<(), String> {
+    let guard = lock(&REFERENCES);
     let file = ReferenceFile {
         version: REFERENCES_VERSION,
-        references: lock(&REFERENCES).clone(),
+        references: guard.vectors.clone(),
+        thresholds: guard.thresholds.clone(),
     };
+    drop(guard);
     let mut text = serde_json::to_string(&file)
         .map_err(|_| "Could not write DINOv2 references.".to_string())?;
     if !text.ends_with('\n') {
@@ -616,7 +830,8 @@ fn embed_crops(
             Ok(values) => {
                 // Score against the references already stored, then append.
                 let matched = best_similarity(crop.class_name, &values);
-                let counts = reference_counts(matched, threshold);
+                let cutoff = threshold_for(crop.class_name, threshold);
+                let counts = reference_counts(matched, cutoff);
                 if store {
                     let count = remember(crop.class_name, &values);
                     stored.insert(crop.class_name.to_string(), count);
@@ -717,15 +932,15 @@ fn store_grouped(
             continue;
         };
         if replace {
-            guard.insert(ic.clone(), vectors);
+            guard.vectors.insert(ic.clone(), vectors);
         } else {
-            guard.entry(ic.clone()).or_default().extend(vectors);
+            guard.vectors.entry(ic.clone()).or_default().extend(vectors);
         }
     }
     let mut rows: Vec<(String, usize)> = order
         .into_iter()
         .map(|ic| {
-            let count = guard.get(&ic).map(Vec::len).unwrap_or(0);
+            let count = guard.vectors.get(&ic).map(Vec::len).unwrap_or(0);
             (ic, count)
         })
         .collect();
@@ -1431,6 +1646,172 @@ mod tests {
             Some(1.0)
         );
         assert_eq!(references_loaded_message(1), "References loaded 1 ICs.");
+
+        clear_references();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn per_ic_threshold_is_saved_and_gates_the_next_count() {
+        let _hold = lock_for_test();
+        clear_references();
+        remember("OK", &[1.0, 0.0, 0.0, 0.0]);
+        remember("OK", &[0.0, 1.0, 0.0, 0.0]);
+        remember("6PBB33", &[0.0, 0.0, 1.0, 0.0]);
+        apply_reference_threshold("OLD", 0.8).unwrap_err();
+        let row = apply_reference_threshold(" OK ", 0.91).unwrap();
+        assert_eq!(row.ic, "OK");
+        assert_eq!(row.threshold, Some(0.91));
+        assert_eq!(row.count, 2);
+        assert!((threshold_for("OK", 0.70) - 0.91).abs() < 0.0001);
+        assert!((threshold_for("6PBB33", 0.70) - 0.70).abs() < 0.0001);
+        assert_eq!(
+            reference_counts(Some(0.80), threshold_for("OK", 0.70)),
+            Some(false)
+        );
+        assert_eq!(
+            reference_counts(Some(0.80), threshold_for("6PBB33", 0.70)),
+            Some(true)
+        );
+        assert_eq!(apply_reference_threshold("OK", 0.10).unwrap().threshold, Some(0.50));
+        assert_eq!(apply_reference_threshold("OK", 1.2).unwrap().threshold, Some(0.95));
+        let kept = apply_reference_threshold("OK", f32::NAN).unwrap_err();
+        assert!(kept.contains("0.50"), "{kept}");
+        assert!((threshold_for("OK", 0.70) - 0.95).abs() < 0.0001);
+
+        let path = std::env::temp_dir().join(format!(
+            "ls-vision-dino-threshold-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        save_references_to(&path).unwrap();
+        clear_references();
+        assert!((threshold_for("OK", 0.70) - 0.70).abs() < 0.0001);
+        assert_eq!(load_references_from(&path).unwrap(), true);
+        assert!((threshold_for("OK", 0.70) - 0.95).abs() < 0.0001);
+        assert_eq!(best_similarity("OK", &[1.0, 0.0, 0.0, 0.0]), Some(1.0));
+        assert_eq!(reference_rows().len(), 2);
+        let listed = reference_rows();
+        assert_eq!(listed[0].ic, "6PBB33");
+        assert_eq!(listed[0].threshold, None);
+        assert_eq!(listed[0].count, 1);
+        assert_eq!(listed[1].ic, "OK");
+        assert_eq!(listed[1].threshold, Some(0.95));
+
+        remove_reference("OK").unwrap();
+        assert!(best_similarity("OK", &[1.0, 0.0, 0.0, 0.0]).is_none());
+        assert!((threshold_for("OK", 0.70) - 0.70).abs() < 0.0001);
+        assert_eq!(best_similarity("6PBB33", &[0.0, 0.0, 1.0, 0.0]), Some(1.0));
+        let missing = remove_reference("OK").unwrap_err();
+        assert!(missing.contains("not saved"), "{missing}");
+        save_references_to(&path).unwrap();
+        clear_references();
+        assert_eq!(load_references_from(&path).unwrap(), true);
+        assert!(best_similarity("OK", &[1.0, 0.0, 0.0, 0.0]).is_none());
+        assert_eq!(best_similarity("6PBB33", &[0.0, 0.0, 1.0, 0.0]), Some(1.0));
+        assert_eq!(reference_rows().len(), 1);
+
+        let dir = path.parent().unwrap().join(format!(
+            "ls-vision-dino-threshold-import-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("dinov2-references.json");
+        let dest = dir.join("installed").join("dinov2-references.json");
+        std::fs::write(
+            &source,
+            concat!(
+                r#"{"version":1,"references":{"#,
+                r#""OK":[[1.0,0.0,0.0,0.0]],"#,
+                r#""6PBB33":[[0.0,0.0,1.0,0.0]],"#,
+                r#"" ":[[1.0]]"#,
+                r#"},"thresholds":{"OK":0.91,"GONE":0.8,"OK ":null,"6PBB33":"nope"}}"#,
+            ),
+        )
+        .unwrap();
+        // A bad threshold value makes the whole file invalid, so memory stays.
+        assert!(install_reference_file(&source, &dest).is_err());
+        assert_eq!(best_similarity("6PBB33", &[0.0, 0.0, 1.0, 0.0]), Some(1.0));
+
+        std::fs::write(
+            &source,
+            concat!(
+                r#"{"version":1,"references":{"#,
+                r#""OK":[[1.0,0.0,0.0,0.0],[0.0,1.0,0.0,0.0]],"#,
+                r#""6PBB33":[[0.0,0.0,1.0,0.0]]"#,
+                r#"},"thresholds":{"OK":0.82,"6PBB33":1.4,"GONE":1.4," ":0.6}}"#,
+            ),
+        )
+        .unwrap();
+        assert_eq!(install_reference_file(&source, &dest).unwrap(), 2);
+        assert!((threshold_for("OK", 0.70) - 0.82).abs() < 0.0001);
+        assert!((threshold_for("6PBB33", 0.70) - 0.95).abs() < 0.0001);
+        assert!((threshold_for("GONE", 0.70) - 0.70).abs() < 0.0001);
+        assert_eq!(
+            reference_counts(Some(0.80), threshold_for("OK", 0.70)),
+            Some(false)
+        );
+        assert_eq!(
+            reference_counts(Some(0.96), threshold_for("6PBB33", 0.70)),
+            Some(true)
+        );
+
+        let plain = dir.join("plain.json");
+        std::fs::write(
+            &plain,
+            r#"{"version":1,"references":{"6PBB33":[[0.0,0.0,1.0,0.0]]}}"#,
+        )
+        .unwrap();
+        assert_eq!(install_reference_file(&plain, &dest).unwrap(), 1);
+        assert!(best_similarity("OK", &[1.0, 0.0, 0.0, 0.0]).is_none());
+        assert!((threshold_for("OK", 0.70) - 0.70).abs() < 0.0001);
+        assert!((threshold_for("6PBB33", 0.70) - 0.70).abs() < 0.0001);
+
+        clear_references();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reference_list_reads_the_same_file_and_reports_a_missing_or_invalid_one() {
+        let _hold = lock_for_test();
+        clear_references();
+        let dir = std::env::temp_dir().join(format!(
+            "ls-vision-dino-list-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dinov2-references.json");
+
+        let missing = reference_list_from(&path).unwrap();
+        assert!(missing.rows.is_empty());
+        assert!(missing.path.ends_with("dinov2-references.json"));
+
+        std::fs::write(&path, "{not json").unwrap();
+        let err = reference_list_from(&path).unwrap_err();
+        assert!(err.contains("not valid JSON"), "{err}");
+        assert!(reference_rows().is_empty());
+
+        std::fs::write(
+            &path,
+            r#"{"version":1,"references":{"OK":[[1.0,0.0]]}}"#,
+        )
+        .unwrap();
+        let list = reference_list_from(&path).unwrap();
+        assert_eq!(list.rows.len(), 1);
+        assert_eq!(list.rows[0].ic, "OK");
+        assert_eq!(list.rows[0].count, 1);
+
+        std::fs::write(&path, "{").unwrap();
+        let err = reference_list_from(&path).unwrap_err();
+        assert!(err.contains("not valid JSON"), "{err}");
+        assert_eq!(reference_rows().len(), 1);
+
+        std::fs::write(&path, r#"{"version":1,"references":{}}"#).unwrap();
+        let empty = reference_list_from(&path).unwrap();
+        assert!(empty.rows.is_empty());
 
         clear_references();
         let _ = std::fs::remove_dir_all(&dir);

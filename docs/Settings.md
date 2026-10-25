@@ -28,7 +28,9 @@ Settings are stored in `vision/config.local.json` (gitignored). The unlock passw
 
 Training lists `.pt` and `.onnx` files in the app data models folder. Update model copies an `.onnx` file over the selected `.onnx` name, or over `best.onnx`. The selected basename is `model` in `vision/config.local.json`. Detection runs only for `.onnx`, and the next run loads the copied file.
 
-Update references, under that control, copies a chosen `dinov2-references.json` over `vision/dinov2-references.json` and loads those embeddings. The status line is "References loaded N ICs." The next detection uses them. A file that is not a valid reference file is refused, and the saved file stays in place.
+Update references, under that control, opens a native file dialog that accepts `.json`. The chosen file replaces `vision/dinov2-references.json`, beside `vision/config.local.json`, and loads those embeddings. The status line is "References loaded N ICs." The next detection uses them. A missing file, a file that is not valid JSON, or a permission error stays on that status line. Cancel says "No file selected." The saved file and the in-memory map stay in place when the chosen file is refused.
+
+View references, under that button, reads that same file and opens a table of each saved IC, its threshold, and how many embeddings it has. The dialog shows the file path. A missing or empty file says "No references loaded." The IC and threshold columns sort. Editing a threshold, or deleting an IC, writes `vision/dinov2-references.json` and the in-memory map. The next detection uses that change. An IC with no saved threshold uses the Training match score. Close returns to Settings.
 
 ## Part rules
 
