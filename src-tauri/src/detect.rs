@@ -1579,6 +1579,7 @@ fn detect_pixels(
                     );
                     if hold_references {
                         crate::dinov2::hold_embeddings(held);
+                        crate::dinov2::hold_frame(rgb, width, height);
                     }
                     Ok(json!({
                         "detections": detections,
@@ -1592,6 +1593,7 @@ fn detect_pixels(
         DetectPlan::Idle => {
             if hold_references {
                 crate::dinov2::hold_embeddings(Vec::new());
+                crate::dinov2::clear_held_frame();
             }
             return Ok(json!([]));
         }
@@ -1626,6 +1628,7 @@ fn detect_pixels(
     }
     if hold_references {
         crate::dinov2::hold_embeddings(held_all);
+        crate::dinov2::hold_frame(rgb, width, height);
     }
     Ok(Value::Array(rows))
 }
@@ -1740,6 +1743,7 @@ pub async fn detect_image(
     // uses the raw frame stored by capture_snapshot. Saving references stores
     // each surviving box's embedding under its IC. It does not change the result.
     // The preview asks to hold those vectors, then saves only the selected boxes.
+    // The same call keeps this RGB frame so a marquee can embed one crop without YOLO.
     let capture_references = capture_references.unwrap_or(false);
     let hold_references = hold_references.unwrap_or(false);
     if let Some(text) = image.filter(|value| !value.trim().is_empty()) {

@@ -87,6 +87,15 @@ type DetectMark = {
 	embed: boolean;
 };
 
+type Region = {
+	x: number;
+	y: number;
+	w: number;
+	h: number;
+};
+
+const MIN_MARQUEE = 8;
+
 const DETECT_COLORS = [
 	"rgb(60, 180, 0)",
 	"rgb(255, 165, 0)",
@@ -115,6 +124,23 @@ let saveMode: "append" | "replace" = "append";
 let saveBusy = false;
 let saveNote = "";
 let saveGeneration = 0;
+let sourceW = 0;
+let sourceH = 0;
+let detectImgEl: HTMLImageElement | undefined;
+let classNames: string[] = [];
+let marquee: Region | null = null;
+let marqueeDraft: Region | null = null;
+let marqueeIc = "";
+let marqueeBusy = false;
+let marqueeReady = false;
+let marqueeNote = "";
+let marqueeGen = 0;
+let drawing = false;
+let drawOrigin = { x: 0, y: 0 };
+
+$: shownMarquee = marqueeDraft ?? marquee;
+$: marqueeCursor =
+	admin && !!detectImage && !spaceDown && !panning && !snapshotOpen;
 
 function formatStatus(body: PreviewBody, canvasRate: string): string {
 	const width = body.width;
@@ -435,6 +461,20 @@ function onKeyDown(event: KeyboardEvent) {
 		void takeSnapshot();
 		return;
 	}
+	if (
+		event.key === "Escape" &&
+		!snapshotOpen &&
+		(drawing || marquee || marqueeDraft || marqueeNote)
+	) {
+		event.preventDefault();
+		forgetMarquee("vector");
+		return;
+	}
+	if (event.key === "Enter" && marqueeField(event)) {
+		event.preventDefault();
+		void saveMarquee();
+		return;
+	}
 	if (event.key === "Escape" && !snapshotOpen && detectImage) {
 		event.preventDefault();
 		clearDetect();
@@ -462,21 +502,117 @@ function onKeyUp(event: KeyboardEvent) {
 	if (event.code === "Space") releaseSpace();
 }
 
+function marqueeField(event: KeyboardEvent): boolean {
+	const target = event.target;
+	return target instanceof HTMLInputElement && target.id === "marquee-ic";
+}
+
+function eventOnDetection(event: Event): boolean {
+	const target = event.target;
+	return (
+		target instanceof Element && target.closest("[data-detection]") !== null
+	);
+}
+
+function previewPoint(event: PointerEvent): { x: number; y: number } | null {
+	const node = detectImgEl;
+	if (!node || detectW < 1 || detectH < 1) return null;
+	const rect = node.getBoundingClientRect();
+	if (rect.width < 1 || rect.height < 1) return null;
+	const x = ((event.clientX - rect.left) / rect.width) * detectW;
+	const y = ((event.clientY - rect.top) / rect.height) * detectH;
+	return {
+		x: Math.min(detectW, Math.max(0, x)),
+		y: Math.min(detectH, Math.max(0, y)),
+	};
+}
+
+function regionFrom(
+	origin: { x: number; y: number },
+	point: { x: number; y: number },
+): Region {
+	return {
+		x: Math.min(origin.x, point.x),
+		y: Math.min(origin.y, point.y),
+		w: Math.abs(point.x - origin.x),
+		h: Math.abs(point.y - origin.y),
+	};
+}
+
+function toSource(region: Region): Region | null {
+	if (detectW < 1 || detectH < 1 || sourceW < 1 || sourceH < 1) return null;
+	return {
+		x: (region.x * sourceW) / detectW,
+		y: (region.y * sourceH) / detectH,
+		w: (region.w * sourceW) / detectW,
+		h: (region.h * sourceH) / detectH,
+	};
+}
+
+function forgetMarquee(mode: "vector" | "frame" | "view") {
+	marqueeGen += 1;
+	marquee = null;
+	marqueeDraft = null;
+	drawing = false;
+	marqueeReady = false;
+	marqueeBusy = false;
+	marqueeNote = "";
+	if (mode === "view") return;
+	const command =
+		mode === "frame" ? "release_preview_frame" : "clear_marquee_reference";
+	void invoke(command).catch(() => {
+		// The next detect replaces the held still.
+	});
+}
+
 function onPointerDown(event: PointerEvent) {
-	if (!spaceDown || event.button !== 0 || zoom <= 1 || snapshotOpen) return;
-	panning = true;
-	panOrigin = { x: event.clientX, y: event.clientY, panX, panY };
+	if (snapshotOpen || event.button !== 0) return;
+	if (spaceDown && zoom > 1) {
+		panning = true;
+		panOrigin = { x: event.clientX, y: event.clientY, panX, panY };
+		viewportEl?.setPointerCapture(event.pointerId);
+		return;
+	}
+	if (!admin || !detectImage || spaceDown || drawing || eventOnDetection(event))
+		return;
+	const point = previewPoint(event);
+	if (!point) return;
+	drawing = true;
+	drawOrigin = point;
+	marqueeDraft = { x: point.x, y: point.y, w: 0, h: 0 };
 	viewportEl?.setPointerCapture(event.pointerId);
 }
 
 function onPointerMove(event: PointerEvent) {
-	if (!panning) return;
-	panX = panOrigin.panX + (event.clientX - panOrigin.x);
-	panY = panOrigin.panY + (event.clientY - panOrigin.y);
-	clampPan();
+	if (panning) {
+		panX = panOrigin.panX + (event.clientX - panOrigin.x);
+		panY = panOrigin.panY + (event.clientY - panOrigin.y);
+		clampPan();
+		return;
+	}
+	if (!drawing) return;
+	const point = previewPoint(event);
+	if (!point) return;
+	marqueeDraft = regionFrom(drawOrigin, point);
 }
 
-function endPan() {
+function onPointerUp(event: PointerEvent) {
+	if (panning) {
+		panning = false;
+		return;
+	}
+	if (!drawing) return;
+	drawing = false;
+	const point = previewPoint(event);
+	const draft = point ? regionFrom(drawOrigin, point) : marqueeDraft;
+	marqueeDraft = null;
+	if (!draft || draft.w < MIN_MARQUEE || draft.h < MIN_MARQUEE) return;
+	void commitMarquee(draft);
+}
+
+function onPointerCancel() {
+	drawing = false;
+	marqueeDraft = null;
 	panning = false;
 }
 
@@ -700,12 +836,15 @@ function clearDetect() {
 	detectImage = "";
 	detectW = 0;
 	detectH = 0;
+	sourceW = 0;
+	sourceH = 0;
 	detectMarks = [];
 	detectNote = "";
 	selected = [];
 	saveNote = "";
 	saveGeneration += 1;
 	saveBusy = false;
+	forgetMarquee("frame");
 }
 
 async function refreshModel() {
@@ -739,6 +878,7 @@ async function runDetect() {
 	selected = [];
 	saveNote = "";
 	saveGeneration += 1;
+	forgetMarquee("vector");
 	try {
 		const snap = await invoke<PreviewBody>("capture_snapshot", {
 			index: camera,
@@ -746,8 +886,11 @@ async function runDetect() {
 		if (closed || gen !== detectGeneration || camera !== index) return;
 		if (snap.status === "fail") {
 			detectImage = "";
+			sourceW = 0;
+			sourceH = 0;
 			detectMarks = [];
 			detectNote = snap.message || "No frame.";
+			forgetMarquee("frame");
 			return;
 		}
 		const body = await invoke<DetectBody>("detect_image", {
@@ -757,8 +900,11 @@ async function runDetect() {
 		const message = typeof body.message === "string" ? body.message.trim() : "";
 		if (message) {
 			detectImage = "";
+			sourceW = 0;
+			sourceH = 0;
 			detectMarks = [];
 			detectNote = message;
+			forgetMarquee("frame");
 			if (
 				message === "Model is missing." ||
 				message.includes("is a .pt file") ||
@@ -770,6 +916,9 @@ async function runDetect() {
 		}
 		const fullW = typeof snap.width === "number" ? snap.width : width;
 		const fullH = typeof snap.height === "number" ? snap.height : height;
+		forgetMarquee("view");
+		sourceW = fullW;
+		sourceH = fullH;
 		detectImage = image;
 		detectW = width;
 		detectH = height;
@@ -781,11 +930,15 @@ async function runDetect() {
 			height,
 		);
 		detectNote = "";
+		if (admin) void loadClassNames();
 	} catch (err: unknown) {
 		if (closed || gen !== detectGeneration) return;
 		detectImage = "";
+		sourceW = 0;
+		sourceH = 0;
 		detectMarks = [];
 		detectNote = invokeMessage(err, "Detect failed.");
+		forgetMarquee("frame");
 	} finally {
 		if (gen === detectGeneration) detectBusy = false;
 	}
@@ -793,7 +946,12 @@ async function runDetect() {
 
 function applyAdmin(next: boolean) {
 	admin = next;
-	if (!next) selected = [];
+	if (!next) {
+		selected = [];
+		forgetMarquee("vector");
+	} else if (detectImage) {
+		void loadClassNames();
+	}
 	try {
 		if (next) sessionStorage.setItem(ADMIN_FLAG, "1");
 		else sessionStorage.removeItem(ADMIN_FLAG);
@@ -835,6 +993,76 @@ function onMarkClick(event: MouseEvent, index: number) {
 
 function markSelected(index: number): boolean {
 	return selected.includes(index);
+}
+
+async function loadClassNames() {
+	try {
+		const data = await invoke<{ classes?: unknown }>("model_class_names");
+		if (closed) return;
+		classNames = Array.isArray(data.classes)
+			? data.classes.filter(
+					(item): item is string =>
+						typeof item === "string" && item.trim().length > 0,
+				)
+			: [];
+	} catch {
+		if (!closed) classNames = [];
+	}
+}
+
+async function commitMarquee(region: Region) {
+	const source = toSource(region);
+	const gen = ++marqueeGen;
+	marquee = region;
+	marqueeDraft = null;
+	marqueeReady = false;
+	marqueeNote = "";
+	if (!source || source.w < 1 || source.h < 1) {
+		marqueeNote = "Draw a larger region.";
+		return;
+	}
+	marqueeBusy = true;
+	try {
+		await invoke("embed_marquee", {
+			x: source.x,
+			y: source.y,
+			w: source.w,
+			h: source.h,
+		});
+		if (closed || gen !== marqueeGen) return;
+		marqueeReady = true;
+	} catch (err: unknown) {
+		if (closed || gen !== marqueeGen) return;
+		marqueeReady = false;
+		marqueeNote = invokeMessage(err, "Could not read that region.");
+	} finally {
+		if (gen === marqueeGen) marqueeBusy = false;
+	}
+}
+
+async function saveMarquee() {
+	const ic = marqueeIc.trim();
+	if (!admin || marqueeBusy || !marqueeReady || !marquee || ic.length === 0)
+		return;
+	const gen = marqueeGen;
+	const replace = saveMode === "replace";
+	marqueeBusy = true;
+	marqueeNote = "";
+	try {
+		const message = await invoke<string>("save_marquee_reference", {
+			ic,
+			replace,
+		});
+		if (closed || gen !== marqueeGen) return;
+		marquee = null;
+		marqueeReady = false;
+		marqueeNote = message.trim() || "Saved.";
+	} catch (err: unknown) {
+		if (closed || gen !== marqueeGen) return;
+		marqueeNote = invokeMessage(err, "Could not save the reference.");
+	} finally {
+		if (gen === marqueeGen) marqueeBusy = false;
+	}
 }
 
 async function saveReferences() {
@@ -972,6 +1200,9 @@ onDestroy(() => {
 	closed = true;
 	generation += 1;
 	if (focusTimer) clearTimeout(focusTimer);
+	void invoke("release_preview_frame").catch(() => {
+		// The window is closing. The held still can stay until the process exits.
+	});
 });
 </script>
 
@@ -1060,12 +1291,13 @@ onDestroy(() => {
 	<div
 		bind:this={viewportEl}
 		class="relative min-h-0 flex-1 select-none overflow-hidden bg-black"
+		class:cursor-crosshair={marqueeCursor}
 		class:cursor-grab={spaceDown && zoom > 1 && !panning}
 		class:cursor-grabbing={panning}
 		on:pointerdown={onPointerDown}
 		on:pointermove={onPointerMove}
-		on:pointerup={endPan}
-		on:pointercancel={endPan}
+		on:pointerup={onPointerUp}
+		on:pointercancel={onPointerCancel}
 	>
 		<canvas
 			bind:this={canvasEl}
@@ -1081,6 +1313,7 @@ onDestroy(() => {
 		></canvas>
 		{#if detectImage}
 			<img
+				bind:this={detectImgEl}
 				src={detectImage}
 				alt=""
 				class="pointer-events-none absolute"
@@ -1103,6 +1336,20 @@ onDestroy(() => {
 				preserveAspectRatio="none"
 				aria-hidden="true"
 			>
+				{#if shownMarquee}
+					<rect
+						x={shownMarquee.x}
+						y={shownMarquee.y}
+						width={shownMarquee.w}
+						height={shownMarquee.h}
+						fill="rgba(250, 204, 21, 0.18)"
+						stroke="#facc15"
+						stroke-width="2"
+						stroke-dasharray="8 4"
+						vector-effect="non-scaling-stroke"
+						pointer-events="none"
+					/>
+				{/if}
 				{#each detectMarks as mark, markIndex (`${markIndex}:${mark.ic}`)}
 					{#if markSelected(mark.index)}
 						<rect
@@ -1210,6 +1457,9 @@ onDestroy(() => {
 				{:else if admin && detectMarks.length > 0}
 					<p class="mt-2 text-xs text-amber-200">DINOv2 is not loaded.</p>
 				{/if}
+				{#if admin}
+					<p class="mt-2 text-xs text-neutral-400">Drag a region to capture a missed part.</p>
+				{/if}
 				<button
 					type="button"
 					class="mt-2 border border-neutral-600 bg-neutral-800 px-2 py-1 text-xs font-semibold text-neutral-100"
@@ -1218,6 +1468,67 @@ onDestroy(() => {
 					Clear
 				</button>
 			</div>
+			{#if admin && (marquee || marqueeNote)}
+				<div
+					class="absolute right-3 top-3 z-[3] w-56 border border-neutral-700 bg-neutral-950/95 px-3 py-2"
+					on:pointerdown|stopPropagation
+				>
+					<label
+						class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400"
+						for="marquee-ic"
+					>
+						IC
+						<input
+							id="marquee-ic"
+							bind:value={marqueeIc}
+							list="preview-class-names"
+							class="border border-neutral-600 bg-neutral-950 px-2 py-1 font-mono text-sm font-medium normal-case tracking-normal text-neutral-100"
+							disabled={marqueeBusy}
+							autocomplete="off"
+							spellcheck="false"
+						/>
+					</label>
+					<datalist id="preview-class-names">
+						{#each classNames as name, nameIndex (nameIndex)}
+							<option value={name}></option>
+						{/each}
+					</datalist>
+					<div class="mt-2 flex items-center gap-2">
+						<select
+							bind:value={saveMode}
+							class="min-w-0 flex-1 border border-neutral-600 bg-neutral-950 px-1 py-1 text-xs font-medium text-neutral-100"
+							disabled={marqueeBusy}
+							title="Append adds this crop to the class. Replace keeps only this crop for that class."
+							aria-label="For this IC"
+						>
+							<option value="append">Append</option>
+							<option value="replace">Replace</option>
+						</select>
+						<button
+							type="button"
+							class="border border-blue-500 bg-blue-600 px-2 py-1 text-sm font-semibold text-white disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
+							aria-label="Save this region"
+							disabled={marqueeBusy || !marqueeReady || marqueeIc.trim().length === 0}
+							on:click={saveMarquee}
+						>
+							✓
+						</button>
+						<button
+							type="button"
+							class="border border-neutral-600 bg-neutral-800 px-2 py-1 text-sm font-semibold text-neutral-100"
+							aria-label="Discard this region"
+							on:click={() => forgetMarquee("vector")}
+						>
+							✕
+						</button>
+					</div>
+					{#if marqueeBusy && !marqueeReady}
+						<p class="mt-1 text-xs text-neutral-300">Reading the region...</p>
+					{:else if marqueeNote}
+						<p class="mt-1 text-xs text-neutral-200">{marqueeNote}</p>
+					{/if}
+				</div>
+			{/if}
 		{/if}
 		{#if failed || !painted}
 			<p class="absolute inset-0 flex items-center justify-center px-6 text-center text-sm text-neutral-300">
