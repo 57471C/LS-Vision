@@ -4,11 +4,13 @@
 //! A missing or unloadable file is a warning. Detection keeps using the YOLO session.
 //! After YOLO keeps a box, this module can crop it, letterbox it to 224, and log
 //! the embedding. A test-mode capture stores that vector under the box's IC.
-//! The map is kept in memory and written to `vision/dinov2-references.json`.
+//! The camera preview can hold the same vectors and store only the boxes an
+//! admin selects, appending them or replacing that IC. The map is kept in
+//! memory and written to `vision/dinov2-references.json`.
 //! A later detection logs the best cosine score against those references.
 //! A box counts toward its IC only when that score is above the saved threshold.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
@@ -46,6 +48,15 @@ struct State {
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 static REFERENCES: LazyLock<Mutex<HashMap<String, Vec<Vec<f32>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static HELD: LazyLock<Mutex<Vec<Option<HeldEmbed>>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// One crop embedding kept from the latest preview detect. `None` means that
+/// box had no vector, so it cannot be saved.
+#[derive(Clone)]
+pub(crate) struct HeldEmbed {
+    pub ic: String,
+    pub values: Vec<f32>,
+}
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|err| err.into_inner())
@@ -207,6 +218,8 @@ pub(crate) struct EmbedDebug {
     /// One entry per crop. `None` means this box has no reference to compare.
     /// `Some` is whether the best cosine is above the threshold.
     pub counted: Vec<Option<bool>>,
+    /// The vector for each crop. `None` when that crop did not embed.
+    pub vectors: Vec<Option<Vec<f32>>>,
 }
 
 /// Crop, letterbox, and embed each box. A missing session returns no lines and
@@ -225,6 +238,7 @@ pub(crate) fn debug_embed(
         return EmbedDebug {
             lines: Vec::new(),
             counted: Vec::new(),
+            vectors: Vec::new(),
         };
     };
     embed_crops(session, rgb, width, height, crops, store, threshold)
@@ -248,6 +262,16 @@ pub(crate) fn embed_debug_crop(
 #[cfg(test)]
 pub(crate) fn clear_references() {
     lock(&REFERENCES).clear();
+}
+
+/// Replace the vectors held for a later admin save. One entry per detection.
+pub(crate) fn hold_embeddings(items: Vec<Option<HeldEmbed>>) {
+    *lock(&HELD) = items;
+}
+
+#[cfg(test)]
+pub(crate) fn clear_held() {
+    lock(&HELD).clear();
 }
 
 /// Append one reference. Returns how many vectors are now stored for this IC.
@@ -434,6 +458,7 @@ fn embed_crops(
 ) -> EmbedDebug {
     let mut lines = Vec::with_capacity(crops.len());
     let mut counted = Vec::with_capacity(crops.len());
+    let mut vectors = Vec::with_capacity(crops.len());
     let mut stored: HashMap<String, usize> = HashMap::new();
     for crop in crops {
         let (line, counts) = match embed_one(session, rgb, width, height, crop) {
@@ -445,18 +470,20 @@ fn embed_crops(
                     let count = remember(crop.class_name, &values);
                     stored.insert(crop.class_name.to_string(), count);
                 }
+                let line = embed_line(crop.class_name, crop.confidence, &values, matched);
+                vectors.push(Some(values));
+                (line, counts)
+            }
+            Err(err) => {
+                vectors.push(None);
                 (
-                    embed_line(crop.class_name, crop.confidence, &values, matched),
-                    counts,
+                    format!(
+                        "DINOv2 {} conf {:.4} embed failed: {err}",
+                        crop.class_name, crop.confidence
+                    ),
+                    None,
                 )
             }
-            Err(err) => (
-                format!(
-                    "DINOv2 {} conf {:.4} embed failed: {err}",
-                    crop.class_name, crop.confidence
-                ),
-                None,
-            ),
         };
         eprintln!("{line}");
         lines.push(line);
@@ -473,7 +500,113 @@ fn embed_crops(
         }
         persist_references();
     }
-    EmbedDebug { lines, counted }
+    EmbedDebug {
+        lines,
+        counted,
+        vectors,
+    }
+}
+
+/// Store the selected held crops under their class names.
+/// Append adds the vectors. Replace keeps only the selected vectors for each
+/// selected class and leaves every other class as it was.
+/// The returned pairs are the class and how many vectors it now has, sorted by class.
+pub(crate) fn apply_selected_references(
+    indices: &[usize],
+    replace: bool,
+) -> Result<Vec<(String, usize)>, String> {
+    if indices.is_empty() {
+        return Err("Select a box.".to_string());
+    }
+    let held = lock(&HELD).clone();
+    let mut picked: Vec<(String, Vec<f32>)> = Vec::new();
+    let mut seen = HashSet::new();
+    for index in indices {
+        if !seen.insert(*index) {
+            continue;
+        }
+        let Some(slot) = held.get(*index) else {
+            return Err("Detect again before saving a reference.".to_string());
+        };
+        let Some(item) = slot else {
+            return Err("That box has no DINOv2 embedding.".to_string());
+        };
+        let ic = item.ic.trim();
+        if ic.is_empty() {
+            return Err("That box has no class.".to_string());
+        }
+        if item.values.is_empty() || item.values.iter().any(|value| !value.is_finite()) {
+            return Err("That box has no DINOv2 embedding.".to_string());
+        }
+        picked.push((ic.to_string(), item.values.clone()));
+    }
+    if picked.is_empty() {
+        return Err("Select a box.".to_string());
+    }
+    let mut grouped: HashMap<String, Vec<Vec<f32>>> = HashMap::new();
+    let mut order = Vec::new();
+    for (ic, values) in picked {
+        if !grouped.contains_key(&ic) {
+            order.push(ic.clone());
+        }
+        grouped.entry(ic).or_default().push(values);
+    }
+    let mut guard = lock(&REFERENCES);
+    for ic in &order {
+        let Some(vectors) = grouped.remove(ic) else {
+            continue;
+        };
+        if replace {
+            guard.insert(ic.clone(), vectors);
+        } else {
+            guard.entry(ic.clone()).or_default().extend(vectors);
+        }
+    }
+    let mut rows: Vec<(String, usize)> = order
+        .into_iter()
+        .map(|ic| {
+            let count = guard.get(&ic).map(Vec::len).unwrap_or(0);
+            (ic, count)
+        })
+        .collect();
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(rows)
+}
+
+fn saved_message(rows: &[(String, usize)], replace: bool) -> String {
+    let verb = if replace { "Replaced" } else { "Saved" };
+    let body = rows
+        .iter()
+        .map(|(ic, count)| format!("{ic} ({count})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{verb} {body}.")
+}
+
+/// Write the in-memory map. Unit tests keep the file write on an explicit path.
+pub(crate) fn write_references() -> Result<(), String> {
+    if cfg!(test) {
+        return Ok(());
+    }
+    let path = references_path()?;
+    save_references_to(&path)
+}
+
+/// Save the selected boxes from the latest preview detect that asked to hold them.
+/// `replace` swaps the stored vectors for each selected class. Otherwise the
+/// vectors are appended. Other classes are left as they are.
+#[tauri::command]
+pub fn save_detection_references(
+    indices: Vec<usize>,
+    replace: Option<bool>,
+) -> Result<String, String> {
+    let replace = replace.unwrap_or(false);
+    let rows = apply_selected_references(&indices, replace)?;
+    write_references()?;
+    for (name, count) in &rows {
+        eprintln!("DINOv2 reference {name} stored {count}");
+    }
+    Ok(saved_message(&rows, replace))
 }
 
 fn embed_one(
@@ -776,6 +909,87 @@ mod tests {
             Some(1.0)
         );
         clear_references();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn selected_boxes_append_or_replace_one_class_and_reload() {
+        let _hold = lock_for_test();
+        clear_references();
+        clear_held();
+        remember("OTHER", &[0.0, 1.0, 0.0, 0.0]);
+        remember("2BBMNM08", &[0.0, 1.0, 0.0, 0.0]);
+        hold_embeddings(vec![
+            Some(HeldEmbed {
+                ic: "2BBMNM08".to_string(),
+                values: vec![1.0, 0.0, 0.0, 0.0],
+            }),
+            Some(HeldEmbed {
+                ic: "6PBB33".to_string(),
+                values: vec![0.0, 0.0, 1.0, 0.0],
+            }),
+            None,
+        ]);
+        let rows = apply_selected_references(&[0], false).unwrap();
+        assert_eq!(rows, vec![("2BBMNM08".to_string(), 2)]);
+        assert_eq!(
+            best_similarity("2BBMNM08", &[1.0, 0.0, 0.0, 0.0]),
+            Some(1.0)
+        );
+        assert_eq!(best_similarity("OTHER", &[0.0, 1.0, 0.0, 0.0]), Some(1.0));
+        assert!(best_similarity("6PBB33", &[0.0, 0.0, 1.0, 0.0]).is_none());
+
+        let rows = apply_selected_references(&[0, 0], true).unwrap();
+        assert_eq!(rows, vec![("2BBMNM08".to_string(), 1)]);
+        let replaced = best_similarity("2BBMNM08", &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        assert!(replaced.abs() < 0.001, "{replaced}");
+        assert_eq!(
+            best_similarity("2BBMNM08", &[1.0, 0.0, 0.0, 0.0]),
+            Some(1.0)
+        );
+        assert_eq!(best_similarity("OTHER", &[0.0, 1.0, 0.0, 0.0]), Some(1.0));
+
+        let rows = apply_selected_references(&[0, 1], false).unwrap();
+        assert_eq!(
+            rows,
+            vec![("2BBMNM08".to_string(), 2), ("6PBB33".to_string(), 1)]
+        );
+
+        let path = std::env::temp_dir().join(format!(
+            "ls-vision-dino-selected-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        save_references_to(&path).unwrap();
+        clear_references();
+        assert!(best_similarity("2BBMNM08", &[1.0, 0.0, 0.0, 0.0]).is_none());
+        assert_eq!(load_references_from(&path).unwrap(), true);
+        assert_eq!(
+            best_similarity("2BBMNM08", &[1.0, 0.0, 0.0, 0.0]),
+            Some(1.0)
+        );
+        assert_eq!(best_similarity("6PBB33", &[0.0, 0.0, 1.0, 0.0]), Some(1.0));
+        assert_eq!(best_similarity("OTHER", &[0.0, 1.0, 0.0, 0.0]), Some(1.0));
+
+        assert_eq!(
+            saved_message(
+                &[("2BBMNM08".to_string(), 2), ("6PBB33".to_string(), 1)],
+                false
+            ),
+            "Saved 2BBMNM08 (2), 6PBB33 (1)."
+        );
+        assert_eq!(
+            saved_message(&[("2BBMNM08".to_string(), 1)], true),
+            "Replaced 2BBMNM08 (1)."
+        );
+        assert!(apply_selected_references(&[], false).is_err());
+        let missing = apply_selected_references(&[9], false).unwrap_err();
+        assert!(missing.contains("Detect again"), "{missing}");
+        let empty = apply_selected_references(&[2], false).unwrap_err();
+        assert!(empty.contains("no DINOv2"), "{empty}");
+
+        clear_references();
+        clear_held();
         let _ = std::fs::remove_file(&path);
     }
 }

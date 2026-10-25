@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { onDestroy, onMount, tick } from "svelte";
 
 const PREVIEW_CHANNEL = "ls-vision-camera-preview";
+const ADMIN_FLAG = "ls-vision-settings-open";
 const DISPLAY_FPS = [15, 20, 25, 30];
 const MIN_ZOOM = 1;
 const MAX_ZOOM = 8;
@@ -82,6 +83,8 @@ type DetectMark = {
 	w: number;
 	h: number;
 	color: string;
+	index: number;
+	embed: boolean;
 };
 
 const DETECT_COLORS = [
@@ -106,6 +109,12 @@ let detectW = 0;
 let detectH = 0;
 let detectMarks: DetectMark[] = [];
 let detectNote = "";
+let admin = false;
+let selected: number[] = [];
+let saveMode: "append" | "replace" = "append";
+let saveBusy = false;
+let saveNote = "";
+let saveGeneration = 0;
 
 function formatStatus(body: PreviewBody, canvasRate: string): string {
 	const width = body.width;
@@ -630,6 +639,7 @@ function readDetections(value: unknown): DetectMark[] {
 			ic?: unknown;
 			confidence?: unknown;
 			bbox?: unknown;
+			embed?: unknown;
 		};
 		const ic = typeof row.ic === "string" ? row.ic : "";
 		const confidence = typeof row.confidence === "number" ? row.confidence : 0;
@@ -656,6 +666,8 @@ function readDetections(value: unknown): DetectMark[] {
 			w: x2 - x1,
 			h: y2 - y1,
 			color: colorForIc(ic),
+			index: marks.length,
+			embed: row.embed === true,
 		});
 	}
 	marks.sort((left, right) => left.confidence - right.confidence);
@@ -690,6 +702,10 @@ function clearDetect() {
 	detectH = 0;
 	detectMarks = [];
 	detectNote = "";
+	selected = [];
+	saveNote = "";
+	saveGeneration += 1;
+	saveBusy = false;
 }
 
 async function refreshModel() {
@@ -720,6 +736,9 @@ async function runDetect() {
 	const camera = index;
 	detectBusy = true;
 	detectNote = "";
+	selected = [];
+	saveNote = "";
+	saveGeneration += 1;
 	try {
 		const snap = await invoke<PreviewBody>("capture_snapshot", {
 			index: camera,
@@ -731,7 +750,9 @@ async function runDetect() {
 			detectNote = snap.message || "No frame.";
 			return;
 		}
-		const body = await invoke<DetectBody>("detect_image");
+		const body = await invoke<DetectBody>("detect_image", {
+			holdReferences: true,
+		});
 		if (closed || gen !== detectGeneration || camera !== index) return;
 		const message = typeof body.message === "string" ? body.message.trim() : "";
 		if (message) {
@@ -767,6 +788,75 @@ async function runDetect() {
 		detectNote = invokeMessage(err, "Detect failed.");
 	} finally {
 		if (gen === detectGeneration) detectBusy = false;
+	}
+}
+
+function applyAdmin(next: boolean) {
+	admin = next;
+	if (!next) selected = [];
+	try {
+		if (next) sessionStorage.setItem(ADMIN_FLAG, "1");
+		else sessionStorage.removeItem(ADMIN_FLAG);
+	} catch {
+		// The window can still use the flag it already applied.
+	}
+	const url = new URL(window.location.href);
+	if (next) url.searchParams.set("admin", "1");
+	else url.searchParams.delete("admin");
+	const nextUrl = `${url.pathname}${url.search}${url.hash}`;
+	const current = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+	if (current !== nextUrl) history.replaceState(null, "", nextUrl);
+}
+
+function readAdmin(params: URLSearchParams): boolean {
+	try {
+		if (sessionStorage.getItem(ADMIN_FLAG) === "1") return true;
+	} catch {
+		// A blocked store still leaves the query flag.
+	}
+	return params.get("admin") === "1";
+}
+
+function toggleMark(index: number) {
+	if (!admin) return;
+	const mark = detectMarks.find((item) => item.index === index);
+	if (!mark?.embed) return;
+	selected = selected.includes(index)
+		? selected.filter((item) => item !== index)
+		: [...selected, index];
+}
+
+function onMarkClick(event: MouseEvent, index: number) {
+	if (!admin || spaceDown) return;
+	event.preventDefault();
+	event.stopPropagation();
+	toggleMark(index);
+}
+
+function markSelected(index: number): boolean {
+	return selected.includes(index);
+}
+
+async function saveReferences() {
+	if (!admin || saveBusy || selected.length === 0) return;
+	const gen = saveGeneration;
+	const indices = selected.slice();
+	const replace = saveMode === "replace";
+	saveBusy = true;
+	saveNote = "";
+	try {
+		const message = await invoke<string>("save_detection_references", {
+			indices,
+			replace,
+		});
+		if (closed || gen !== saveGeneration) return;
+		saveNote = message.trim() || "Saved.";
+		selected = [];
+	} catch (err: unknown) {
+		if (closed || gen !== saveGeneration) return;
+		saveNote = invokeMessage(err, "Could not save the reference.");
+	} finally {
+		if (gen === saveGeneration) saveBusy = false;
 	}
 }
 
@@ -842,9 +932,13 @@ onMount(() => {
 	const params = new URLSearchParams(window.location.search);
 	const initial = readIndex(params.get("index"));
 	if (initial !== null) index = initial;
+	applyAdmin(readAdmin(params));
 	void retitle(index);
 	const channel = new BroadcastChannel(PREVIEW_CHANNEL);
 	channel.onmessage = (event) => {
+		if (event.data && typeof event.data.admin === "boolean") {
+			applyAdmin(event.data.admin);
+		}
 		if (event.data && "displayFps" in event.data) {
 			displayFpsPinned = true;
 			const next = readDisplayFps(event.data.displayFps);
@@ -857,6 +951,7 @@ onMount(() => {
 		const next = readIndex(event.data?.index);
 		if (next !== null) useIndex(next);
 	};
+	channel.postMessage({ ready: true });
 	const page = pageEl;
 	page?.addEventListener("wheel", onWheel, { passive: false });
 	const observer = new ResizeObserver(() => fitFrame());
@@ -1009,16 +1104,33 @@ onDestroy(() => {
 				aria-hidden="true"
 			>
 				{#each detectMarks as mark, markIndex (`${markIndex}:${mark.ic}`)}
+					{#if markSelected(mark.index)}
+						<rect
+							x={mark.x}
+							y={mark.y}
+							width={mark.w}
+							height={mark.h}
+							fill="none"
+							stroke="#ffffff"
+							stroke-width="5"
+							vector-effect="non-scaling-stroke"
+							pointer-events="none"
+						/>
+					{/if}
 					<rect
 						x={mark.x}
 						y={mark.y}
 						width={mark.w}
 						height={mark.h}
-						fill="none"
+						fill={admin && mark.embed ? "transparent" : "none"}
 						stroke={mark.color}
 						stroke-width="2"
 						vector-effect="non-scaling-stroke"
 						data-detection={mark.ic}
+						data-selected={markSelected(mark.index) ? "true" : "false"}
+						class:pointer-events-auto={admin && mark.embed}
+						class:cursor-pointer={admin && mark.embed}
+						on:click={(event) => onMarkClick(event, mark.index)}
 					/>
 					<text
 						x={mark.x}
@@ -1027,14 +1139,14 @@ onDestroy(() => {
 						font-size="16"
 						font-family="ui-monospace, monospace"
 						font-weight="600"
+						pointer-events="none"
 					>
 						{mark.ic}
 					</text>
 				{/each}
 			</svg>
 			<div
-				class="absolute left-3 top-3 z-[2] max-h-48 max-w-xs overflow-auto border border-neutral-700 bg-neutral-950/90 px-3 py-2"
-				role="status"
+				class="absolute left-3 top-3 z-[2] max-h-80 max-w-xs overflow-auto border border-neutral-700 bg-neutral-950/90 px-3 py-2"
 				on:pointerdown|stopPropagation
 			>
 				<p class="text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
@@ -1045,12 +1157,58 @@ onDestroy(() => {
 				{:else}
 					<ul class="mt-1 space-y-1">
 						{#each detectMarks as mark, markIndex (`${markIndex}:${mark.ic}:${mark.confidence}`)}
-							<li class="font-mono text-sm text-neutral-100">
-								{mark.ic}
-								<span class="text-neutral-400">{mark.confidence.toFixed(2)}</span>
+							<li>
+								{#if admin && mark.embed}
+									<button
+										type="button"
+										class="w-full px-1 text-left font-mono text-sm text-neutral-100"
+										class:bg-neutral-800={markSelected(mark.index)}
+										aria-pressed={markSelected(mark.index)}
+										on:click={() => toggleMark(mark.index)}
+									>
+										{mark.ic}
+										<span class="text-neutral-400">{mark.confidence.toFixed(2)}</span>
+									</button>
+								{:else}
+									<p class="px-1 font-mono text-sm text-neutral-100">
+										{mark.ic}
+										<span class="text-neutral-400">{mark.confidence.toFixed(2)}</span>
+									</p>
+								{/if}
 							</li>
 						{/each}
 					</ul>
+				{/if}
+				{#if admin && detectMarks.some((mark) => mark.embed)}
+					<div class="mt-2 flex flex-wrap items-center gap-2">
+						<label class="flex items-center gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+							For this IC
+							<select
+								bind:value={saveMode}
+								class="border border-neutral-600 bg-neutral-950 px-1 py-1 font-sans text-xs font-medium normal-case tracking-normal text-neutral-100"
+								disabled={saveBusy}
+								title="Append adds these crops to the class. Replace keeps only these crops for that class."
+							>
+								<option value="append">Append</option>
+								<option value="replace">Replace</option>
+							</select>
+						</label>
+						<button
+							type="button"
+							class="border border-blue-500 bg-blue-600 px-2 py-1 text-xs font-semibold text-white disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
+							disabled={saveBusy || selected.length === 0}
+							on:click={saveReferences}
+						>
+							{saveBusy ? "Saving..." : "Save as reference"}
+						</button>
+					</div>
+					{#if saveNote}
+						<p class="mt-1 text-xs text-neutral-200">{saveNote}</p>
+					{:else if selected.length === 0}
+						<p class="mt-1 text-xs text-neutral-400">Select one or more boxes.</p>
+					{/if}
+				{:else if admin && detectMarks.length > 0}
+					<p class="mt-2 text-xs text-amber-200">DINOv2 is not loaded.</p>
 				{/if}
 				<button
 					type="button"
@@ -1103,12 +1261,11 @@ onDestroy(() => {
 				<button
 					type="button"
 					class="inline-flex min-h-9 items-center gap-2 border border-blue-500 bg-blue-600 px-3 text-sm font-semibold text-white disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
-					title="Detect (\)"
+					title="Detect"
 					disabled={!modelReady || detectBusy || snapshotOpen}
 					on:click={runDetect}
 				>
 					{detectBusy ? "Detecting..." : "Detect"}
-					<kbd class="font-mono text-xs opacity-80">\</kbd>
 				</button>
 				{#if modelChecked && !modelReady}
 					<span class="max-w-40 text-xs text-amber-200">No model loaded.</span>
