@@ -15,6 +15,6 @@ Inference is ONNX Runtime in the Rust backend. The app does not start a Python p
 ## First-time checks
 
 - The camera appears in Settings and the preview stays smooth.
-- Inference EP lists the providers this build can run. This OpenVINO build lists CPU. Use OpenVINO (Arc) loads the same ONNX files on the Arc GPU when `openvino/` sits next to the exe.
+- Inference EP lists the providers this build can run. This OpenVINO build lists CPU. Use OpenVINO (Arc) loads the same ONNX files on the Arc GPU when the OpenVINO DLLs sit next to the exe.
 - A known kit barcode returns a BoM.
 - Start/Stop Feed ignores extra clicks for 1.52 seconds.

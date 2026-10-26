@@ -21,7 +21,7 @@ Place `best.pt` in `vision/models/`. Weight files (`*.pt`, `*.onnx`) stay local 
 yolo export model=best.pt format=onnx
 ```
 
-In Settings > Training, use Update model and choose the `.onnx` file. The app copies it into the app data models folder (`%APPDATA%\studio.lean.ls-vision\models` on Windows). Dev and the installed app use that folder. The installer does not bundle that YOLO file. It does bundle `src-tauri/models/dinov2_vits14.onnx` and `src-tauri/openvino/` when those folders are filled in before the build. Both stay gitignored.
+In Settings > Training, use Update model and choose the `.onnx` file. The app copies it into the app data models folder (`%APPDATA%\studio.lean.ls-vision\models` on Windows). Dev and the installed app use that folder. The installer does not bundle that YOLO file. It does bundle `src-tauri/models/dinov2_vits14.onnx` under `models/` and the DLLs from `src-tauri/openvino/` next to the exe when those files are present at build time. Both stay gitignored.
 
 ## Activate the environment (every new terminal)
 

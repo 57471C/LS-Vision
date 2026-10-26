@@ -21,7 +21,7 @@ See [plan.md](plan.md) for the architecture and phased plan. Operator and admin 
 - **Frontend**: SvelteKit + TypeScript + Vite
 - **Desktop shell**: Tauri 2 (Rust)
 - **Vision**: ONNX Runtime in Rust. The live preview is a paced canvas (Display FPS, JPEG scaled to fit 1280×720). A barcode snapshot is a separate full-resolution still, so the preview keeps drawing. Start/Stop Feed ignores extra clicks for 1.52 seconds. A `.pt` file is training-only and does not detect.
-- **Inference EP**: Settings probes this PC and lists CPU, plus DirectML or CUDA when that runtime and GPU are present. This build links the OpenVINO prebuilt only, so the list is CPU. Use OpenVINO (Arc) registers the plugin in `openvino/` next to the exe and loads the same ONNX files on the Arc GPU. A missing plugin stays on ONNX Runtime. A provider that fails to start falls back to CPU. The saved choice is kept.
+- **Inference EP**: Settings probes this PC and lists CPU, plus DirectML or CUDA when that runtime and GPU are present. This build links the OpenVINO prebuilt only, so the list is CPU. Use OpenVINO (Arc) registers the plugin beside the exe, or from `openvino/` when that folder is present, and loads the same ONNX files on the Arc GPU. A missing plugin stays on ONNX Runtime. A provider that fails to start falls back to CPU. The saved choice is kept.
 - **Data**: JSON sample BoM, a job-card API, or MSSQL. The source is chosen in Settings.
 
 ## Getting started
@@ -31,7 +31,7 @@ npm install
 npm run tauri dev
 ```
 
-In Settings > Training, use Update model to copy an `.onnx` file into the app data models folder. Dev and the installed app share that folder. YOLO weight files are not stored in git and are not bundled. The installer does bundle `models/dinov2_vits14.onnx` and the OpenVINO runtime under `openvino/` next to the exe when those files are present at build time. Both stay gitignored. See [vision/README.md](vision/README.md) for the offline training and export steps.
+In Settings > Training, use Update model to copy an `.onnx` file into the app data models folder. Dev and the installed app share that folder. YOLO weight files are not stored in git and are not bundled. The installer does bundle `models/dinov2_vits14.onnx` and the OpenVINO DLLs in the same directory as the exe when those files are present at build time. Both stay gitignored. See [vision/README.md](vision/README.md) for the offline training and export steps.
 
 ## Project status
 
