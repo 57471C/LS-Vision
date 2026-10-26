@@ -1,3 +1,25 @@
+export type CameraScale = {
+	mmPerPx: number;
+	width: number;
+	height: number;
+};
+
+const MAX_MM_PER_PX = 1000;
+
+export function readCameraScale(value: unknown): CameraScale | null {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+	const data = value as Record<string, unknown>;
+	const mmPerPx = Number(data.mmPerPx);
+	const width = Number(data.width);
+	const height = Number(data.height);
+	if (!Number.isFinite(mmPerPx) || mmPerPx <= 0 || mmPerPx > MAX_MM_PER_PX) {
+		return null;
+	}
+	if (!Number.isFinite(width) || width < 1 || width > 20000) return null;
+	if (!Number.isFinite(height) || height < 1 || height > 20000) return null;
+	return { mmPerPx, width, height };
+}
+
 export type CameraSettings = {
 	index: number;
 	resolution: string;
@@ -5,6 +27,7 @@ export type CameraSettings = {
 	focus: number | null;
 	brightness: number;
 	contrast: number;
+	scale: CameraScale | null;
 };
 
 const DISPLAY_RATES = [15, 20, 25, 30];
@@ -30,13 +53,16 @@ function levelValue(value: unknown): number | null {
 }
 
 function levels(settings: CameraSettings): Record<string, unknown> {
-	return {
+	const record: Record<string, unknown> = {
 		resolution: settings.resolution,
 		displayFps: settings.displayFps,
 		focus: settings.focus,
 		brightness: settings.brightness,
 		contrast: settings.contrast,
 	};
+	// Replacing the camera record drops a scale that is left out.
+	if (settings.scale) record.scale = settings.scale;
+	return record;
 }
 
 export function defaultCameraSettings(index: number): CameraSettings {
@@ -47,6 +73,7 @@ export function defaultCameraSettings(index: number): CameraSettings {
 		focus: null,
 		brightness: 50,
 		contrast: 50,
+		scale: null,
 	};
 }
 
@@ -60,6 +87,7 @@ function settingsFrom(value: unknown, index: number): CameraSettings {
 		focus: Object.hasOwn(data, "focus") ? levelValue(data.focus) : null,
 		brightness: levelValue(data.brightness) ?? 50,
 		contrast: levelValue(data.contrast) ?? 50,
+		scale: readCameraScale(data.scale),
 	};
 }
 

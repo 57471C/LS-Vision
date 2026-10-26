@@ -788,7 +788,9 @@ function inferenceLabel(id: string): string {
 	return "CPU";
 }
 
-$: inferenceBackend = openVinoActive ? "OpenVINO" : inferenceLabel(inferenceActive);
+$: inferenceBackend = openVinoActive
+	? "OpenVINO"
+	: inferenceLabel(inferenceActive);
 
 function applyInference(data: {
 	providers?: unknown;
@@ -1961,7 +1963,10 @@ function cameraSettingsBody() {
 	};
 }
 
-async function postCameraSettings(applyOnly = false, preset?: CameraSettings) {
+async function postCameraSettings(
+	applyOnly = false,
+	preset?: Omit<CameraSettings, "scale">,
+) {
 	const body = preset ?? cameraSettingsBody();
 	// This form stores the fields. The preview Focus slider is what sets the
 	// camera. Brightness and contrast are not applied, so a live change here
@@ -1983,6 +1988,7 @@ async function postCameraSettings(applyOnly = false, preset?: CameraSettings) {
 	}
 	const version = cameraFileVersion;
 	const current = await loadDocument();
+	const existing = settingsForCamera(objectField(current.camera), index);
 	const settings = {
 		index,
 		resolution: body.resolution,
@@ -1990,6 +1996,7 @@ async function postCameraSettings(applyOnly = false, preset?: CameraSettings) {
 		focus: body.focus,
 		brightness: body.brightness,
 		contrast: body.contrast,
+		scale: existing.scale,
 	};
 	// Save belongs to the camera on the form when Save was clicked. A later
 	// camera change must not move that record onto the newly selected camera.
