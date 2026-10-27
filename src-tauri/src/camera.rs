@@ -2657,7 +2657,8 @@ mod tests {
                         "displayFps": 15,
                         "focus": null,
                         "brightness": 60,
-                        "contrast": 40
+                        "contrast": 40,
+                        "scale": { "mmPerPx": 0.25, "width": 1280, "height": 720 }
                     }
                 }
             }
@@ -2671,6 +2672,8 @@ mod tests {
         assert_eq!(config["camera"]["focus"], 35);
         assert_eq!(config["camera"]["byIndex"]["1"]["focus"], 35);
         assert_eq!(config["camera"]["byIndex"]["1"]["brightness"], 60);
+        assert_eq!(config["camera"]["byIndex"]["1"]["scale"]["mmPerPx"], 0.25);
+        assert_eq!(config["camera"]["byIndex"]["1"]["scale"]["width"], 1280);
         assert_eq!(
             config["camera"]["byIndex"]["1"]["resolution"],
             "1920x1080@30"

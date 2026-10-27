@@ -1,7 +1,26 @@
 <script lang="ts">
 // biome-ignore-all lint/correctness/noUnusedVariables: Biome 2.4 does not treat Svelte template references as uses
+
 import { invoke } from "@tauri-apps/api/core";
 import { onDestroy, onMount, tick } from "svelte";
+import {
+	assignActiveCamera,
+	retainCameraSettings,
+	settingsForCamera,
+} from "$lib/camera-settings";
+// biome-ignore lint/correctness/noUnusedImports: the template uses this component
+import MeasureOverlay from "$lib/MeasureOverlay.svelte";
+import {
+	type CameraScale,
+	formatReadout,
+	formatScale,
+	type ImageLine,
+	lineLength,
+	type MeasureDraw,
+	measureReadout,
+	parseMillimetres,
+	scaleFromLength,
+} from "$lib/measure";
 
 const PREVIEW_CHANNEL = "ls-vision-camera-preview";
 const ADMIN_FLAG = "ls-vision-settings-open";
@@ -137,6 +156,19 @@ let marqueeNote = "";
 let marqueeGen = 0;
 let drawing = false;
 let drawOrigin = { x: 0, y: 0 };
+
+let scale: CameraScale | null = null;
+let scaleLoadId = 0;
+let scaleMode = false;
+let scaleModal = false;
+let scaleMm = "";
+let scaleError = "";
+let scaleSaving = false;
+let scaleInput: HTMLInputElement | undefined;
+let pendingScale: { pixels: number; width: number; height: number } | null =
+	null;
+let measureOn = false;
+let measureLine: ImageLine | null = null;
 
 $: shownMarquee = marqueeDraft ?? marquee;
 $: marqueeCursor =
@@ -456,6 +488,23 @@ function onKeyDown(event: KeyboardEvent) {
 		cancelSnapshot();
 		return;
 	}
+	if (scaleModal) {
+		if (event.key === "Escape") {
+			event.preventDefault();
+			cancelScaleMode();
+		}
+		return;
+	}
+	if (event.key === "Escape" && scaleMode) {
+		event.preventDefault();
+		cancelScaleMode();
+		return;
+	}
+	if (event.key === "Escape" && measureOn && measureLine) {
+		event.preventDefault();
+		measureLine = null;
+		return;
+	}
 	if (event.key === "Enter" && !snapshotOpen && !typingTarget(event)) {
 		event.preventDefault();
 		void takeSnapshot();
@@ -626,6 +675,7 @@ async function drawFrame(url: string): Promise<boolean> {
 			node.height = bitmap.height;
 		}
 		if (frameW !== bitmap.width || frameH !== bitmap.height) {
+			if (frameW > 0 && frameH > 0) measureLine = null;
 			frameW = bitmap.width;
 			frameH = bitmap.height;
 			fitFrame();
@@ -654,6 +704,9 @@ function useIndex(next: number) {
 	frameH = 0;
 	lastFrame = "";
 	clearDetect();
+	cancelScaleMode();
+	measureLine = null;
+	scale = null;
 	focusNotice = "";
 	focusStatus = "";
 	if (focusTimer) {
@@ -662,6 +715,7 @@ function useIndex(next: number) {
 	}
 	resetView();
 	void retitle(next);
+	void loadStoredScale(next);
 	void applyStoredFocus(next);
 	generation += 1;
 	void runPreview(generation);
@@ -716,7 +770,20 @@ async function runPreview(gen: number) {
 	}
 }
 
+async function loadStoredScale(cameraIndex: number) {
+	const loadId = ++scaleLoadId;
+	try {
+		const config = await invoke<{ camera?: unknown }>("load_local_config");
+		if (closed || loadId !== scaleLoadId || cameraIndex !== index) return;
+		scale = settingsForCamera(config.camera, cameraIndex).scale;
+	} catch {
+		if (closed || loadId !== scaleLoadId || cameraIndex !== index) return;
+		scale = null;
+	}
+}
+
 async function loadDisplayFps() {
+	const loadId = ++scaleLoadId;
 	try {
 		const config = await invoke<{ camera?: { displayFps?: unknown } }>(
 			"load_local_config",
@@ -724,11 +791,130 @@ async function loadDisplayFps() {
 		if (!displayFpsPinned) {
 			displayFps = readDisplayFps(config.camera?.displayFps);
 		}
+		if (!closed && loadId === scaleLoadId) {
+			scale = settingsForCamera(config.camera, index).scale;
+		}
 	} catch {
 		if (!displayFpsPinned) displayFps = 15;
 	}
 	await applyStoredFocus(index);
 }
+
+function cancelScaleMode() {
+	scaleMode = false;
+	scaleModal = false;
+	scaleMm = "";
+	scaleError = "";
+	scaleSaving = false;
+	pendingScale = null;
+	if (!measureOn) measureLine = null;
+}
+
+function toggleScaleMode() {
+	if (!admin) return;
+	if (scaleMode || scaleModal) {
+		cancelScaleMode();
+		return;
+	}
+	measureOn = false;
+	measureLine = null;
+	scaleMode = true;
+}
+
+function toggleMeasure() {
+	if (measureOn) {
+		measureOn = false;
+		measureLine = null;
+		return;
+	}
+	cancelScaleMode();
+	measureOn = true;
+}
+
+function onMeasureLine(event: CustomEvent<MeasureDraw>) {
+	const drawn = event.detail;
+	measureLine = drawn.line;
+	if (!scaleMode) return;
+	pendingScale = {
+		pixels: lineLength(drawn.line),
+		width: drawn.width,
+		height: drawn.height,
+	};
+	scaleMm = "";
+	scaleError = "";
+	scaleModal = true;
+	void tick().then(() => {
+		scaleInput?.focus();
+		scaleInput?.select();
+	});
+}
+
+async function persistScale(next: CameraScale) {
+	const config = await invoke<Record<string, unknown>>("load_local_config");
+	const camera = config.camera;
+	const active = Number(
+		camera && typeof camera === "object"
+			? (camera as { index?: unknown }).index
+			: Number.NaN,
+	);
+	const settings = settingsForCamera(camera, index);
+	settings.scale = next;
+	if (active === index) assignActiveCamera(config, settings);
+	else retainCameraSettings(config, settings);
+	await invoke("save_local_config", { config });
+	const saved = await invoke<{ camera?: unknown }>("load_local_config");
+	const stored = settingsForCamera(saved.camera, index).scale;
+	if (!stored || Math.abs(stored.mmPerPx - next.mmPerPx) > 1e-9) {
+		throw new Error("The scale was not stored.");
+	}
+	scale = stored;
+	const channel = new BroadcastChannel(PREVIEW_CHANNEL);
+	channel.postMessage({ index, scale: stored });
+	channel.close();
+}
+
+async function confirmScale() {
+	const pending = pendingScale;
+	if (!pending || scaleSaving || !admin) return;
+	const millimetres = parseMillimetres(scaleMm);
+	const next = millimetres
+		? scaleFromLength(
+				millimetres,
+				pending.pixels,
+				pending.width,
+				pending.height,
+			)
+		: null;
+	if (!next) {
+		scaleError = "Enter a length in millimetres.";
+		return;
+	}
+	scaleSaving = true;
+	scaleError = "";
+	try {
+		await persistScale(next);
+		scaleModal = false;
+		scaleMode = false;
+		pendingScale = null;
+		measureLine = null;
+		scaleMm = "";
+	} catch (err: unknown) {
+		scaleError = invokeMessage(err, "Could not save the scale.");
+	} finally {
+		scaleSaving = false;
+	}
+}
+
+$: scaleText = scale ? formatScale(scale, frameW) : "";
+$: measureLabel = measureLine
+	? formatReadout(measureReadout(lineLength(measureLine), frameW, scale))
+	: "";
+$: lineActive =
+	(scaleMode || measureOn) &&
+	!scaleModal &&
+	!snapshotOpen &&
+	!spaceDown &&
+	!panning;
 
 function invokeMessage(err: unknown, fallback: string): string {
 	return typeof err === "string" && err.trim() ? err : fallback;
@@ -949,6 +1135,7 @@ function applyAdmin(next: boolean) {
 	if (!next) {
 		selected = [];
 		forgetMarquee("vector");
+		cancelScaleMode();
 	} else if (detectImage) {
 		void loadClassNames();
 	}
@@ -1275,16 +1462,59 @@ onDestroy(() => {
 
 <div bind:this={pageEl} class="relative flex h-dvh flex-col overflow-hidden bg-neutral-950 text-neutral-100">
 	<header class="flex shrink-0 items-center justify-between gap-3 border-b border-neutral-800 bg-neutral-900 px-4 py-2">
-		<h1 class="text-sm font-semibold tracking-tight">Camera {index}</h1>
-		{#if status}
-			<p class="min-w-0 truncate text-xs tabular-nums text-neutral-200">{status}</p>
-		{:else}
-			<p class="text-[11px] font-semibold uppercase tracking-widest text-neutral-500">Preview</p>
-		{/if}
+		<div class="flex min-w-0 items-center gap-2">
+			<h1 class="shrink-0 text-sm font-semibold tracking-tight">Camera {index}</h1>
+			{#if admin}
+				<button
+					type="button"
+					class="inline-flex h-7 shrink-0 items-center border px-2 text-xs font-semibold disabled:opacity-50 {scaleMode
+						? 'border-amber-300 bg-amber-400 text-neutral-950'
+						: 'border-neutral-600 bg-neutral-800 text-neutral-100'}"
+					aria-pressed={scaleMode}
+					aria-label="Set scale"
+					title={painted
+						? "Draw a line of a known length"
+						: "Wait for a preview frame"}
+					disabled={!painted || snapshotOpen}
+					on:click={toggleScaleMode}
+				>
+					{scaleMode ? "Cancel scale" : "Set scale"}
+				</button>
+			{/if}
+			{#if scaleText}
+				<span class="truncate font-mono text-xs text-neutral-200" title={scaleText}>{scaleText}</span>
+			{/if}
+		</div>
+		<div class="flex min-w-0 items-center gap-2">
+			<button
+				type="button"
+				class="inline-flex h-7 shrink-0 items-center border px-2 text-xs font-semibold {measureOn
+					? 'border-blue-500 bg-blue-600 text-white'
+					: 'border-neutral-600 bg-neutral-800 text-neutral-100'}"
+				aria-pressed={measureOn}
+				aria-label="Measure"
+				disabled={snapshotOpen}
+				on:click={toggleMeasure}
+			>
+				Measure
+			</button>
+			{#if status}
+				<p class="min-w-0 truncate text-xs tabular-nums text-neutral-200">{status}</p>
+			{:else}
+				<p class="text-[11px] font-semibold uppercase tracking-widest text-neutral-500">Preview</p>
+			{/if}
+		</div>
 	</header>
 	<p class="shrink-0 border-b border-neutral-800 px-4 py-1 text-[11px] text-neutral-500">
 		Focus slider or Auto · Ctrl+wheel zoom · Space+drag pan · Enter snapshot · \ detect
 	</p>
+	{#if scaleMode}
+		<p class="shrink-0 px-4 py-1 text-xs text-amber-200">Draw a straight line of a known length.</p>
+	{:else if measureOn}
+		<p class="shrink-0 px-4 py-1 text-xs {scale ? 'text-neutral-200' : 'text-amber-200'}">
+			{measureLabel || (scale ? "Draw a straight line to measure." : "No scale set for this camera. Draw a line to see pixels.")}
+		</p>
+	{/if}
 	{#if snapshotSaved}
 		<p class="shrink-0 px-4 py-1 text-xs text-neutral-200">{snapshotSaved}</p>
 	{/if}
@@ -1311,6 +1541,27 @@ onDestroy(() => {
 			style:transform-origin="0 0"
 			aria-label="Camera {index} preview"
 		></canvas>
+		{#if painted && frameW > 0 && frameH > 0}
+			<div
+				class="absolute z-[1]"
+				class:pointer-events-none={!lineActive}
+				style:left="{fitLeft}px"
+				style:top="{fitTop}px"
+				style:width="{fitW}px"
+				style:height="{fitH}px"
+				style:transform="translate({panX}px, {panY}px) scale({zoom})"
+				style:transform-origin="0 0"
+			>
+				<MeasureOverlay
+					active={lineActive}
+					imageWidth={frameW}
+					imageHeight={frameH}
+					line={measureLine}
+					label={measureLabel}
+					on:line={onMeasureLine}
+				/>
+			</div>
+		{/if}
 		{#if detectImage}
 			<img
 				bind:this={detectImgEl}
@@ -1586,6 +1837,58 @@ onDestroy(() => {
 			</div>
 		</div>
 	</div>
+	{#if scaleModal}
+		<div class="absolute inset-0 z-20 flex items-center justify-center bg-black/70 p-4">
+			<form
+				class="w-full max-w-md border border-neutral-700 bg-neutral-900 p-4"
+				role="dialog"
+				aria-modal="true"
+				aria-labelledby="scale-title"
+				on:submit|preventDefault={confirmScale}
+			>
+				<h2 id="scale-title" class="text-base font-semibold tracking-tight">Known length</h2>
+				<p class="mt-2 text-sm text-neutral-300">
+					The line is {pendingScale ? Math.round(pendingScale.pixels) : 0} px. Enter its real length.
+				</p>
+				<label class="mt-3 flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400" for="scale-length">
+					Length
+					<span class="flex items-center gap-2 normal-case tracking-normal">
+						<input
+							bind:this={scaleInput}
+							bind:value={scaleMm}
+							id="scale-length"
+							class="min-w-0 flex-1 border border-neutral-600 bg-neutral-950 px-3 py-2 font-mono text-base font-medium text-neutral-100"
+							inputmode="decimal"
+							autocomplete="off"
+							spellcheck="false"
+							disabled={scaleSaving}
+						/>
+						<span class="font-mono text-sm text-neutral-300">mm</span>
+					</span>
+				</label>
+				{#if scaleError}
+					<p class="mt-2 text-sm text-amber-200">{scaleError}</p>
+				{/if}
+				<div class="mt-4 flex flex-wrap items-center gap-2">
+					<button
+						type="submit"
+						class="inline-flex min-h-11 items-center border border-blue-500 bg-blue-600 px-4 text-sm font-semibold text-white disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
+						disabled={scaleSaving}
+					>
+						{scaleSaving ? "Saving..." : "Save"}
+					</button>
+					<button
+						type="button"
+						class="inline-flex min-h-11 items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100"
+						on:click={cancelScaleMode}
+						disabled={scaleSaving}
+					>
+						Cancel
+					</button>
+				</div>
+			</form>
+		</div>
+	{/if}
 	{#if snapshotOpen}
 		<div class="absolute inset-0 z-10 flex items-center justify-center bg-black/70 p-4">
 			<form

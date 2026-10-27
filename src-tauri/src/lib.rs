@@ -9,6 +9,7 @@ mod inference_ep;
 mod local_config;
 mod results;
 mod training;
+mod vision;
 
 use std::sync::{Arc, Mutex};
 

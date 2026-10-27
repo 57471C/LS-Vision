@@ -1,13 +1,29 @@
 <script lang="ts">
 // biome-ignore-all lint/correctness/noUnusedVariables: Biome 2.4 does not treat Svelte template references as uses
 
+import { invoke } from "@tauri-apps/api/core";
+import { onMount } from "svelte";
+import { readCameraScale, settingsForCamera } from "$lib/camera-settings";
 import { type DetectRoi, overlayDetections, slotColor } from "$lib/detect-rois";
+// biome-ignore lint/correctness/noUnusedImports: the template uses this component
+import MeasureOverlay from "$lib/MeasureOverlay.svelte";
+import {
+	type CameraScale,
+	formatReadout,
+	type ImageLine,
+	lineLength,
+	type MeasureDraw,
+	measureFrameBox,
+	measureReadout,
+} from "$lib/measure";
 import {
 	detectionCounts,
 	extraPartCount,
 	hasUnexpected,
 } from "$lib/operator/verdict";
 import { useOperator } from "$lib/stores/operator";
+
+const PREVIEW_CHANNEL = "ls-vision-camera-preview";
 
 const {
 	barcodeOverlay,
@@ -181,6 +197,90 @@ function detectionMarks(
 	return marks;
 }
 
+let scale: CameraScale | null = null;
+let scaleCamera = -1;
+let scaleGeneration = 0;
+let measureOn = false;
+let measureLine: ImageLine | null = null;
+let seenView = "";
+
+async function loadOperatorScale(cameraIndex: number) {
+	const generation = ++scaleGeneration;
+	try {
+		const config = await invoke<{ camera?: unknown }>("load_local_config");
+		if (generation !== scaleGeneration || cameraIndex !== scaleCamera) return;
+		scale = settingsForCamera(config.camera, cameraIndex).scale;
+	} catch {
+		if (generation !== scaleGeneration || cameraIndex !== scaleCamera) return;
+		scale = null;
+	}
+}
+
+function toggleMeasure() {
+	measureOn = !measureOn;
+	measureLine = null;
+}
+
+function onMeasureLine(event: CustomEvent<MeasureDraw>) {
+	measureLine = event.detail.line;
+}
+
+$: if (Number($operator.cameraIndex) !== scaleCamera) {
+	scaleCamera = Number($operator.cameraIndex);
+	measureLine = null;
+	void loadOperatorScale(scaleCamera);
+}
+
+$: measureBox = measureFrameBox(
+	$zoom,
+	$operator.frameWidth,
+	$operator.frameHeight,
+	$operator.paneWidth,
+	$operator.paneHeight,
+);
+$: measureRead = measureLine
+	? measureReadout(lineLength(measureLine), $operator.paneWidth, scale)
+	: null;
+$: measureLabel = measureRead ? formatReadout(measureRead) : "";
+$: cameraReady =
+	Boolean($operator.snapshot) ||
+	($operator.livePainted && $operator.paneWidth > 0);
+$: measureNote = !measureOn
+	? ""
+	: !cameraReady
+		? "Open the camera to measure."
+		: measureLabel
+			? measureLabel
+			: scale
+				? "Draw a straight line to measure."
+				: "No scale set for this camera. Draw a line to see pixels.";
+$: measureWarn = measureOn && (!scale || !cameraReady);
+$: viewKey = `${$operator.cameraIndex}:${$operator.snapshot?.takenAt ?? "live"}:${$operator.paneWidth}x${$operator.paneHeight}`;
+$: if (viewKey !== seenView) {
+	const first = seenView === "";
+	seenView = viewKey;
+	if (!first) measureLine = null;
+}
+
+onMount(() => {
+	const channel = new BroadcastChannel(PREVIEW_CHANNEL);
+	channel.onmessage = (event) => {
+		const data = event.data;
+		if (!data || typeof data !== "object" || !("scale" in data)) return;
+		if (Number(data.index) !== scaleCamera) return;
+		scale = readCameraScale(data.scale);
+		measureLine = null;
+	};
+	const onFocus = () => {
+		void loadOperatorScale(scaleCamera);
+	};
+	window.addEventListener("focus", onFocus);
+	return () => {
+		channel.close();
+		window.removeEventListener("focus", onFocus);
+	};
+});
+
 function slotSquareClass(roi: DetectRoi | null): string {
 	if (!roi) return "border-neutral-700 bg-neutral-800 text-neutral-500";
 	if (roi.enabled) return "border-green-400 bg-green-500 text-neutral-950";
@@ -238,10 +338,26 @@ $: bannerCount = (wrongParts ? 1 : 0) + (extraParts > 0 ? 1 : 0);
 
 <section class="flex min-h-0 min-w-0 flex-col overflow-hidden border border-neutral-700 bg-black">
 	<div class="flex shrink-0 items-center justify-between border-b border-neutral-800 px-3 py-1.5">
-		<div class="flex items-center gap-2">
+		<div class="flex min-w-0 items-center gap-2">
 			<h2 class="text-[11px] font-semibold uppercase tracking-widest text-neutral-500">
 				{$operator.snapshot ? "Snapshot" : "Camera"}
 			</h2>
+			<button
+				type="button"
+				class="inline-flex h-7 shrink-0 items-center border px-2 text-xs font-semibold {measureOn
+					? 'border-blue-500 bg-blue-600 text-white'
+					: 'border-neutral-600 bg-neutral-800 text-neutral-100'}"
+				aria-pressed={measureOn}
+				aria-label="Measure"
+				on:click={toggleMeasure}
+			>
+				Measure
+			</button>
+			{#if measureNote}
+				<p class="min-w-0 truncate text-xs {measureWarn ? 'text-amber-200' : 'text-neutral-200'}">
+					{measureNote}
+				</p>
+			{/if}
 			{#if !$operator.admin && $operator.detectRois.some((roi) => roi)}
 				<div class="flex items-center gap-1" role="group" aria-label="Detect slots">
 					{#each [1, 2, 3, 4] as slot (slot)}
@@ -588,6 +704,24 @@ $: bannerCount = (wrongParts ? 1 : 0) + (extraParts > 0 ? 1 : 0);
 			{#if $operator.draftMark}
 				<div class="pointer-events-none absolute z-50" style={draftStyle}></div>
 			{/if}
+		{/if}
+		{#if measureOn && measureBox}
+			<div
+				class="absolute z-20"
+				style:left="{measureBox.left}px"
+				style:top="{measureBox.top}px"
+				style:width="{measureBox.width}px"
+				style:height="{measureBox.height}px"
+			>
+				<MeasureOverlay
+					active={measureOn && !$operator.drawing && !$operator.barcodeDrawing}
+					imageWidth={$operator.paneWidth}
+					imageHeight={$operator.paneHeight}
+					line={measureLine}
+					label={measureLabel}
+					on:line={onMeasureLine}
+				/>
+			</div>
 		{/if}
 	</div>
 </section>
