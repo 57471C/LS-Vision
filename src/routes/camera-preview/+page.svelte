@@ -5,8 +5,10 @@ import { invoke } from "@tauri-apps/api/core";
 import { onDestroy, onMount, tick } from "svelte";
 import {
 	assignActiveCamera,
+	readUvcSettings,
 	retainCameraSettings,
 	settingsForCamera,
+	type UvcSettings,
 } from "$lib/camera-settings";
 // biome-ignore lint/correctness/noUnusedImports: the template uses this component
 import MeasureOverlay from "$lib/MeasureOverlay.svelte";
@@ -320,6 +322,9 @@ let focusTimer: ReturnType<typeof setTimeout> | null = null;
 let focusLoadId = 0;
 let focusEpoch = 0;
 let focusChain: Promise<void> = Promise.resolve();
+let exposureAbsolute = 156;
+let gain = 0;
+let controlNotice = "";
 let closed = false;
 
 function objectField(value: unknown): Record<string, unknown> {
@@ -390,17 +395,96 @@ function sendFocus(cameraIndex: number, value: number) {
 async function applyStoredFocus(cameraIndex: number) {
 	const loadId = ++focusLoadId;
 	let stored: number | null = null;
+	let uvc: UvcSettings = readUvcSettings(null);
 	try {
 		const config = await invoke<{ camera?: unknown }>("load_local_config");
 		stored = readStoredFocus(config.camera, cameraIndex);
+		uvc = readUvcSettings(config.camera);
 	} catch {
 		stored = null;
 	}
 	if (closed || loadId !== focusLoadId || cameraIndex !== index) return;
-	focus = stored ?? 50;
+	exposureAbsolute = uvc.exposureAbsolute;
+	gain = uvc.gain;
+	controlNotice = "";
 	focusNotice = "";
-	focusStatus = stored === null ? "Autofocus" : "";
-	if (stored !== null) sendFocus(cameraIndex, stored);
+	if (stored !== null) {
+		focus = stored;
+		focusStatus = "";
+		sendFocus(cameraIndex, stored);
+	} else if (!uvc.autoFocus) {
+		focus = uvc.focusAbsolute;
+		focusStatus = "";
+		sendFocus(cameraIndex, uvc.focusAbsolute);
+	} else {
+		focus = 50;
+		focusStatus = "Autofocus";
+	}
+	sendExposure(cameraIndex, uvc.exposureAbsolute);
+	sendGain(cameraIndex, uvc.gain);
+}
+
+function sendExposure(cameraIndex: number, value: number) {
+	const run = focusChain.then(async () => {
+		if (closed || cameraIndex !== index || exposureAbsolute !== value) return;
+		try {
+			const body = await invoke<PreviewBody>("set_camera_exposure", {
+				index: cameraIndex,
+				exposureAbsolute: value,
+			});
+			if (closed || cameraIndex !== index || exposureAbsolute !== value) return;
+			if (body.status === "fail") {
+				controlNotice = body.message || "Could not set exposure.";
+			}
+		} catch (err: unknown) {
+			if (closed || cameraIndex !== index || exposureAbsolute !== value) return;
+			controlNotice = invokeMessage(err, "Could not set exposure.");
+		}
+	});
+	focusChain = run.then(
+		() => undefined,
+		() => undefined,
+	);
+}
+
+function sendGain(cameraIndex: number, value: number) {
+	const run = focusChain.then(async () => {
+		if (closed || cameraIndex !== index || gain !== value) return;
+		try {
+			const body = await invoke<PreviewBody>("set_camera_gain", {
+				index: cameraIndex,
+				gain: value,
+			});
+			if (closed || cameraIndex !== index || gain !== value) return;
+			if (body.status === "fail") {
+				controlNotice = body.message || "Could not set gain.";
+			}
+		} catch (err: unknown) {
+			if (closed || cameraIndex !== index || gain !== value) return;
+			controlNotice = invokeMessage(err, "Could not set gain.");
+		}
+	});
+	focusChain = run.then(
+		() => undefined,
+		() => undefined,
+	);
+}
+
+function onExposureChange(event: Event) {
+	const raw = Number((event.currentTarget as HTMLInputElement).value);
+	if (!Number.isInteger(raw) || raw < -13 || raw > 20000 || snapshotOpen)
+		return;
+	exposureAbsolute = raw;
+	controlNotice = "";
+	sendExposure(index, raw);
+}
+
+function onGainChange(event: Event) {
+	const raw = Number((event.currentTarget as HTMLInputElement).value);
+	if (!Number.isInteger(raw) || raw < 0 || raw > 255 || snapshotOpen) return;
+	gain = raw;
+	controlNotice = "";
+	sendGain(index, raw);
 }
 
 function onAutoFocus() {
@@ -1506,7 +1590,7 @@ onDestroy(() => {
 		</div>
 	</header>
 	<p class="shrink-0 border-b border-neutral-800 px-4 py-1 text-[11px] text-neutral-500">
-		Focus slider or Auto · Ctrl+wheel zoom · Space+drag pan · Enter snapshot · \ detect
+		Exposure, gain, and focus · Ctrl+wheel zoom · Space+drag pan · Enter snapshot · \ detect
 	</p>
 	{#if scaleMode}
 		<p class="shrink-0 px-4 py-1 text-xs text-amber-200">Draw a straight line of a known length.</p>
@@ -1787,9 +1871,45 @@ onDestroy(() => {
 			</p>
 		{/if}
 		<div
-			class="absolute inset-x-0 bottom-0 z-[1] flex items-center gap-3 bg-neutral-950/80 px-4 py-2"
+			class="absolute inset-x-0 bottom-0 z-[1] flex flex-col gap-2 bg-neutral-950/80 px-4 py-2"
 			on:pointerdown|stopPropagation
 		>
+			<div class="flex items-center gap-3">
+				<label class="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-widest text-neutral-300" for="preview-exposure">
+					Exposure
+					<input
+						id="preview-exposure"
+						type="number"
+						class="w-20 border border-neutral-600 bg-neutral-950 px-2 py-1 font-mono text-sm font-medium normal-case tracking-normal text-neutral-100"
+						min="-13"
+						max="20000"
+						step="1"
+						value={exposureAbsolute}
+						aria-label="Exposure"
+						disabled={snapshotOpen}
+						on:change={onExposureChange}
+					/>
+				</label>
+				<label class="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-widest text-neutral-300" for="preview-gain">
+					Gain
+					<input
+						id="preview-gain"
+						type="number"
+						class="w-16 border border-neutral-600 bg-neutral-950 px-2 py-1 font-mono text-sm font-medium normal-case tracking-normal text-neutral-100"
+						min="0"
+						max="255"
+						step="1"
+						value={gain}
+						aria-label="Gain"
+						disabled={snapshotOpen}
+						on:change={onGainChange}
+					/>
+				</label>
+				{#if controlNotice}
+					<span class="min-w-0 truncate text-xs text-amber-300" title={controlNotice}>{controlNotice}</span>
+				{/if}
+			</div>
+			<div class="flex items-center gap-3">
 			<span class="shrink-0 text-[11px] font-semibold uppercase tracking-widest text-neutral-300">Focus</span>
 			<input
 				type="range"
@@ -1834,6 +1954,7 @@ onDestroy(() => {
 				{:else if detectNote}
 					<span class="max-w-40 truncate text-xs text-amber-200" title={detectNote}>{detectNote}</span>
 				{/if}
+			</div>
 			</div>
 		</div>
 	</div>
