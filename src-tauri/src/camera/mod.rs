@@ -16,13 +16,15 @@
 //! `capture_snapshot` keeps the selected mode. `capture_preview` scales
 //! that frame to fit in 1280×720. Those two commands stay the public
 //! stream. `InspectionCamera` sits under them: `UvcBackend` applies the
-//! saved UVC exposure, focus, white balance, and gain on the open device.
-//! A later `PylonBackend` can implement the same trait. It is a stub, and
-//! this crate does not link the Pylon SDK. Brightness and contrast are
+//! saved UVC exposure, focus, white balance, and gain on the open device
+//! after the mode is selected and before the first sample. A rejected
+//! control is logged and does not stop the stream. Later changes write
+//! that same handle and do not pause frame delivery. `PylonBackend`
+//! returns "Pylon backend not linked yet" and does not open this reader.
+//! This crate does not link the Pylon SDK. Brightness and contrast are
 //! stored by Settings and are not applied here.
 
 use std::collections::VecDeque;
-use std::fmt;
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
@@ -44,28 +46,6 @@ const FIRST_FRAME_WAIT: Duration = Duration::from_secs(4);
 const RELEASE_WAIT: Duration = Duration::from_millis(250);
 const RESOURCE_CODE: u32 = 0xC00D_3704;
 
-/// Failure from a camera backend. The message is safe to show on the preview.
-#[derive(Debug, Clone)]
-pub struct CameraError {
-    message: String,
-}
-
-impl CameraError {
-    pub fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
-    }
-}
-
-impl fmt::Display for CameraError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for CameraError {}
-
 /// Exposure for [`InspectionCamera::set_exposure`].
 /// `absolute` is the UVC exposure-time absolute control, in units of 100 µs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,14 +54,24 @@ pub struct ExposureConfig {
     pub absolute: i32,
 }
 
+const PYLON_NOT_LINKED: &str = "Pylon backend not linked yet";
+
 /// One capture device. The Media Foundation reader still owns the live
 /// preview and the snapshot. A backend uses this trait for a still frame
-/// and for exposure and gain, so a Pylon device can replace the UVC body
-/// without a new operator path.
+/// and for exposure, gain, focus, and white balance, so a Pylon device can
+/// replace the UVC body without a new operator path. Focus and white
+/// balance default to no-ops so a backend that does not own those controls
+/// can leave them unimplemented.
 pub trait InspectionCamera: Send + Sync {
-    fn capture_frame(&mut self) -> Result<RgbImage, CameraError>;
-    fn set_exposure(&mut self, exposure: ExposureConfig) -> Result<(), CameraError>;
-    fn set_gain(&mut self, gain_db: f32) -> Result<(), CameraError>;
+    fn capture_frame(&mut self) -> Result<image::RgbImage, String>;
+    fn set_exposure(&mut self, config: &ExposureConfig) -> Result<(), String>;
+    fn set_gain(&mut self, gain: f32) -> Result<(), String>;
+    fn set_focus(&mut self, _auto: bool, _focus_absolute: Option<i32>) -> Result<(), String> {
+        Ok(())
+    }
+    fn set_white_balance(&mut self, _auto: bool, _kelvin: Option<i32>) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,24 +156,47 @@ impl UvcBackend {
 }
 
 impl InspectionCamera for UvcBackend {
-    fn capture_frame(&mut self) -> Result<RgbImage, CameraError> {
-        let frame = fetch_frame(self.index, true).map_err(CameraError::new)?;
-        let (rgb, width, height) = use_frame(&frame, rgb_frame).map_err(CameraError::new)?;
+    fn capture_frame(&mut self) -> Result<image::RgbImage, String> {
+        let frame = fetch_frame(self.index, true)?;
+        let (rgb, width, height) = use_frame(&frame, rgb_frame)?;
         RgbImage::from_raw(width, height, rgb)
-            .ok_or_else(|| CameraError::new("Could not build the camera image."))
+            .ok_or_else(|| "Could not build the camera image.".to_string())
     }
 
-    fn set_exposure(&mut self, exposure: ExposureConfig) -> Result<(), CameraError> {
-        self.settings.auto_exposure = exposure.auto;
-        self.settings.exposure_absolute = exposure.absolute;
-        let applied = apply_exposure(self.index, exposure.absolute).map_err(CameraError::new)?;
+    fn set_exposure(&mut self, config: &ExposureConfig) -> Result<(), String> {
+        self.settings.auto_exposure = config.auto;
+        self.settings.exposure_absolute = config.absolute;
+        let applied = apply_exposure(self.index, config.auto, config.absolute)?;
         self.applied = Some(applied);
         Ok(())
     }
 
-    fn set_gain(&mut self, gain_db: f32) -> Result<(), CameraError> {
-        self.settings.gain = gain_db;
-        let applied = apply_gain(self.index, gain_db).map_err(CameraError::new)?;
+    fn set_gain(&mut self, gain: f32) -> Result<(), String> {
+        self.settings.gain = gain;
+        let applied = apply_gain(self.index, gain)?;
+        self.applied = Some(applied);
+        Ok(())
+    }
+
+    fn set_focus(&mut self, auto: bool, focus_absolute: Option<i32>) -> Result<(), String> {
+        self.settings.auto_focus = auto;
+        if let Some(value) = focus_absolute {
+            self.settings.focus_absolute = value.clamp(0, 100) as u32;
+        }
+        let request = if auto {
+            FocusRequest::Auto
+        } else {
+            FocusRequest::Manual(self.settings.focus_absolute)
+        };
+        submit_focus(self.index, request)
+    }
+
+    fn set_white_balance(&mut self, auto: bool, kelvin: Option<i32>) -> Result<(), String> {
+        self.settings.auto_white_balance = auto;
+        if let Some(value) = kelvin {
+            self.settings.white_balance_kelvin = value;
+        }
+        let applied = apply_white_balance(self.index, auto, self.settings.white_balance_kelvin)?;
         self.applied = Some(applied);
         Ok(())
     }
@@ -203,26 +216,38 @@ impl PylonBackend {
 }
 
 impl InspectionCamera for PylonBackend {
-    fn capture_frame(&mut self) -> Result<RgbImage, CameraError> {
-        Err(CameraError::new("Pylon cameras are not available yet."))
+    fn capture_frame(&mut self) -> Result<image::RgbImage, String> {
+        Err(PYLON_NOT_LINKED.to_string())
     }
 
-    fn set_exposure(&mut self, _exposure: ExposureConfig) -> Result<(), CameraError> {
-        Err(CameraError::new("Pylon cameras are not available yet."))
+    fn set_exposure(&mut self, _config: &ExposureConfig) -> Result<(), String> {
+        Err(PYLON_NOT_LINKED.to_string())
     }
 
-    fn set_gain(&mut self, _gain_db: f32) -> Result<(), CameraError> {
-        Err(CameraError::new("Pylon cameras are not available yet."))
+    fn set_gain(&mut self, _gain: f32) -> Result<(), String> {
+        Err(PYLON_NOT_LINKED.to_string())
     }
 }
 
 /// The backend named by `camera.type`. Pylon is constructed so the trait
-/// stays the only capture surface a later SDK has to fill in.
+/// stays the only capture surface a later SDK has to fill in. Selecting it
+/// logs once that the backend is not linked. Capture then returns
+/// [`PYLON_NOT_LINKED`] and does not open the Media Foundation stream.
 pub fn open_backend(driver: &LoadedCameraDriver) -> Box<dyn InspectionCamera> {
     match driver.kind {
         CameraDriverKind::Uvc => Box::new(UvcBackend::new(driver.device_index, driver.uvc)),
-        CameraDriverKind::Pylon => Box::new(PylonBackend::new(driver.pylon.clone())),
+        CameraDriverKind::Pylon => {
+            log_pylon_unlinked();
+            Box::new(PylonBackend::new(driver.pylon.clone()))
+        }
     }
+}
+
+fn log_pylon_unlinked() {
+    static LOGGED: OnceLock<()> = OnceLock::new();
+    LOGGED.get_or_init(|| {
+        eprintln!("Pylon backend is selected but not linked.");
+    });
 }
 
 struct Frame {
@@ -329,12 +354,19 @@ enum Job {
     },
     Exposure {
         index: u32,
+        auto: bool,
         absolute: i32,
         reply: Sender<Result<i32, String>>,
     },
     Gain {
         index: u32,
         gain: f32,
+        reply: Sender<Result<i32, String>>,
+    },
+    WhiteBalance {
+        index: u32,
+        auto: bool,
+        kelvin: i32,
         reply: Sender<Result<i32, String>>,
     },
 }
@@ -376,6 +408,9 @@ fn camera_loop(incoming: mpsc::Receiver<Job>) {
                 Job::Gain { reply, .. } => {
                     let _ = reply.send(Err(message));
                 }
+                Job::WhiteBalance { reply, .. } => {
+                    let _ = reply.send(Err(message));
+                }
             }
             continue;
         }
@@ -402,10 +437,11 @@ fn camera_loop(incoming: mpsc::Receiver<Job>) {
             }
             Job::Exposure {
                 index,
+                auto,
                 absolute,
                 reply,
             } => {
-                let _ = reply.send(apply_exposure_job(&mut open, index, absolute));
+                let _ = reply.send(apply_exposure_job(&mut open, index, auto, absolute));
             }
             Job::Gain {
                 index,
@@ -413,6 +449,14 @@ fn camera_loop(incoming: mpsc::Receiver<Job>) {
                 reply,
             } => {
                 let _ = reply.send(apply_gain_job(&mut open, index, gain));
+            }
+            Job::WhiteBalance {
+                index,
+                auto,
+                kelvin,
+                reply,
+            } => {
+                let _ = reply.send(apply_white_balance_job(&mut open, index, auto, kelvin));
             }
         }
     }
@@ -554,18 +598,8 @@ pub fn set_camera_focus(index: Option<u32>, focus: u32) -> Result<Value, String>
     if focus > 100 {
         return Ok(fail("Focus must be from 0 to 100."));
     }
-    let (tx, rx) = mpsc::channel();
-    jobs()
-        .send(Job::Focus {
-            index,
-            request: FocusRequest::Manual(focus),
-            reply: tx,
-        })
-        .map_err(|_| "Camera thread stopped.".to_string())?;
-    match rx.recv() {
-        Ok(Ok(())) => {}
-        Ok(Err(message)) => return Ok(fail(&message)),
-        Err(_) => return Err("Camera thread stopped.".to_string()),
+    if let Err(message) = submit_focus(index, FocusRequest::Manual(focus)) {
+        return Ok(fail(&message));
     }
     if let Err(message) = remember_focus(index, Some(focus)) {
         return Ok(fail(&message));
@@ -584,18 +618,8 @@ pub fn set_camera_autofocus(index: Option<u32>) -> Result<Value, String> {
     if index > 32 {
         return Ok(fail("Camera index must be from 0 to 32."));
     }
-    let (tx, rx) = mpsc::channel();
-    jobs()
-        .send(Job::Focus {
-            index,
-            request: FocusRequest::Auto,
-            reply: tx,
-        })
-        .map_err(|_| "Camera thread stopped.".to_string())?;
-    match rx.recv() {
-        Ok(Ok(())) => {}
-        Ok(Err(message)) => return Ok(fail(&message)),
-        Err(_) => return Err("Camera thread stopped.".to_string()),
+    if let Err(message) = submit_focus(index, FocusRequest::Auto) {
+        return Ok(fail(&message));
     }
     if let Err(message) = remember_focus(index, None) {
         return Ok(fail(&message));
@@ -619,11 +643,11 @@ pub fn set_camera_exposure(index: Option<u32>, exposure_absolute: i32) -> Result
         return Ok(fail("Exposure must be from -13 to 20000."));
     }
     let mut backend = UvcBackend::new(index, loaded_driver().uvc);
-    if let Err(error) = backend.set_exposure(ExposureConfig {
+    if let Err(message) = backend.set_exposure(&ExposureConfig {
         auto: false,
         absolute: exposure_absolute,
     }) {
-        return Ok(fail(&error.message));
+        return Ok(fail(&message));
     }
     if let Err(message) = remember_uvc_exposure(exposure_absolute) {
         return Ok(fail(&message));
@@ -648,8 +672,8 @@ pub fn set_camera_gain(index: Option<u32>, gain: f32) -> Result<Value, String> {
         return Ok(fail("Gain must be from 0 to 255."));
     }
     let mut backend = UvcBackend::new(index, loaded_driver().uvc);
-    if let Err(error) = backend.set_gain(gain) {
-        return Ok(fail(&error.message));
+    if let Err(message) = backend.set_gain(gain) {
+        return Ok(fail(&message));
     }
     if let Err(message) = remember_uvc_gain(gain) {
         return Ok(fail(&message));
@@ -721,6 +745,7 @@ fn snapshot_body(frame: &Frame, jpeg: &[u8], width: u32, height: u32) -> Value {
 }
 
 fn modes_for(open: &mut Option<session::Device>, index: u32) -> Result<Vec<Mode>, String> {
+    refuse_unlinked_pylon(open)?;
     if let Some(device) = open.as_ref()
         && device.index() == index
     {
@@ -736,6 +761,7 @@ fn modes_for(open: &mut Option<session::Device>, index: u32) -> Result<Vec<Mode>
 }
 
 fn grab(open: &mut Option<session::Device>, index: u32, still: bool) -> Result<Frame, String> {
+    refuse_unlinked_pylon(open)?;
     let opened = ensure_device(open, index)?;
     if opened {
         apply_open_controls(open);
@@ -777,38 +803,64 @@ fn ensure_device(open: &mut Option<session::Device>, index: u32) -> Result<bool,
     Ok(true)
 }
 
-fn apply_saved_focus(open: &mut Option<session::Device>) {
-    let Some(device) = open.as_ref() else {
-        return;
-    };
-    let Some(focus) = stored_focus_for(device.index()) else {
-        return;
-    };
-    let _ = device.set_focus(focus);
-}
-
-/// UVC settings on a newly opened reader. A Pylon type leaves this stream
-/// on the saved focus only. `pylonSettings` is not sent to the device.
+/// UVC settings on an open reader. Called again after `open_device` returns
+/// so a driver that only accepts controls once streaming has started still
+/// receives them. The first write happens inside `try_open`, before
+/// `ReadSample`. A rejected control is logged and does not stop the stream.
+/// Pylon never opens this reader.
 fn apply_open_controls(open: &mut Option<session::Device>) {
     let Some(device) = open.as_ref() else {
         return;
     };
-    let index = device.index();
+    apply_device_controls(device, "open");
+}
+
+fn apply_device_controls(device: &session::Device, phase: &str) {
     let driver = loaded_driver();
-    let Some(settings) = uvc_controls_for_open(&driver, stored_focus_for(index)) else {
-        apply_saved_focus(open);
+    if driver.kind != CameraDriverKind::Uvc {
+        return;
+    }
+    let Some(settings) = uvc_controls_for_open(&driver, stored_focus_for(device.index())) else {
         return;
     };
-    if let Err(message) = device.apply_uvc(&settings) {
-        eprintln!("UVC controls: {message}");
+    if let Err(message) = device.apply_uvc(&settings, phase) {
+        eprintln!("UVC warning ({phase}): {message}");
     }
 }
 
-fn apply_exposure(index: u32, absolute: i32) -> Result<i32, String> {
+/// `camera.type` of `pylon` constructs the stub and returns its error.
+/// The Media Foundation device is shut down and is not opened again.
+fn refuse_unlinked_pylon(open: &mut Option<session::Device>) -> Result<(), String> {
+    let driver = loaded_driver();
+    if driver.kind != CameraDriverKind::Pylon {
+        return Ok(());
+    }
+    if let Some(mut previous) = open.take() {
+        previous.shutdown();
+    }
+    let mut backend = open_backend(&driver);
+    backend.capture_frame().map(|_| ())
+}
+
+fn submit_focus(index: u32, request: FocusRequest) -> Result<(), String> {
+    let (tx, rx) = mpsc::channel();
+    jobs()
+        .send(Job::Focus {
+            index,
+            request,
+            reply: tx,
+        })
+        .map_err(|_| "Camera thread stopped.".to_string())?;
+    rx.recv()
+        .map_err(|_| "Camera thread stopped.".to_string())?
+}
+
+fn apply_exposure(index: u32, auto: bool, absolute: i32) -> Result<i32, String> {
     let (tx, rx) = mpsc::channel();
     jobs()
         .send(Job::Exposure {
             index,
+            auto,
             absolute,
             reply: tx,
         })
@@ -830,26 +882,70 @@ fn apply_gain(index: u32, gain: f32) -> Result<i32, String> {
         .map_err(|_| "Camera thread stopped.".to_string())?
 }
 
+fn apply_white_balance(index: u32, auto: bool, kelvin: i32) -> Result<i32, String> {
+    let (tx, rx) = mpsc::channel();
+    jobs()
+        .send(Job::WhiteBalance {
+            index,
+            auto,
+            kelvin,
+            reply: tx,
+        })
+        .map_err(|_| "Camera thread stopped.".to_string())?;
+    rx.recv()
+        .map_err(|_| "Camera thread stopped.".to_string())?
+}
+
 fn apply_exposure_job(
     open: &mut Option<session::Device>,
     index: u32,
+    auto: bool,
     absolute: i32,
 ) -> Result<i32, String> {
+    refuse_unlinked_pylon(open)?;
     let opened = ensure_device(open, index)?;
     if opened {
         apply_open_controls(open);
     }
     let device = open.as_ref().expect("camera was opened");
-    device.set_exposure_control(false, absolute)
+    let applied = device.set_exposure_control(auto, absolute)?;
+    if !auto {
+        log_if_clamped("exposure", i64::from(absolute), applied);
+    }
+    Ok(applied)
 }
 
 fn apply_gain_job(open: &mut Option<session::Device>, index: u32, gain: f32) -> Result<i32, String> {
+    refuse_unlinked_pylon(open)?;
     let opened = ensure_device(open, index)?;
     if opened {
         apply_open_controls(open);
     }
     let device = open.as_ref().expect("camera was opened");
-    device.set_gain_control(gain)
+    let applied = device.set_gain_control(gain)?;
+    if gain.is_finite() {
+        log_if_clamped("gain", i64::from(gain.round() as i32), applied);
+    }
+    Ok(applied)
+}
+
+fn apply_white_balance_job(
+    open: &mut Option<session::Device>,
+    index: u32,
+    auto: bool,
+    kelvin: i32,
+) -> Result<i32, String> {
+    refuse_unlinked_pylon(open)?;
+    let opened = ensure_device(open, index)?;
+    if opened {
+        apply_open_controls(open);
+    }
+    let device = open.as_ref().expect("camera was opened");
+    let applied = device.set_white_balance_control(auto, kelvin)?;
+    if !auto {
+        log_if_clamped("white balance", i64::from(kelvin), applied);
+    }
+    Ok(applied)
 }
 
 fn apply_focus(
@@ -857,13 +953,18 @@ fn apply_focus(
     index: u32,
     request: FocusRequest,
 ) -> Result<(), String> {
+    refuse_unlinked_pylon(open)?;
     let opened = ensure_device(open, index)?;
     if opened {
         apply_open_controls(open);
     }
     let device = open.as_ref().expect("camera was opened");
     match request {
-        FocusRequest::Manual(focus) => device.set_focus(focus),
+        FocusRequest::Manual(focus) => {
+            let applied = device.set_focus(focus)?;
+            log_if_clamped("focus", i64::from(focus), applied);
+            Ok(())
+        }
         FocusRequest::Auto => device.set_autofocus(),
     }
 }
@@ -945,8 +1046,7 @@ pub fn load_camera_driver(camera: &Value) -> LoadedCameraDriver {
     }
 }
 
-/// Settings to push when a UVC reader opens. `None` means this stream is not
-/// a UVC driver, so the caller keeps the older focus-only behaviour.
+/// Settings to push when a UVC reader opens. `None` when this camera is not UVC.
 pub fn uvc_controls_for_open(
     driver: &LoadedCameraDriver,
     stored_focus: Option<u32>,
@@ -1081,6 +1181,22 @@ fn json_gain(gain: f32) -> Value {
         json!(gain as i32)
     } else {
         json!(gain)
+    }
+}
+
+/// One control in the open log. A driver value that differs from the request
+/// is the value that was written, including the exposure log2 conversion.
+fn control_note(label: &str, requested: i64, applied: i32) -> String {
+    if requested == i64::from(applied) {
+        format!("{label} {applied}")
+    } else {
+        format!("{label} {requested} applied as {applied}")
+    }
+}
+
+fn log_if_clamped(label: &str, requested: i64, applied: i32) {
+    if requested != i64::from(applied) {
+        eprintln!("UVC controls: {}", control_note(label, requested, applied));
     }
 }
 
@@ -2329,9 +2445,13 @@ mod session {
             self.wait_slot(timeout, false)
         }
 
-        /// Manual focus. A camera that cannot be cast, or whose range or set
-        /// call fails, returns an error and leaves the open session running.
-        pub(super) fn set_focus(&self, percent: u32) -> Result<(), String> {
+        /// Manual focus. `percent` is the 0–100 slider stored as `focusAbsolute`.
+        /// The driver min, max, and step are queried and the slider is mapped
+        /// onto that range, so the written value is inside the range and on a
+        /// step. The returned value is the one the driver kept. A camera that
+        /// cannot be cast, or whose range or set call fails, returns an error
+        /// and leaves the open session running.
+        pub(super) fn set_focus(&self, percent: u32) -> Result<i32, String> {
             let range = self.focus_range()?;
             let manual = CameraControl_Flags_Manual.0;
             if range.caps != 0 && range.caps & manual == 0 {
@@ -2343,8 +2463,17 @@ mod session {
                     .control
                     .Set(CameraControl_Focus.0, value, manual)
                     .map_err(|err| short_camera(&mf_error(&err)))?;
+                let mut got = value;
+                let mut got_flags = manual;
+                if range
+                    .control
+                    .Get(CameraControl_Focus.0, &mut got, &mut got_flags)
+                    .is_ok()
+                {
+                    return Ok(got);
+                }
             }
-            Ok(())
+            Ok(value)
         }
 
         /// Autofocus. The same failure leaves the open session running.
@@ -2365,54 +2494,68 @@ mod session {
 
         /// Push the UVC block onto this open reader. One rejected control
         /// does not undo the others. The caller keeps the stream either way.
-        pub(super) fn apply_uvc(&self, settings: &UvcSettings) -> Result<(), String> {
+        /// `phase` is only used in the log (`before capture` or `open`).
+        pub(super) fn apply_uvc(&self, settings: &UvcSettings, phase: &str) -> Result<(), String> {
             let mut notes = Vec::new();
             let mut errors = Vec::new();
-            match self.set_exposure_control(settings.auto_exposure, settings.exposure_absolute) {
+            if settings.auto_exposure {
+                match self.set_exposure_control(true, settings.exposure_absolute) {
+                    Ok(_) => notes.push("exposure auto".to_string()),
+                    Err(err) => errors.push(err),
+                }
+            } else {
+                match self.set_exposure_control(false, settings.exposure_absolute) {
+                    Ok(applied) => notes.push(super::control_note(
+                        "exposure",
+                        i64::from(settings.exposure_absolute),
+                        applied,
+                    )),
+                    Err(err) => errors.push(err),
+                }
+            }
+            if settings.auto_white_balance {
+                match self.set_white_balance_control(true, settings.white_balance_kelvin) {
+                    Ok(_) => notes.push("white balance auto".to_string()),
+                    Err(err) => errors.push(err),
+                }
+            } else {
+                match self.set_white_balance_control(false, settings.white_balance_kelvin) {
+                    Ok(applied) => notes.push(super::control_note(
+                        "white balance",
+                        i64::from(settings.white_balance_kelvin),
+                        applied,
+                    )),
+                    Err(err) => errors.push(err),
+                }
+            }
+            match self.set_gain_control(settings.gain) {
                 Ok(applied) => {
-                    notes.push(format!(
-                        "exposure {} -> {applied}",
-                        settings.exposure_absolute
-                    ));
+                    let requested = if settings.gain.is_finite() {
+                        i64::from(settings.gain.round() as i32)
+                    } else {
+                        i64::from(applied)
+                    };
+                    notes.push(super::control_note("gain", requested, applied));
                 }
                 Err(err) => errors.push(err),
             }
-            match self.set_white_balance_control(
-                settings.auto_white_balance,
-                settings.white_balance_kelvin,
-            ) {
-                Ok(applied) => notes.push(format!(
-                    "white balance {} -> {applied}",
-                    settings.white_balance_kelvin
-                )),
-                Err(err) => errors.push(err),
-            }
-            match self.set_gain_control(settings.gain) {
-                Ok(applied) => notes.push(format!("gain {} -> {applied}", settings.gain)),
-                Err(err) => errors.push(err),
-            }
-            let focus = if settings.auto_focus {
+            if settings.auto_focus {
                 match self.set_autofocus() {
-                    Ok(()) => {
-                        notes.push("focus auto".to_string());
-                        Ok(())
-                    }
-                    Err(err) => Err(err),
+                    Ok(()) => notes.push("focus auto".to_string()),
+                    Err(err) => errors.push(err),
                 }
             } else {
                 match self.set_focus(settings.focus_absolute) {
-                    Ok(()) => {
-                        notes.push(format!("focus {}", settings.focus_absolute));
-                        Ok(())
-                    }
-                    Err(err) => Err(err),
+                    Ok(applied) => notes.push(super::control_note(
+                        "focus",
+                        i64::from(settings.focus_absolute),
+                        applied,
+                    )),
+                    Err(err) => errors.push(err),
                 }
-            };
-            if let Err(err) = focus {
-                errors.push(err);
             }
             if !notes.is_empty() {
-                eprintln!("UVC controls: {}", notes.join(", "));
+                eprintln!("UVC controls ({phase}): {}", notes.join(", "));
             }
             if errors.is_empty() {
                 Ok(())
@@ -2953,6 +3096,11 @@ mod session {
             device.shutdown();
             return Err(message);
         }
+        // The source is open and the mode is selected, and ReadSample has not
+        // started the callback. Write exposure, white balance, gain, and focus
+        // on this handle now. A rejected control is a warning. Streaming still
+        // starts, and this call does not run on the frame callback.
+        super::apply_device_controls(&device, "before capture");
         *lock(&shared.reader) = device.reader.clone();
         let started = unsafe {
             device
@@ -3392,7 +3540,7 @@ mod session {
             Err("Camera capture is only available on Windows.".to_string())
         }
 
-        pub(super) fn set_focus(&self, _percent: u32) -> Result<(), String> {
+        pub(super) fn set_focus(&self, _percent: u32) -> Result<i32, String> {
             Err("Camera capture is only available on Windows.".to_string())
         }
 
@@ -3400,7 +3548,7 @@ mod session {
             Err("Camera capture is only available on Windows.".to_string())
         }
 
-        pub(super) fn apply_uvc(&self, _settings: &UvcSettings) -> Result<(), String> {
+        pub(super) fn apply_uvc(&self, _settings: &UvcSettings, _phase: &str) -> Result<(), String> {
             Err("Camera capture is only available on Windows.".to_string())
         }
 
@@ -4037,9 +4185,28 @@ mod tests {
         assert!(uvc_controls_for_open(&pylon, None).is_none());
         let mut backend = open_backend(&pylon);
         let missing = backend.capture_frame().unwrap_err();
-        assert!(missing.to_string().contains("not available"), "{missing}");
-        assert!(backend.set_exposure(ExposureConfig { auto: false, absolute: 156 }).is_err());
-        assert!(backend.set_gain(0.0).is_err());
+        assert_eq!(missing, "Pylon backend not linked yet");
+        let exposure = ExposureConfig {
+            auto: false,
+            absolute: 156,
+        };
+        assert_eq!(
+            backend.set_exposure(&exposure).unwrap_err(),
+            "Pylon backend not linked yet"
+        );
+        assert_eq!(backend.set_gain(0.0).unwrap_err(), "Pylon backend not linked yet");
+        assert!(backend.set_focus(false, Some(25)).is_ok());
+        assert!(backend.set_white_balance(false, Some(4500)).is_ok());
+    }
+
+    #[test]
+    fn clamped_control_logs_the_applied_value() {
+        assert_eq!(control_note("exposure", 156, 156), "exposure 156");
+        assert_eq!(
+            control_note("exposure", 156, -6),
+            "exposure 156 applied as -6"
+        );
+        assert_eq!(control_note("focus", 25, 63), "focus 25 applied as 63");
     }
 
     #[test]
