@@ -3,8 +3,11 @@
 //! `detect_image` reads the latest raw frame. A test-mode file is the
 //! exception: that call passes the chosen image, and the same letterbox
 //! path runs on those pixels. It returns `detections` of
-//! `{ ic, confidence, bbox }` and the model's `classes`. The overlay draws
-//! those boxes on the still, so this command does not encode a JPEG.
+//! `{ ic, confidence, bbox }` and the model's `classes`, plus `items` and
+//! the `transform` used to letterbox that view. Boxes are unpadded to sensor
+//! pixels before the slot-crop origin is added. Millimetres are not applied
+//! to tensor coordinates. The overlay draws those boxes on the still, so
+//! this command does not encode a JPEG.
 //! This command reads `.onnx` only. A `.pt` name is a training file; the page warns and does not detect.
 //!
 //! Boxes are checked against Ultralytics `YOLO(best.onnx)`, not `YOLO(best.pt)`.
@@ -23,6 +26,10 @@ use serde_json::{Value, json};
 use crate::frame::{FrameState, RawFrame};
 use crate::inference_ep::{self, Provider};
 use crate::local_config;
+use crate::vision::letterbox::{
+    DetectedItem, DetectionResponse, LetterboxTransform, TensorNormalization,
+    normalization_from_metadata, yolo_tensor,
+};
 
 const DEFAULT_CONFIDENCE: f32 = 0.45;
 const MIN_CONFIDENCE: f32 = 0.15;
@@ -35,7 +42,6 @@ const MAX_DET: usize = 300;
 const MAX_NMS: usize = 30_000;
 const MAX_WH: f32 = 7680.0;
 const DEFAULT_IMAGE_SIZE: usize = 640;
-const PAD_VALUE: u8 = 114;
 const INTER_RESIZE_COEF_SCALE: i32 = 2048;
 const MAX_PIXELS: usize = 40_000_000;
 const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
@@ -70,11 +76,28 @@ struct Roi {
 }
 
 struct OutputFrame {
-    view_w: i32,
-    view_h: i32,
-    image_size: i32,
+    transform: LetterboxTransform,
     origin_x: i32,
     origin_y: i32,
+}
+
+struct PreparedView {
+    data: Vec<f32>,
+    transform: LetterboxTransform,
+    origin_x: i32,
+    origin_y: i32,
+}
+
+struct Decoded {
+    detections: Vec<Detection>,
+    items: Vec<DetectedItem>,
+}
+
+struct Inference {
+    detections: Vec<Detection>,
+    items: Vec<DetectedItem>,
+    classes: Vec<String>,
+    transform: LetterboxTransform,
 }
 
 struct Candidate {
@@ -100,6 +123,7 @@ struct LoadedModel {
     names: Vec<String>,
     image_size: usize,
     end_to_end: bool,
+    normalization: TensorNormalization,
     requested: Provider,
     provider: Provider,
     openvino: bool,
@@ -443,6 +467,8 @@ pub(crate) struct Letterbox {
     pub(crate) left: i32,
 }
 
+/// DINOv2's square pad. YOLO uses [`LetterboxTransform`] instead: that path
+/// fills RGB 114 and unpads with the same gain the tensor was built from.
 pub(crate) fn letterbox_geometry(width: i32, height: i32, size: i32) -> Letterbox {
     let shape_h = f64::from(height);
     let shape_w = f64::from(width);
@@ -460,74 +486,39 @@ pub(crate) fn letterbox_geometry(width: i32, height: i32, size: i32) -> Letterbo
     }
 }
 
-fn letterbox(rgb: &[u8], width: usize, height: usize, size: usize) -> Result<Vec<u8>, String> {
-    let geometry = letterbox_geometry(width as i32, height as i32, size as i32);
-    if geometry.new_w < 1 || geometry.new_h < 1 {
-        return Err("Could not read the image".to_string());
-    }
-    let new_w = geometry.new_w as usize;
-    let new_h = geometry.new_h as usize;
-    let resized = resize_linear(rgb, width, height, new_w, new_h);
-    let mut canvas = vec![PAD_VALUE; size * size * 3];
-    let top = geometry.top.max(0) as usize;
-    let left = geometry.left.max(0) as usize;
-    for y in 0..new_h {
-        let dst_y = top + y;
-        if dst_y >= size || left >= size {
-            break;
-        }
-        let copy_w = new_w.min(size - left);
-        let src_start = y * new_w * 3;
-        let dst_start = (dst_y * size + left) * 3;
-        canvas[dst_start..dst_start + copy_w * 3]
-            .copy_from_slice(&resized[src_start..src_start + copy_w * 3]);
-    }
-    Ok(canvas)
-}
-
-fn nchw(canvas: &[u8], size: usize) -> Vec<f32> {
-    let plane = size * size;
-    let mut data = vec![0f32; 3 * plane];
-    for y in 0..size {
-        for x in 0..size {
-            let pixel = (y * size + x) * 3;
-            let offset = y * size + x;
-            data[offset] = f32::from(canvas[pixel]) / 255.0;
-            data[plane + offset] = f32::from(canvas[pixel + 1]) / 255.0;
-            data[plane * 2 + offset] = f32::from(canvas[pixel + 2]) / 255.0;
-        }
-    }
-    data
-}
-
+#[cfg(test)]
 fn scale_box(x1: f32, y1: f32, x2: f32, y2: f32, img0_h: i32, img0_w: i32, img1: i32) -> [i32; 4] {
-    // Ultralytics recomputes the gain from the two shapes. It does not reuse
-    // the letterbox offsets. The pad and gain are f64, then applied as f32.
-    let img0_h_f = f64::from(img0_h);
-    let img0_w_f = f64::from(img0_w);
-    let img1_f = f64::from(img1);
-    let gain = (img1_f / img0_h_f).min(img1_f / img0_w_f);
-    let new_h = py_round(img0_h_f * gain);
-    let new_w = py_round(img0_w_f * gain);
-    let gain_y = f64::from(new_h) / img0_h_f;
-    let gain_x = f64::from(new_w) / img0_w_f;
-    let pad_x = py_round((img1_f - f64::from(new_w)) / 2.0 - 0.1);
-    let pad_y = py_round((img1_f - f64::from(new_h)) / 2.0 - 0.1);
-    let gain_x_f = gain_x as f32;
-    let gain_y_f = gain_y as f32;
-    let pad_x_f = pad_x as f32;
-    let pad_y_f = pad_y as f32;
-    let max_x = img0_w as f32;
-    let max_y = img0_h as f32;
-    let left = ((x1 - pad_x_f) / gain_x_f).clamp(0.0, max_x);
-    let top = ((y1 - pad_y_f) / gain_y_f).clamp(0.0, max_y);
-    let right = ((x2 - pad_x_f) / gain_x_f).clamp(0.0, max_x);
-    let bottom = ((y2 - pad_y_f) / gain_y_f).clamp(0.0, max_y);
+    let transform =
+        LetterboxTransform::new(img0_w.max(0) as u32, img0_h.max(0) as u32, img1 as f32);
+    round_sensor_box(transform.unpad_bbox([x1, y1, x2, y2]))
+}
+
+/// Unpad into the letterboxed view, then shift by the crop origin.
+/// The result is native sensor pixels. Millimetres are not applied here,
+/// and the slot rectangle is not used as a tensor-space filter.
+fn sensor_geometry(
+    transform: &LetterboxTransform,
+    bbox: [f32; 4],
+    polygon: &[[f32; 2]],
+    origin_x: i32,
+    origin_y: i32,
+) -> ([f32; 4], Vec<[f32; 2]>) {
+    let view = transform.unpad_bbox(bbox);
+    let points = transform.unpad_polygon(polygon);
+    let ox = origin_x as f32;
+    let oy = origin_y as f32;
+    (
+        [view[0] + ox, view[1] + oy, view[2] + ox, view[3] + oy],
+        points.into_iter().map(|[x, y]| [x + ox, y + oy]).collect(),
+    )
+}
+
+fn round_sensor_box(bbox: [f32; 4]) -> [i32; 4] {
     [
-        py_round(f64::from(left)),
-        py_round(f64::from(top)),
-        py_round(f64::from(right)),
-        py_round(f64::from(bottom)),
+        py_round(f64::from(bbox[0])),
+        py_round(f64::from(bbox[1])),
+        py_round(f64::from(bbox[2])),
+        py_round(f64::from(bbox[3])),
     ]
 }
 
@@ -904,7 +895,7 @@ fn detections_from_output(
     end_to_end: bool,
     frame: OutputFrame,
     conf_threshold: f32,
-) -> Result<Vec<Detection>, String> {
+) -> Result<Decoded, String> {
     if shape.len() != 3 || shape[0] < 1 {
         return Err("Detect failed: unexpected output shape".to_string());
     }
@@ -936,30 +927,33 @@ fn detections_from_output(
         ))
     };
     let mut detections = Vec::with_capacity(chosen.len());
+    let mut items = Vec::with_capacity(chosen.len());
     for item in chosen {
-        let scaled = scale_box(
-            item.x1,
-            item.y1,
-            item.x2,
-            item.y2,
-            frame.view_h,
-            frame.view_w,
-            frame.image_size,
+        // Tensor pixels first. The crop origin is a sensor-pixel shift after that.
+        let (sensor, polygon) = sensor_geometry(
+            &frame.transform,
+            [item.x1, item.y1, item.x2, item.y2],
+            &[],
+            frame.origin_x,
+            frame.origin_y,
         );
+        let ic = class_name(names, item.class_id);
+        let confidence = round_places(f64::from(item.score), 4);
         detections.push(Detection {
-            ic: class_name(names, item.class_id),
-            confidence: round_places(f64::from(item.score), 4),
-            bbox: [
-                scaled[0] + frame.origin_x,
-                scaled[1] + frame.origin_y,
-                scaled[2] + frame.origin_x,
-                scaled[3] + frame.origin_y,
-            ],
+            ic: ic.clone(),
+            confidence,
+            bbox: round_sensor_box(sensor),
             reference_match: None,
             embed: None,
         });
+        items.push(DetectedItem {
+            ic,
+            confidence,
+            bbox: sensor,
+            polygon,
+        });
     }
-    Ok(detections)
+    Ok(Decoded { detections, items })
 }
 
 fn end_to_end_candidates(
@@ -1166,6 +1160,57 @@ fn input_image_size(session: &ort::session::Session) -> usize {
     DEFAULT_IMAGE_SIZE
 }
 
+/// The graph must take float32 NCHW. Spatial size may be fixed or dynamic.
+fn verify_onnx_input(session: &ort::session::Session) -> Result<(), String> {
+    let Some(input) = session.inputs().first() else {
+        return Err("ONNX model has no input".to_string());
+    };
+    let dtype = input.dtype();
+    match dtype.tensor_type() {
+        Some(ort::value::TensorElementType::Float32) => {}
+        Some(_) => return Err("ONNX input is not float32".to_string()),
+        None => return Err("ONNX input is not a tensor".to_string()),
+    }
+    let Some(shape) = dtype.tensor_shape() else {
+        return Err("ONNX input is not a tensor".to_string());
+    };
+    if shape.len() != 4 {
+        return Err("ONNX input is not NCHW".to_string());
+    }
+    if shape[0] != 1 && shape[0] != -1 {
+        return Err("ONNX input batch is not 1".to_string());
+    }
+    if shape[1] != 3 && shape[1] != -1 {
+        return Err("ONNX input is not 3 channels".to_string());
+    }
+    Ok(())
+}
+
+fn normalization_entries(
+    keys: Vec<String>,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> TensorNormalization {
+    let mut entries = Vec::new();
+    for key in keys {
+        if let Some(value) = lookup(&key) {
+            entries.push((key, value));
+        }
+    }
+    for key in ["tensor_normalization", "normalization"] {
+        if entries.iter().any(|(name, _)| name == key) {
+            continue;
+        }
+        if let Some(value) = lookup(key) {
+            entries.push((key.to_string(), value));
+        }
+    }
+    let borrowed: Vec<(&str, &str)> = entries
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    normalization_from_metadata(borrowed)
+}
+
 /// Same `.onnx` file, on the registered OpenVINO plugin's GPU device (Arc iGPU).
 pub(crate) fn open_openvino_session(
     env: &ort::environment::Environment,
@@ -1251,7 +1296,8 @@ fn finish_model(
     session: ort::session::Session,
 ) -> Result<LoadedModel, String> {
     let name = file_name(path);
-    let (names, end_to_end) = {
+    verify_onnx_input(&session).map_err(|err| format!("{name} failed to load: {err}"))?;
+    let (names, end_to_end, normalization) = {
         let metadata = session
             .metadata()
             .map_err(|err| format!("{name} failed to load: {}", short_error(&err.to_string())))?;
@@ -1263,7 +1309,9 @@ fn finish_model(
             let value = value.trim();
             value.eq_ignore_ascii_case("true") || value == "1"
         });
-        (names, end_to_end)
+        let keys = metadata.custom_keys().unwrap_or_default();
+        let normalization = normalization_entries(keys, |key| metadata.custom(key));
+        (names, end_to_end, normalization)
     };
     let image_size = input_image_size(&session);
     let message = if provider == requested {
@@ -1281,6 +1329,7 @@ fn finish_model(
         names,
         image_size,
         end_to_end,
+        normalization,
         requested,
         provider,
         openvino,
@@ -1405,40 +1454,56 @@ pub(crate) fn reload_session() -> Result<(), String> {
     }
 }
 
+/// Saved `tensorNormalization`. A missing or unknown value leaves the model metadata in charge.
+fn tensor_normalization_override(document: &Value) -> Option<TensorNormalization> {
+    document
+        .get("tensorNormalization")
+        .and_then(Value::as_str)
+        .and_then(TensorNormalization::parse)
+}
+
 fn detect_view(
     rgb: &[u8],
     width: u32,
     height: u32,
     roi: Option<&Roi>,
     image_size: usize,
-) -> Result<(Vec<f32>, i32, i32, i32, i32), String> {
+    normalization: TensorNormalization,
+) -> Result<PreparedView, String> {
     let width = width as usize;
     let height = height as usize;
+    // The slot crop is the image YOLO sees. Its origin is stored here and added
+    // only after unpad, so the returned boxes are native sensor pixels.
     let (view, view_w, view_h, origin_x, origin_y) = if let Some(roi) = roi {
         crop_rgb(rgb, width, height, roi)
     } else {
         (rgb.to_vec(), width, height, 0, 0)
     };
-    let canvas = letterbox(&view, view_w, view_h, image_size)?;
-    Ok((
-        nchw(&canvas, image_size),
-        view_w as i32,
-        view_h as i32,
+    let (data, transform) = yolo_tensor(
+        &view,
+        view_w as u32,
+        view_h as u32,
+        image_size as u32,
+        normalization,
+        resize_linear,
+    )?;
+    Ok(PreparedView {
+        data,
+        transform,
         origin_x,
         origin_y,
-    ))
+    })
 }
 
 fn infer_detections(
     model: &mut LoadedModel,
     data: Vec<f32>,
     image_size: usize,
-    view_w: i32,
-    view_h: i32,
+    transform: LetterboxTransform,
     origin_x: i32,
     origin_y: i32,
     conf_threshold: f32,
-) -> Result<Vec<Detection>, String> {
+) -> Result<Decoded, String> {
     let tensor = ort::value::Tensor::from_array(([1usize, 3, image_size, image_size], data))
         .map_err(|err| format!("Detect failed: {}", short_error(&err.to_string())))?;
     let outputs = model
@@ -1454,9 +1519,7 @@ fn infer_detections(
         &model.names,
         model.end_to_end,
         OutputFrame {
-            view_w,
-            view_h,
-            image_size: image_size as i32,
+            transform,
             origin_x,
             origin_y,
         },
@@ -1464,6 +1527,7 @@ fn infer_detections(
     )
 }
 
+#[cfg(test)]
 fn run_model(
     path: &Path,
     rgb: &[u8],
@@ -1472,18 +1536,43 @@ fn run_model(
     roi: Option<&Roi>,
     conf_threshold: f32,
 ) -> Result<(Vec<Detection>, Vec<String>), String> {
-    let image_size = with_model(path, |model| Ok(model.image_size))?;
-    let prepared = detect_view(rgb, width, height, roi, image_size)?;
+    let found = run_inference(path, rgb, width, height, roi, conf_threshold, None)?;
+    Ok((found.detections, found.classes))
+}
+
+fn run_inference(
+    path: &Path,
+    rgb: &[u8],
+    width: u32,
+    height: u32,
+    roi: Option<&Roi>,
+    conf_threshold: f32,
+    document: Option<&Value>,
+) -> Result<Inference, String> {
+    let (image_size, normalization) = with_model(path, |model| {
+        Ok((
+            model.image_size,
+            document
+                .and_then(tensor_normalization_override)
+                .unwrap_or(model.normalization),
+        ))
+    })?;
+    let prepared = detect_view(rgb, width, height, roi, image_size, normalization)?;
     infer_prepared(path, image_size, prepared, conf_threshold)
 }
 
 fn infer_prepared(
     path: &Path,
     image_size: usize,
-    prepared: (Vec<f32>, i32, i32, i32, i32),
+    prepared: PreparedView,
     conf_threshold: f32,
-) -> Result<(Vec<Detection>, Vec<String>), String> {
-    let (data, view_w, view_h, origin_x, origin_y) = prepared;
+) -> Result<Inference, String> {
+    let PreparedView {
+        data,
+        transform,
+        origin_x,
+        origin_y,
+    } = prepared;
     with_model(path, |model| {
         let retry = if model.provider == Provider::Cpu {
             None
@@ -1494,8 +1583,7 @@ fn infer_prepared(
             model,
             data,
             image_size,
-            view_w,
-            view_h,
+            transform,
             origin_x,
             origin_y,
             conf_threshold,
@@ -1525,8 +1613,7 @@ fn infer_prepared(
                     model,
                     retry,
                     image_size,
-                    view_w,
-                    view_h,
+                    transform,
                     origin_x,
                     origin_y,
                     conf_threshold,
@@ -1534,8 +1621,30 @@ fn infer_prepared(
             }
         };
         // The same names this session used to label boxes. Empty gaps are dropped.
-        Ok((found, listed_classes(model.names.clone())))
+        Ok(Inference {
+            detections: found.detections,
+            items: found.items,
+            classes: listed_classes(model.names.clone()),
+            transform,
+        })
     })
+}
+
+fn detection_value(found: Inference, dinov2: Vec<String>) -> Value {
+    let Inference {
+        detections,
+        items,
+        classes,
+        transform,
+    } = found;
+    let response = DetectionResponse { items, transform };
+    let mut value = serde_json::to_value(&response).unwrap_or_else(|_| json!({}));
+    if let Some(object) = value.as_object_mut() {
+        object.insert("detections".to_string(), json!(detections));
+        object.insert("classes".to_string(), json!(classes));
+        object.insert("dinov2".to_string(), json!(dinov2));
+    }
+    value
 }
 
 #[cfg(test)]
@@ -1623,13 +1732,21 @@ fn detect_pixels(
     // Saved slots that are all off return an empty list, not the full frame.
     let slots = match plan {
         DetectPlan::FullFrame => {
-            return match run_model(&path, rgb, width, height, None, confidence) {
-                Ok((mut detections, classes)) => {
+            return match run_inference(
+                &path,
+                rgb,
+                width,
+                height,
+                None,
+                confidence,
+                document.as_ref(),
+            ) {
+                Ok(mut found) => {
                     let (dinov2, held) = log_dinov2_embeddings(
                         rgb,
                         width,
                         height,
-                        &mut detections,
+                        &mut found.detections,
                         capture_references,
                         cutoff,
                         hold_references,
@@ -1638,11 +1755,7 @@ fn detect_pixels(
                         crate::dinov2::hold_embeddings(held);
                         crate::dinov2::hold_frame(rgb, width, height);
                     }
-                    Ok(json!({
-                        "detections": detections,
-                        "classes": classes,
-                        "dinov2": dinov2,
-                    }))
+                    Ok(detection_value(found, dinov2))
                 }
                 Err(message) => Ok(failure(&model_status_message(&message))),
             };
@@ -1659,13 +1772,21 @@ fn detect_pixels(
     let mut rows = Vec::with_capacity(slots.len());
     let mut held_all = Vec::new();
     for (slot, roi) in slots {
-        match run_model(&path, rgb, width, height, Some(&roi), confidence) {
-            Ok((mut detections, classes)) => {
+        match run_inference(
+            &path,
+            rgb,
+            width,
+            height,
+            Some(&roi),
+            confidence,
+            document.as_ref(),
+        ) {
+            Ok(mut found) => {
                 let (dinov2, held) = log_dinov2_embeddings(
                     rgb,
                     width,
                     height,
-                    &mut detections,
+                    &mut found.detections,
                     capture_references,
                     cutoff,
                     hold_references,
@@ -1673,12 +1794,11 @@ fn detect_pixels(
                 if hold_references {
                     held_all.extend(held);
                 }
-                rows.push(json!({
-                    "slot": slot,
-                    "detections": detections,
-                    "classes": classes,
-                    "dinov2": dinov2,
-                }));
+                let mut row = detection_value(found, dinov2);
+                if let Some(object) = row.as_object_mut() {
+                    object.insert("slot".to_string(), json!(slot));
+                }
+                rows.push(row);
             }
             Err(message) => return Ok(failure(&model_status_message(&message))),
         }
@@ -1936,9 +2056,11 @@ fn benchmark_files(model_path: &Path, image_path: &Path) -> Result<DetectBenchma
     let bytes = std::fs::read(image_path)
         .map_err(|_| format!("Could not read {}.", file_name(image_path)))?;
     let (rgb, width, height) = decode_rgb(&bytes)?;
-    let image_size = with_model(model_path, |model| Ok(model.image_size))?;
-    let (data, _view_w, _view_h, _origin_x, _origin_y) =
-        detect_view(&rgb, width, height, None, image_size)?;
+    let (image_size, normalization) = with_model(model_path, |model| {
+        Ok((model.image_size, model.normalization))
+    })?;
+    let prepared = detect_view(&rgb, width, height, None, image_size, normalization)?;
+    let data = prepared.data;
     let (provider, times) = with_model(model_path, |model| {
         let mut times = Vec::with_capacity(BENCHMARK_RUNS);
         while times.len() < BENCHMARK_RUNS {
@@ -2036,6 +2158,36 @@ mod tests {
         // img0 is 100 tall and 200 wide. img1 is the 640 square.
         let scaled = scale_box(0.0, 160.0, 10.0, 170.0, 100, 200, 640);
         assert_eq!(scaled, [0, 0, 3, 3]);
+    }
+
+    #[test]
+    fn sensor_boxes_add_the_crop_origin_after_unpad() {
+        let transform = LetterboxTransform::new(200, 100, 640.0);
+        let (sensor, polygon) =
+            sensor_geometry(&transform, [0.0, 160.0, 10.0, 170.0], &[[0.0, 160.0]], 5, 7);
+        assert!((sensor[0] - 5.0).abs() < 1e-2);
+        assert!((sensor[1] - 7.0).abs() < 1e-2);
+        assert!((sensor[2] - 8.125).abs() < 0.05);
+        assert!((sensor[3] - 10.125).abs() < 0.05);
+        assert!((polygon[0][0] - sensor[0]).abs() < 1e-4);
+        assert!((polygon[0][1] - sensor[1]).abs() < 1e-4);
+        assert_eq!(round_sensor_box(sensor), [5, 7, 8, 10]);
+        // 160 is the tensor pad, not 160 sensor pixels.
+        assert!(sensor[1] < 20.0);
+    }
+
+    #[test]
+    fn tensor_normalization_override_reads_the_config_key() {
+        assert!(tensor_normalization_override(&json!({})).is_none());
+        assert_eq!(
+            tensor_normalization_override(&json!({"tensorNormalization": "zeroTo255"})),
+            Some(TensorNormalization::ZeroTo255)
+        );
+        assert_eq!(
+            tensor_normalization_override(&json!({"tensorNormalization": "0-1"})),
+            Some(TensorNormalization::ZeroToOne)
+        );
+        assert!(tensor_normalization_override(&json!({"tensorNormalization": "nope"})).is_none());
     }
 
     #[test]
@@ -2459,10 +2611,26 @@ mod tests {
             w: 0.5,
             h: 1.0,
         };
-        let (data, view_w, view_h, origin_x, origin_y) =
-            detect_view(&rgb, width as u32, height as u32, Some(&roi), 8).unwrap();
-        assert_eq!((view_w, view_h, origin_x, origin_y), (2, 2, 0, 0));
-        assert_eq!(data.len(), 8 * 8 * 3);
+        let prepared = detect_view(
+            &rgb,
+            width as u32,
+            height as u32,
+            Some(&roi),
+            8,
+            TensorNormalization::ZeroToOne,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                prepared.transform.orig_w,
+                prepared.transform.orig_h,
+                prepared.origin_x,
+                prepared.origin_y
+            ),
+            (2.0, 2.0, 0, 0)
+        );
+        assert_eq!(prepared.data.len(), 8 * 8 * 3);
+        let data = prepared.data;
         assert!(
             data.iter().all(|value| *value < 0.5),
             "the tensor still contains the uncropped half"
