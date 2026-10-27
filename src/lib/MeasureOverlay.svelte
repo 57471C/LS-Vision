@@ -1,7 +1,8 @@
 <script lang="ts">
 // biome-ignore-all lint/correctness/noUnusedVariables: Biome 2.4 does not treat Svelte template references as uses
-import { createEventDispatcher } from "svelte";
+import { createEventDispatcher, onMount } from "svelte";
 import {
+	endTicks,
 	finishLine,
 	type ImageLine,
 	type ImagePoint,
@@ -21,12 +22,38 @@ let surface: HTMLDivElement | undefined;
 let draft: ImageLine | null = null;
 let drawing = false;
 let origin: ImagePoint = { x: 0, y: 0 };
+let viewWidth = 0;
+let viewHeight = 0;
+
+function syncView(): void {
+	const node = surface;
+	if (!node) return;
+	const rect = node.getBoundingClientRect();
+	if (rect.width < 1 || rect.height < 1) return;
+	if (rect.width === viewWidth && rect.height === viewHeight) return;
+	viewWidth = rect.width;
+	viewHeight = rect.height;
+}
 
 $: if (!active && drawing) {
 	drawing = false;
 	draft = null;
 }
 $: shown = draft ?? line;
+$: if (shown) syncView();
+$: ticks =
+	shown && viewWidth > 0 && viewHeight > 0
+		? endTicks(shown, imageWidth, imageHeight, viewWidth, viewHeight)
+		: null;
+
+onMount(() => {
+	const node = surface;
+	if (!node) return;
+	syncView();
+	const observer = new ResizeObserver(() => syncView());
+	observer.observe(node);
+	return () => observer.disconnect();
+});
 $: labelLeft =
 	shown && imageWidth > 0 ? ((shown.x1 + shown.x2) / 2 / imageWidth) * 100 : 0;
 $: labelTop =
@@ -89,11 +116,13 @@ function onPointerCancel() {
 }
 </script>
 
+<!-- Active sets auto. pointer-events is inherited, and the preview parent is none. -->
 <div
 	bind:this={surface}
 	class="absolute inset-0 touch-none"
 	class:cursor-crosshair={active}
 	class:pointer-events-none={!active}
+	class:pointer-events-auto={active}
 	on:pointerdown={onPointerDown}
 	on:pointermove={onPointerMove}
 	on:pointerup={onPointerUp}
@@ -113,11 +142,24 @@ function onPointerCancel() {
 				y2={shown.y2}
 				stroke="#facc15"
 				stroke-width="2"
-				stroke-linecap="round"
+				stroke-linecap="butt"
 				vector-effect="non-scaling-stroke"
 			/>
-			<circle cx={shown.x1} cy={shown.y1} r="3" fill="#facc15" />
-			<circle cx={shown.x2} cy={shown.y2} r="3" fill="#facc15" />
+			{#if ticks}
+				{#each ticks as tick, index (index)}
+					<line
+						x1={tick.x1}
+						y1={tick.y1}
+						x2={tick.x2}
+						y2={tick.y2}
+						stroke="#facc15"
+						stroke-width="1"
+						stroke-linecap="butt"
+						vector-effect="non-scaling-stroke"
+						data-measure-tick
+					/>
+				{/each}
+			{/if}
 		</svg>
 		{#if label}
 			<p

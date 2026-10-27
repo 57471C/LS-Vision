@@ -8,7 +8,7 @@ The main screen used on the bench.
 - The pace follows Display FPS. Preview JPEGs are scaled to fit 1280×720. The camera keeps its selected mode.
 - The header shows the capture size and the canvas rate.
 - **Start feed** and **Stop feed** turn that preview on and off. Extra clicks are ignored for 1.52 seconds. While locked, the button reads Please wait, is disabled, and draws at half opacity.
-- **Measure**, beside Camera, draws a straight line on the live preview or the held snapshot. The line shows its pixel length. When that camera has a scale from Settings > Camera > Preview, it also shows the length in millimetres. With no scale, it says "No scale set for this camera." Measure does not change the scale.
+- **Measure**, beside Camera, draws a straight line on the live preview or the held snapshot. Each end is a 1px tick perpendicular to the line. The line shows its pixel length. When that camera has a scale from Settings > Camera > Preview, it also shows the length in millimetres. With no scale, it says "No scale set for this camera." Measure does not change the scale.
 
 ## Barcode and snapshot
 

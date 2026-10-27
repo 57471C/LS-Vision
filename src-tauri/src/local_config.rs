@@ -308,6 +308,55 @@ pub(crate) fn save_document(root: &Path, config: &Value) -> Result<(), String> {
     write_json_file(&config_file(root), config)
 }
 
+/// Objects merge. Arrays, nulls, and other values replace. A key that the
+/// patch leaves out stays, so a camera save cannot drop `byIndex`, `scale`,
+/// or `detectRois`.
+fn merge_config(mut existing: Value, patch: &Value) -> Result<Value, String> {
+    if !patch.is_object() {
+        return Err("Config must be a JSON object.".to_string());
+    }
+    if !existing.is_object() {
+        existing = Value::Object(serde_json::Map::new());
+    }
+    merge_value(&mut existing, patch);
+    Ok(existing)
+}
+
+fn merge_value(base: &mut Value, patch: &Value) {
+    let Value::Object(patch_map) = patch else {
+        *base = patch.clone();
+        return;
+    };
+    if !base.is_object() {
+        *base = Value::Object(serde_json::Map::new());
+    }
+    let Some(base_map) = base.as_object_mut() else {
+        return;
+    };
+    for (key, patch_value) in patch_map {
+        if let Some(slot) = base_map.get_mut(key) {
+            merge_value(slot, patch_value);
+        } else {
+            base_map.insert(key.clone(), patch_value.clone());
+        }
+    }
+}
+
+/// Write `config` onto the file that is already there. A missing file is
+/// written as given, so the first save does not invent default keys.
+fn save_merged(root: &Path, config: Value) -> Result<Value, String> {
+    if !config.is_object() {
+        return Err("Config must be a JSON object.".to_string());
+    }
+    let merged = if config_file(root).is_file() {
+        merge_config(load_document(root)?, &config)?
+    } else {
+        config
+    };
+    save_document(root, &merged)?;
+    Ok(merged)
+}
+
 fn clean_model_name(raw: &str) -> Option<String> {
     let name = raw.trim();
     if name.is_empty() || name.len() > MAX_MODEL_NAME {
@@ -613,9 +662,7 @@ pub fn load_local_config() -> Result<Value, String> {
 
 #[tauri::command]
 pub fn save_local_config(config: Value) -> Result<Value, String> {
-    let root = project_root()?;
-    save_document(&root, &config)?;
-    Ok(config)
+    save_merged(&project_root()?, config)
 }
 
 #[tauri::command]
@@ -662,7 +709,7 @@ pub fn update_model(app: AppHandle, filename: String) -> Result<ActiveModel, Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::Map;
+    use serde_json::{Map, json};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     struct TempProject {
@@ -959,21 +1006,112 @@ mod tests {
         .unwrap();
         let value: Value = serde_json::from_str(&text).unwrap();
         let resources = value["bundle"]["resources"]
-            .as_array()
+            .as_object()
             .expect("bundle.resources");
-        let entries: Vec<_> = resources
-            .iter()
-            .filter_map(Value::as_str)
-            .collect();
-        assert!(entries.contains(&"models/*"), "{entries:?}");
-        assert!(entries.contains(&"openvino/*"), "{entries:?}");
+        assert_eq!(
+            resources.get("models/*").and_then(Value::as_str),
+            Some("models/")
+        );
+        assert_eq!(
+            resources.get("openvino/*.dll").and_then(Value::as_str),
+            Some(""),
+            "OpenVINO DLLs install beside the exe"
+        );
         assert!(
-            !entries.iter().any(|entry| entry.contains("best.onnx")),
-            "{entries:?}"
+            resources.values().all(|dest| {
+                dest.as_str()
+                    .is_some_and(|path| !path.starts_with("openvino"))
+            }),
+            "{resources:?}"
+        );
+        assert!(
+            resources.keys().all(|key| !key.contains("best.onnx")),
+            "{resources:?}"
         );
         let lower = text.to_ascii_lowercase();
         assert!(!lower.contains("best.onnx"));
         assert!(!lower.contains("vision/models"));
+    }
+
+    #[test]
+    fn save_keeps_omitted_camera_scale_and_detect_rois() {
+        let project = TempProject::new("merge-config");
+        fs::write(
+            config_file(project.root()),
+            r#"{
+                "source": "json",
+                "detectRoi": { "x": 0.1, "y": 0.1, "w": 0.2, "h": 0.2 },
+                "detectRois": [
+                    { "x": 0.1, "y": 0.1, "w": 0.2, "h": 0.2, "enabled": true },
+                    null,
+                    null,
+                    null
+                ],
+                "camera": {
+                    "index": 1,
+                    "type": "uvc",
+                    "byIndex": {
+                        "0": { "focus": 4 },
+                        "1": {
+                            "resolution": "1920x1080@30",
+                            "focus": 10,
+                            "scale": { "mmPerPx": 0.25, "width": 1280, "height": 720 }
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let saved = save_merged(
+            project.root(),
+            json!({
+                "source": "api",
+                "camera": {
+                    "index": 1,
+                    "byIndex": {
+                        "1": { "focus": 35, "resolution": "1280x720@30" }
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(saved["source"], "api");
+        assert_eq!(saved["camera"]["type"], "uvc");
+        assert_eq!(saved["camera"]["byIndex"]["0"]["focus"], 4);
+        assert_eq!(saved["camera"]["byIndex"]["1"]["focus"], 35);
+        assert_eq!(saved["camera"]["byIndex"]["1"]["resolution"], "1280x720@30");
+        assert_eq!(saved["camera"]["byIndex"]["1"]["scale"]["mmPerPx"], 0.25);
+        assert_eq!(saved["camera"]["byIndex"]["1"]["scale"]["width"], 1280);
+        assert_eq!(saved["detectRois"][0]["enabled"], true);
+        assert_eq!(saved["detectRoi"]["w"], 0.2);
+
+        let cleared = save_merged(
+            project.root(),
+            json!({
+                "detectRoi": null,
+                "detectRois": [null, null, null, null],
+                "camera": { "byIndex": { "1": { "focus": null } } }
+            }),
+        )
+        .unwrap();
+        assert!(cleared["detectRoi"].is_null());
+        assert!(
+            cleared["detectRois"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item.is_null())
+        );
+        assert!(cleared["camera"]["byIndex"]["1"]["focus"].is_null());
+        assert_eq!(cleared["camera"]["byIndex"]["1"]["scale"]["mmPerPx"], 0.25);
+        assert_eq!(cleared["camera"]["byIndex"]["0"]["focus"], 4);
+        assert_eq!(cleared["source"], "api");
+
+        let fresh = TempProject::new("merge-fresh");
+        let created = save_merged(fresh.root(), json!({ "source": "api" })).unwrap();
+        assert_eq!(created, json!({ "source": "api" }));
+        assert!(created.get("camera").is_none());
+        assert!(created.get("detectRois").is_none());
     }
 
     fn onnx_bytes(payload: &[u8]) -> Vec<u8> {

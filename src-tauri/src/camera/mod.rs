@@ -56,6 +56,53 @@ pub struct ExposureConfig {
 
 const PYLON_NOT_LINKED: &str = "Pylon backend not linked yet";
 
+/// Error string for [`InspectionCamera`] and both backends.
+///
+/// Media Foundation callbacks stay on `windows::core::Result` because the
+/// `windows` crate fixes that signature. `set_native_mode` stays on
+/// `windows::core::Error` so a resource HRESULT is recognised before the
+/// text is shown to the operator.
+#[derive(Debug, Clone)]
+pub struct CameraError(String);
+
+impl CameraError {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for CameraError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CameraError {}
+
+impl PartialEq<&str> for CameraError {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+impl From<&str> for CameraError {
+    fn from(message: &str) -> Self {
+        Self(message.to_string())
+    }
+}
+
+impl From<String> for CameraError {
+    fn from(message: String) -> Self {
+        Self(message)
+    }
+}
+
+impl From<CameraError> for String {
+    fn from(error: CameraError) -> Self {
+        error.0
+    }
+}
+
 /// One capture device. The Media Foundation reader still owns the live
 /// preview and the snapshot. A backend uses this trait for a still frame
 /// and for exposure, gain, focus, and white balance, so a Pylon device can
@@ -63,17 +110,17 @@ const PYLON_NOT_LINKED: &str = "Pylon backend not linked yet";
 /// balance default to no-ops so a backend that does not own those controls
 /// can leave them unimplemented.
 pub trait InspectionCamera: Send + Sync {
-    fn capture_frame(&mut self) -> Result<image::RgbImage, String>;
-    fn set_exposure(&mut self, config: &ExposureConfig) -> Result<(), String>;
-    fn set_gain(&mut self, gain: f32) -> Result<(), String>;
+    fn capture_frame(&mut self) -> Result<image::RgbImage, CameraError>;
+    fn set_exposure(&mut self, config: &ExposureConfig) -> Result<(), CameraError>;
+    fn set_gain(&mut self, gain: f32) -> Result<(), CameraError>;
     /// Pylon inherits this no-op. UVC focus is written on the open device.
     #[allow(dead_code)]
-    fn set_focus(&mut self, _auto: bool, _focus_absolute: Option<i32>) -> Result<(), String> {
+    fn set_focus(&mut self, _auto: bool, _focus_absolute: Option<i32>) -> Result<(), CameraError> {
         Ok(())
     }
     /// Pylon inherits this no-op. UVC white balance is written on the open device.
     #[allow(dead_code)]
-    fn set_white_balance(&mut self, _auto: bool, _kelvin: Option<i32>) -> Result<(), String> {
+    fn set_white_balance(&mut self, _auto: bool, _kelvin: Option<i32>) -> Result<(), CameraError> {
         Ok(())
     }
 }
@@ -160,14 +207,14 @@ impl UvcBackend {
 }
 
 impl InspectionCamera for UvcBackend {
-    fn capture_frame(&mut self) -> Result<image::RgbImage, String> {
+    fn capture_frame(&mut self) -> Result<image::RgbImage, CameraError> {
         let frame = fetch_frame(self.index, true)?;
         let (rgb, width, height) = use_frame(&frame, rgb_frame)?;
         RgbImage::from_raw(width, height, rgb)
-            .ok_or_else(|| "Could not build the camera image.".to_string())
+            .ok_or_else(|| "Could not build the camera image.".into())
     }
 
-    fn set_exposure(&mut self, config: &ExposureConfig) -> Result<(), String> {
+    fn set_exposure(&mut self, config: &ExposureConfig) -> Result<(), CameraError> {
         self.settings.auto_exposure = config.auto;
         self.settings.exposure_absolute = config.absolute;
         let applied = apply_exposure(self.index, config.auto, config.absolute)?;
@@ -175,7 +222,7 @@ impl InspectionCamera for UvcBackend {
         Ok(())
     }
 
-    fn set_gain(&mut self, gain: f32) -> Result<(), String> {
+    fn set_gain(&mut self, gain: f32) -> Result<(), CameraError> {
         self.settings.gain = gain;
         let applied = apply_gain(self.index, gain)?;
         self.applied = Some(applied);
@@ -197,16 +244,16 @@ impl PylonBackend {
 }
 
 impl InspectionCamera for PylonBackend {
-    fn capture_frame(&mut self) -> Result<image::RgbImage, String> {
-        Err(PYLON_NOT_LINKED.to_string())
+    fn capture_frame(&mut self) -> Result<image::RgbImage, CameraError> {
+        Err(PYLON_NOT_LINKED.into())
     }
 
-    fn set_exposure(&mut self, _config: &ExposureConfig) -> Result<(), String> {
-        Err(PYLON_NOT_LINKED.to_string())
+    fn set_exposure(&mut self, _config: &ExposureConfig) -> Result<(), CameraError> {
+        Err(PYLON_NOT_LINKED.into())
     }
 
-    fn set_gain(&mut self, _gain: f32) -> Result<(), String> {
-        Err(PYLON_NOT_LINKED.to_string())
+    fn set_gain(&mut self, _gain: f32) -> Result<(), CameraError> {
+        Err(PYLON_NOT_LINKED.into())
     }
 }
 
@@ -489,8 +536,8 @@ fn store_still(
     latest: &Mutex<Option<crate::frame::RawFrame>>,
 ) -> Result<Value, String> {
     let frame = match command_frame(index, true) {
-        Ok(frame) => frame,
-        Err(response) => return response,
+        FrameFetch::Ready(frame) => frame,
+        FrameFetch::Done(response) => return response,
     };
     let raw = match use_frame(&frame, rgb_frame) {
         Ok((data, width, height)) => crate::frame::RawFrame {
@@ -535,8 +582,8 @@ fn test_latest() -> &'static Mutex<Option<crate::frame::RawFrame>> {
 #[tauri::command]
 pub fn capture_preview(index: Option<u32>) -> Result<Value, String> {
     let frame = match command_frame(index, false) {
-        Ok(frame) => frame,
-        Err(response) => return response,
+        FrameFetch::Ready(frame) => frame,
+        FrameFetch::Done(response) => return response,
     };
     match use_frame(&frame, encode_preview) {
         Ok((jpeg, preview_width, preview_height)) => {
@@ -607,11 +654,11 @@ pub fn set_camera_exposure(index: Option<u32>, exposure_absolute: i32) -> Result
         return Ok(fail("Exposure must be from -13 to 20000."));
     }
     let mut backend = UvcBackend::new(index, loaded_driver().uvc);
-    if let Err(message) = backend.set_exposure(&ExposureConfig {
+    if let Err(error) = backend.set_exposure(&ExposureConfig {
         auto: false,
         absolute: exposure_absolute,
     }) {
-        return Ok(fail(&message));
+        return Ok(fail(error.as_str()));
     }
     if let Err(message) = remember_uvc_exposure(exposure_absolute) {
         return Ok(fail(&message));
@@ -636,8 +683,8 @@ pub fn set_camera_gain(index: Option<u32>, gain: f32) -> Result<Value, String> {
         return Ok(fail("Gain must be from 0 to 255."));
     }
     let mut backend = UvcBackend::new(index, loaded_driver().uvc);
-    if let Err(message) = backend.set_gain(gain) {
-        return Ok(fail(&message));
+    if let Err(error) = backend.set_gain(gain) {
+        return Ok(fail(error.as_str()));
     }
     if let Err(message) = remember_uvc_gain(gain) {
         return Ok(fail(&message));
@@ -650,15 +697,21 @@ pub fn set_camera_gain(index: Option<u32>, gain: f32) -> Result<Value, String> {
     }))
 }
 
-fn command_frame(index: Option<u32>, still: bool) -> Result<Frame, Result<Value, String>> {
+/// A frame ready to encode, or the command result to return immediately.
+enum FrameFetch {
+    Ready(Frame),
+    Done(Result<Value, String>),
+}
+
+fn command_frame(index: Option<u32>, still: bool) -> FrameFetch {
     let index = index.unwrap_or_else(saved_index);
     if index > 32 {
-        return Err(Ok(fail("Camera index must be from 0 to 32.")));
+        return FrameFetch::Done(Ok(fail("Camera index must be from 0 to 32.")));
     }
     match fetch_frame(index, still) {
-        Ok(frame) => Ok(frame),
-        Err(message) if message == "Camera thread stopped." => Err(Err(message)),
-        Err(message) => Err(Ok(fail(&message))),
+        Ok(frame) => FrameFetch::Ready(frame),
+        Err(message) if message == "Camera thread stopped." => FrameFetch::Done(Err(message)),
+        Err(message) => FrameFetch::Done(Ok(fail(&message))),
     }
 }
 
@@ -803,7 +856,7 @@ fn refuse_unlinked_pylon(open: &mut Option<session::Device>) -> Result<(), Strin
         previous.shutdown();
     }
     let mut backend = open_backend(&driver);
-    backend.capture_frame().map(|_| ())
+    backend.capture_frame().map(|_| ()).map_err(String::from)
 }
 
 fn submit_focus(index: u32, request: FocusRequest) -> Result<(), String> {
@@ -1343,17 +1396,27 @@ fn write_focus(config: &mut Value, index: u32, focus: Option<u32>) -> Result<(),
         .and_then(|value| u32::try_from(value).ok())
         .filter(|value| *value <= 32);
     let copied = if active == Some(index) {
-        ["resolution", "displayFps", "brightness", "contrast"]
-            .into_iter()
-            .filter_map(|name| camera.get(name).map(|value| (name, value.clone())))
-            .collect::<Vec<_>>()
+        [
+            "resolution",
+            "displayFps",
+            "brightness",
+            "contrast",
+            "scale",
+        ]
+        .into_iter()
+        .filter_map(|name| camera.get(name).map(|value| (name, value.clone())))
+        .collect::<Vec<_>>()
     } else {
         Vec::new()
     };
-    if camera
-        .get("byIndex")
-        .is_some_and(|value| !value.is_object())
-    {
+    let replace_by_index = match camera.get("byIndex") {
+        Some(value) if value.is_null() => true,
+        Some(value) if !value.is_object() => {
+            return Err("Camera byIndex must be a JSON object.".to_string());
+        }
+        _ => false,
+    };
+    if replace_by_index {
         camera.insert("byIndex".to_string(), json!({}));
     }
     {
@@ -3705,9 +3768,51 @@ mod tests {
         write_focus(&mut config, 1, None).unwrap();
         assert!(config["camera"]["focus"].is_null());
         assert!(config["camera"]["byIndex"]["1"]["focus"].is_null());
+        assert_eq!(config["camera"]["byIndex"]["1"]["scale"]["mmPerPx"], 0.25);
         assert_eq!(config["camera"]["brightness"], 60);
         assert_eq!(config["camera"]["resolution"], "1920x1080@30");
         assert_eq!(config["trainingDir"], "D:\\shots");
+
+        let mut scaled = json!({
+            "camera": {
+                "index": 0,
+                "resolution": "1280x720@30",
+                "displayFps": 15,
+                "scale": { "mmPerPx": 0.5, "width": 1000, "height": 800 }
+            }
+        });
+        write_focus(&mut scaled, 0, Some(12)).unwrap();
+        assert_eq!(scaled["camera"]["focus"], 12);
+        assert_eq!(scaled["camera"]["scale"]["mmPerPx"], 0.5);
+        assert_eq!(scaled["camera"]["byIndex"]["0"]["scale"]["mmPerPx"], 0.5);
+        assert_eq!(scaled["camera"]["byIndex"]["0"]["scale"]["width"], 1000);
+        assert_eq!(
+            scaled["camera"]["byIndex"]["0"]["resolution"],
+            "1280x720@30"
+        );
+
+        let mut cleared = json!({
+            "camera": {
+                "index": 0,
+                "byIndex": null,
+                "resolution": "640x480@30"
+            }
+        });
+        write_focus(&mut cleared, 0, Some(8)).unwrap();
+        assert_eq!(cleared["camera"]["byIndex"]["0"]["focus"], 8);
+        assert_eq!(
+            cleared["camera"]["byIndex"]["0"]["resolution"],
+            "640x480@30"
+        );
+
+        let mut blocked = json!({
+            "detectRois": [null, null, null, null],
+            "camera": { "index": 0, "byIndex": ["not-an-object"] }
+        });
+        let before = blocked.clone();
+        let err = write_focus(&mut blocked, 0, Some(1)).unwrap_err();
+        assert!(err.contains("byIndex"), "{err}");
+        assert_eq!(blocked, before);
     }
 
     #[test]

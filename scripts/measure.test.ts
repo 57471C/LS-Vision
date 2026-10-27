@@ -10,6 +10,7 @@ import {
 } from "../src/lib/camera-settings.ts";
 import {
 	effectiveMmPerPx,
+	endTicks,
 	finishLine,
 	formatReadout,
 	formatScale,
@@ -41,6 +42,43 @@ const diagonal = finishLine({ x: 0, y: 0 }, { x: 3, y: 4 });
 check("a 5 px line is too short", diagonal === null);
 const kept = finishLine({ x: 0, y: 0 }, { x: 8, y: 0 });
 check("an 8 px line is kept", kept !== null && lineLength(kept) === 8);
+
+const flatTicks = endTicks(
+	{ x1: 10, y1: 20, x2: 110, y2: 20 },
+	200,
+	100,
+	200,
+	100,
+);
+check(
+	"a horizontal line has vertical end ticks",
+	flatTicks !== null &&
+		flatTicks[0].x1 === 10 &&
+		flatTicks[0].x2 === 10 &&
+		flatTicks[0].y1 === 14 &&
+		flatTicks[0].y2 === 26 &&
+		flatTicks[1].x1 === 110 &&
+		flatTicks[1].y1 === 14,
+);
+const stretched = endTicks(
+	{ x1: 10, y1: 20, x2: 110, y2: 20 },
+	200,
+	100,
+	200,
+	200,
+	6,
+);
+check(
+	"a stretched view keeps the tick perpendicular on screen",
+	stretched !== null &&
+		stretched[0].x1 === 10 &&
+		stretched[0].x2 === 10 &&
+		Math.abs(stretched[0].y2 - stretched[0].y1 - 6) < 1e-9,
+);
+check(
+	"a missing view has no ticks",
+	endTicks({ x1: 0, y1: 0, x2: 10, y2: 0 }, 100, 50, 0, 40) === null,
+);
 
 const point = imagePoint(
 	50,
@@ -189,6 +227,29 @@ const keptScale = settingsForCamera(reloaded.camera, 0);
 check(
 	"saving another camera field keeps the scale",
 	keptScale.resolution === "1280x720@30" && keptScale.scale?.mmPerPx === 0.5,
+);
+
+const withExtra = JSON.parse(JSON.stringify(reloaded)) as Record<
+	string,
+	unknown
+>;
+const extraCamera = withExtra.camera as Record<string, unknown>;
+const extraIndex = extraCamera.byIndex as Record<
+	string,
+	Record<string, unknown>
+>;
+extraIndex["0"].note = "keep";
+const edited = settingsForCamera(extraCamera, 0);
+edited.brightness = 60;
+assignActiveCamera(withExtra, edited);
+const keptRecord = (
+	extraCamera.byIndex as Record<string, Record<string, unknown>>
+)["0"];
+check(
+	"saving camera fields keeps scale and extra record keys",
+	keptRecord.note === "keep" &&
+		(keptRecord.scale as { mmPerPx: number }).mmPerPx === 0.5 &&
+		keptRecord.brightness === 60,
 );
 
 const other = settingsForCamera(reloaded.camera, 2);
