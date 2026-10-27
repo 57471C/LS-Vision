@@ -138,9 +138,22 @@ function levels(settings: CameraSettings): Record<string, unknown> {
 		brightness: settings.brightness,
 		contrast: settings.contrast,
 	};
-	// Replacing the camera record drops a scale that is left out.
+	// Leave scale out when it is unset so the stored record can keep its own.
 	if (settings.scale) record.scale = settings.scale;
 	return record;
+}
+
+function storedRecord(
+	byIndex: Record<string, unknown>,
+	key: string,
+	settings: CameraSettings,
+): Record<string, unknown> {
+	const previous = objectField(byIndex[key]);
+	const next = { ...previous, ...levels(settings) };
+	if (!settings.scale && Object.hasOwn(previous, "scale")) {
+		next.scale = previous.scale;
+	}
+	return next;
 }
 
 export function defaultCameraSettings(index: number): CameraSettings {
@@ -205,7 +218,8 @@ function writeCamera(
 ): void {
 	const camera = objectField(document.camera);
 	const byIndex = objectField(camera.byIndex);
-	byIndex[String(settings.index)] = levels(settings);
+	const key = String(settings.index);
+	byIndex[key] = storedRecord(byIndex, key, settings);
 	if (!active) {
 		camera.byIndex = byIndex;
 		document.camera = camera;

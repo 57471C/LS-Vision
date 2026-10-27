@@ -587,13 +587,12 @@ fn same_file(left: &Path, right: &Path) -> bool {
 /// A file that does not parse leaves both the destination and memory unchanged.
 /// The returned count is the number of ICs now stored.
 pub(crate) fn install_reference_file(source: &Path, dest: &Path) -> Result<usize, String> {
-    let bytes = fs::read(source).map_err(|err| format!("Could not read DINOv2 references: {err}"))?;
-    let text = String::from_utf8(bytes).map_err(|_| {
-        "Selected file is not a valid DINOv2 reference file.".to_string()
-    })?;
-    let clean = parse_reference_map(&text).map_err(|_| {
-        "Selected file is not a valid DINOv2 reference file.".to_string()
-    })?;
+    let bytes =
+        fs::read(source).map_err(|err| format!("Could not read DINOv2 references: {err}"))?;
+    let text = String::from_utf8(bytes)
+        .map_err(|_| "Selected file is not a valid DINOv2 reference file.".to_string())?;
+    let clean = parse_reference_map(&text)
+        .map_err(|_| "Selected file is not a valid DINOv2 reference file.".to_string())?;
     if !same_file(source, dest) {
         replace_reference_bytes(dest, text.as_bytes())?;
     }
@@ -1070,7 +1069,8 @@ pub fn embed_marquee(x: f64, y: f64, w: f64, h: f64) -> Result<(), String> {
             }
         })?
     };
-    if MARQUEE_TOKEN.load(Ordering::SeqCst) != token || FRAME_GEN.load(Ordering::SeqCst) != frame_gen
+    if MARQUEE_TOKEN.load(Ordering::SeqCst) != token
+        || FRAME_GEN.load(Ordering::SeqCst) != frame_gen
     {
         return Err("Detect again before saving a reference.".to_string());
     }
@@ -1282,10 +1282,8 @@ mod tests {
 
     #[test]
     fn bundled_model_next_to_the_exe_wins_over_the_crate_copy() {
-        let root = std::env::temp_dir().join(format!(
-            "ls-vision-dino-bundle-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("ls-vision-dino-bundle-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let exe_dir = root.join("app");
         let manifest = root.join("crate");
@@ -1566,7 +1564,10 @@ mod tests {
             best_similarity("2BBMNM08", &[1.0, 0.0, 0.0, 0.0]),
             Some(1.0)
         );
-        assert_eq!(best_similarity("2BBMNM08", &[0.0, 1.0, 0.0, 0.0]), Some(1.0));
+        assert_eq!(
+            best_similarity("2BBMNM08", &[0.0, 1.0, 0.0, 0.0]),
+            Some(1.0)
+        );
         assert_eq!(best_similarity("OTHER", &[0.0, 1.0, 0.0, 0.0]), Some(1.0));
         assert_eq!(
             apply_selected_references(&[0], false).unwrap(),
@@ -1591,10 +1592,7 @@ mod tests {
         hold_marquee(vec![1.0, 0.0, 0.0, 0.0]);
         let rows = apply_marquee_reference(" 6PBB33 ", false).unwrap();
         assert_eq!(rows, vec![("6PBB33".to_string(), 1)]);
-        assert_eq!(
-            saved_message(&rows, false),
-            "Saved 6PBB33 (1)."
-        );
+        assert_eq!(saved_message(&rows, false), "Saved 6PBB33 (1).");
 
         let path = std::env::temp_dir().join(format!(
             "ls-vision-dino-marquee-{}.json",
@@ -1605,10 +1603,7 @@ mod tests {
         clear_references();
         assert!(best_similarity("6PBB33", &[1.0, 0.0, 0.0, 0.0]).is_none());
         assert_eq!(load_references_from(&path).unwrap(), true);
-        assert_eq!(
-            best_similarity("6PBB33", &[1.0, 0.0, 0.0, 0.0]),
-            Some(1.0)
-        );
+        assert_eq!(best_similarity("6PBB33", &[1.0, 0.0, 0.0, 0.0]), Some(1.0));
         assert_eq!(
             best_similarity("2BBMNM08", &[0.0, 0.0, 1.0, 0.0]),
             Some(1.0)
@@ -1673,11 +1668,11 @@ mod tests {
         assert_eq!(references_loaded_message(count), "References loaded 2 ICs.");
         assert!(best_similarity("OLD", &[0.0, 1.0, 0.0, 0.0]).is_none());
         assert_eq!(best_similarity("OK", &[1.0, 0.0, 0.0, 0.0]), Some(1.0));
+        assert_eq!(best_similarity("6PBB33", &[0.0, 0.0, 1.0, 0.0]), Some(1.0));
         assert_eq!(
-            best_similarity("6PBB33", &[0.0, 0.0, 1.0, 0.0]),
-            Some(1.0)
+            std::fs::read(&dest).unwrap(),
+            std::fs::read(&source).unwrap()
         );
-        assert_eq!(std::fs::read(&dest).unwrap(), std::fs::read(&source).unwrap());
 
         clear_references();
         assert!(best_similarity("OK", &[1.0, 0.0, 0.0, 0.0]).is_none());
@@ -1740,8 +1735,14 @@ mod tests {
             reference_counts(Some(0.80), threshold_for("6PBB33", 0.70)),
             Some(true)
         );
-        assert_eq!(apply_reference_threshold("OK", 0.10).unwrap().threshold, Some(0.50));
-        assert_eq!(apply_reference_threshold("OK", 1.2).unwrap().threshold, Some(0.95));
+        assert_eq!(
+            apply_reference_threshold("OK", 0.10).unwrap().threshold,
+            Some(0.50)
+        );
+        assert_eq!(
+            apply_reference_threshold("OK", 1.2).unwrap().threshold,
+            Some(0.95)
+        );
         let kept = apply_reference_threshold("OK", f32::NAN).unwrap_err();
         assert!(kept.contains("0.50"), "{kept}");
         assert!((threshold_for("OK", 0.70) - 0.95).abs() < 0.0001);
@@ -1844,10 +1845,7 @@ mod tests {
     fn reference_list_reads_the_same_file_and_reports_a_missing_or_invalid_one() {
         let _hold = lock_for_test();
         clear_references();
-        let dir = std::env::temp_dir().join(format!(
-            "ls-vision-dino-list-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("ls-vision-dino-list-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("dinov2-references.json");
@@ -1861,11 +1859,7 @@ mod tests {
         assert!(err.contains("not valid JSON"), "{err}");
         assert!(reference_rows().is_empty());
 
-        std::fs::write(
-            &path,
-            r#"{"version":1,"references":{"OK":[[1.0,0.0]]}}"#,
-        )
-        .unwrap();
+        std::fs::write(&path, r#"{"version":1,"references":{"OK":[[1.0,0.0]]}}"#).unwrap();
         let list = reference_list_from(&path).unwrap();
         assert_eq!(list.rows.len(), 1);
         assert_eq!(list.rows[0].ic, "OK");

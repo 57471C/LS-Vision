@@ -2398,7 +2398,7 @@ function patchCameraFocus(
 		record.focus = nextFocus;
 		byIndex[key] = record;
 	} else if (Number(camera.index) === nextIndex) {
-		byIndex[key] = {
+		const record: Record<string, unknown> = {
 			resolution:
 				typeof camera.resolution === "string" ? camera.resolution : "",
 			displayFps: camera.displayFps,
@@ -2406,6 +2406,8 @@ function patchCameraFocus(
 			brightness: camera.brightness,
 			contrast: camera.contrast,
 		};
+		if (Object.hasOwn(camera, "scale")) record.scale = camera.scale;
+		byIndex[key] = record;
 	} else {
 		byIndex[key] = { focus: nextFocus };
 	}

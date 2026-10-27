@@ -43,6 +43,66 @@ export function lineLength(line: ImageLine): number {
 	return Math.hypot(line.x2 - line.x1, line.y2 - line.y1);
 }
 
+export type ImageTick = {
+	x1: number;
+	y1: number;
+	x2: number;
+	y2: number;
+};
+
+/** Half the on-screen length of a measure end tick. */
+export const TICK_HALF_PX = 6;
+
+/**
+ * A short tick across each end of a measure line.
+ * The preview stretches the image, so the tick is perpendicular in screen pixels.
+ */
+export function endTicks(
+	line: ImageLine,
+	imageWidth: number,
+	imageHeight: number,
+	viewWidth: number,
+	viewHeight: number,
+	halfPx = TICK_HALF_PX,
+): [ImageTick, ImageTick] | null {
+	if (
+		![
+			line.x1,
+			line.y1,
+			line.x2,
+			line.y2,
+			imageWidth,
+			imageHeight,
+			viewWidth,
+			viewHeight,
+			halfPx,
+		].every((value) => Number.isFinite(value))
+	) {
+		return null;
+	}
+	if (imageWidth < 1 || imageHeight < 1 || viewWidth < 1 || viewHeight < 1)
+		return null;
+	if (halfPx <= 0) return null;
+	const sx = viewWidth / imageWidth;
+	const sy = viewHeight / imageHeight;
+	let vx = (line.x2 - line.x1) * sx;
+	let vy = (line.y2 - line.y1) * sy;
+	if (Math.hypot(vx, vy) < 1e-6) {
+		vx = 1;
+		vy = 0;
+	}
+	const len = Math.hypot(vx, vy);
+	const px = -vy / len;
+	const py = vx / len;
+	const tickAt = (x: number, y: number): ImageTick => ({
+		x1: x - (px * halfPx) / sx,
+		y1: y - (py * halfPx) / sy,
+		x2: x + (px * halfPx) / sx,
+		y2: y + (py * halfPx) / sy,
+	});
+	return [tickAt(line.x1, line.y1), tickAt(line.x2, line.y2)];
+}
+
 export function imagePoint(
 	clientX: number,
 	clientY: number,
@@ -157,6 +217,20 @@ export function formatScale(scale: CameraScale, imageWidth: number): string {
 export function formatReadout(readout: MeasureReadout): string {
 	if (readout.length) return `${readout.pixels} · ${readout.length}`;
 	return `${readout.pixels}. ${readout.message ?? "No scale set for this camera."}`;
+}
+
+/** Pixels, and millimetres when this image has a scale. */
+export function formatPxMm(
+	pixels: number,
+	imageWidth: number,
+	scale: CameraScale | null,
+): string {
+	if (!Number.isFinite(pixels)) return "";
+	const px = formatPixels(Math.max(0, pixels));
+	if (!scale) return px;
+	const mm = lengthMm(Math.max(0, pixels), imageWidth, scale);
+	if (mm === null) return px;
+	return `${px} · ${formatLengthMm(mm)}`;
 }
 
 export function measureReadout(

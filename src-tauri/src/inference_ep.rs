@@ -159,10 +159,7 @@ fn store_use_openvino(enabled: bool) -> Result<(), String> {
     let object = document
         .as_object_mut()
         .ok_or_else(|| "Config must be a JSON object.".to_string())?;
-    object.insert(
-        "useOpenVino".to_string(),
-        serde_json::Value::Bool(enabled),
-    );
+    object.insert("useOpenVino".to_string(), serde_json::Value::Bool(enabled));
     local_config::save_document(&root, &document)
 }
 
@@ -211,7 +208,8 @@ fn register_openvino_plugin() -> Result<(), String> {
     if registered.is_some() {
         return Ok(());
     }
-    let exe = std::env::current_exe().map_err(|_| "Could not find the app directory.".to_string())?;
+    let exe =
+        std::env::current_exe().map_err(|_| "Could not find the app directory.".to_string())?;
     let Some(dir) = exe.parent() else {
         return Err("Could not find the app directory.".to_string());
     };
@@ -303,7 +301,11 @@ fn push_dll_directory(dir: &std::path::Path) -> Option<DllDirectoryGuard> {
         use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
         use windows::core::PCWSTR;
 
-        let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let wide: Vec<u16> = dir
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
         if unsafe { SetDllDirectoryW(PCWSTR(wide.as_ptr())) }.is_err() {
             None
         } else {
@@ -641,10 +643,7 @@ mod tests {
             message: OPENVINO_UNAVAILABLE.to_string(),
         };
         assert_eq!(
-            compose_message(
-                "DirectML did not start. Using CPU.".to_string(),
-                &fallback
-            ),
+            compose_message("DirectML did not start. Using CPU.".to_string(), &fallback),
             "OpenVINO is not available. Using ONNX Runtime. DirectML did not start. Using CPU."
         );
         assert_eq!(
@@ -665,10 +664,7 @@ mod tests {
 
     #[test]
     fn openvino_plugin_dll_is_beside_the_exe_or_under_resources() {
-        let root = std::env::temp_dir().join(format!(
-            "ls-vision-ov-plugin-{}",
-            std::process::id()
-        ));
+        let root = std::env::temp_dir().join(format!("ls-vision-ov-plugin-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("resources").join("openvino")).unwrap();
         assert!(find_openvino_plugin(&root).is_none());
@@ -686,7 +682,10 @@ mod tests {
             .join("openvino")
             .join("onnxruntime_providers_openvino_plugin.dll");
         std::fs::write(&nested, b"plugin").unwrap();
-        assert_eq!(find_openvino_plugin(&root).as_deref(), Some(nested.as_path()));
+        assert_eq!(
+            find_openvino_plugin(&root).as_deref(),
+            Some(nested.as_path())
+        );
         let beside_provider = root.join("onnxruntime_providers_openvino.dll");
         std::fs::write(&beside_provider, b"provider").unwrap();
         assert_eq!(
@@ -695,12 +694,18 @@ mod tests {
         );
         let beside = root.join("onnxruntime_providers_openvino_plugin.dll");
         std::fs::write(&beside, b"plugin").unwrap();
-        assert_eq!(find_openvino_plugin(&root).as_deref(), Some(beside.as_path()));
+        assert_eq!(
+            find_openvino_plugin(&root).as_deref(),
+            Some(beside.as_path())
+        );
         let bundled_dir = root.join("openvino");
         std::fs::create_dir_all(&bundled_dir).unwrap();
         let bundled = bundled_dir.join("onnxruntime_providers_openvino.dll");
         std::fs::write(&bundled, b"bundled").unwrap();
-        assert_eq!(find_openvino_plugin(&root).as_deref(), Some(bundled.as_path()));
+        assert_eq!(
+            find_openvino_plugin(&root).as_deref(),
+            Some(bundled.as_path())
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
