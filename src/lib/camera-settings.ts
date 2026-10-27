@@ -30,6 +30,40 @@ export type CameraSettings = {
 	scale: CameraScale | null;
 };
 
+export type UvcSettings = {
+	autoExposure: boolean;
+	exposureAbsolute: number;
+	autoFocus: boolean;
+	focusAbsolute: number;
+	autoWhiteBalance: boolean;
+	whiteBalanceKelvin: number;
+	gain: number;
+};
+
+export function defaultUvcSettings(): UvcSettings {
+	return {
+		autoExposure: false,
+		exposureAbsolute: 156,
+		autoFocus: false,
+		focusAbsolute: 25,
+		autoWhiteBalance: false,
+		whiteBalanceKelvin: 4500,
+		gain: 0,
+	};
+}
+
+export function defaultPylonSettings(): {
+	exposureTimeUs: number;
+	gainDb: number;
+	pixelFormat: string;
+} {
+	return {
+		exposureTimeUs: 15000,
+		gainDb: 0,
+		pixelFormat: "RGB8",
+	};
+}
+
 const DISPLAY_RATES = [15, 20, 25, 30];
 
 export function readDisplayFps(value: unknown): number {
@@ -44,6 +78,50 @@ function isModeId(value: string): boolean {
 function objectField(value: unknown): Record<string, unknown> {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return {};
 	return value as Record<string, unknown>;
+}
+
+function boolField(value: unknown, fallback: boolean): boolean {
+	return typeof value === "boolean" ? value : fallback;
+}
+
+function intField(
+	value: unknown,
+	fallback: number,
+	min: number,
+	max: number,
+): number {
+	if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+	const next = Math.round(value);
+	if (next < min || next > max) return fallback;
+	return next;
+}
+
+/** Driver block for the open UVC camera. Missing fields use the bench defaults. */
+export function readUvcSettings(camera: unknown): UvcSettings {
+	const defaults = defaultUvcSettings();
+	const data = objectField(objectField(camera).uvcSettings);
+	return {
+		autoExposure: boolField(data.autoExposure, defaults.autoExposure),
+		exposureAbsolute: intField(
+			data.exposureAbsolute,
+			defaults.exposureAbsolute,
+			-13,
+			20000,
+		),
+		autoFocus: boolField(data.autoFocus, defaults.autoFocus),
+		focusAbsolute: intField(data.focusAbsolute, defaults.focusAbsolute, 0, 100),
+		autoWhiteBalance: boolField(
+			data.autoWhiteBalance,
+			defaults.autoWhiteBalance,
+		),
+		whiteBalanceKelvin: intField(
+			data.whiteBalanceKelvin,
+			defaults.whiteBalanceKelvin,
+			1000,
+			15000,
+		),
+		gain: intField(data.gain, defaults.gain, 0, 255),
+	};
 }
 
 function levelValue(value: unknown): number | null {
@@ -133,12 +211,30 @@ function writeCamera(
 		document.camera = camera;
 		return;
 	}
-	document.camera = {
+	const next: Record<string, unknown> = {
 		...camera,
 		...levels(settings),
 		index: settings.index,
+		deviceIndex: settings.index,
 		byIndex,
 	};
+	if (typeof next.type !== "string" || next.type.trim() === "")
+		next.type = "uvc";
+	if (
+		!next.uvcSettings ||
+		typeof next.uvcSettings !== "object" ||
+		Array.isArray(next.uvcSettings)
+	) {
+		next.uvcSettings = defaultUvcSettings();
+	}
+	if (
+		!next.pylonSettings ||
+		typeof next.pylonSettings !== "object" ||
+		Array.isArray(next.pylonSettings)
+	) {
+		next.pylonSettings = defaultPylonSettings();
+	}
+	document.camera = next;
 }
 
 /** Store `settings` without changing which camera is selected. */

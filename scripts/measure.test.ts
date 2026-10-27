@@ -4,6 +4,7 @@
 import {
 	assignActiveCamera,
 	readCameraScale,
+	readUvcSettings,
 	retainCameraSettings,
 	settingsForCamera,
 } from "../src/lib/camera-settings.ts";
@@ -158,6 +159,19 @@ const reloaded = JSON.parse(JSON.stringify(document)) as Record<
 	unknown
 >;
 const again = settingsForCamera(reloaded.camera, 0);
+const savedCamera = document.camera as {
+	deviceIndex?: number;
+	type?: string;
+	uvcSettings?: { exposureAbsolute?: number };
+};
+check(
+	"the active camera keeps its driver block and scale",
+	savedCamera.deviceIndex === 0 &&
+		savedCamera.type === "uvc" &&
+		savedCamera.uvcSettings?.exposureAbsolute === 156 &&
+		readUvcSettings(savedCamera).focusAbsolute === 25 &&
+		readUvcSettings(savedCamera).gain === 0,
+);
 check(
 	"the scale survives a JSON reload",
 	again.scale?.mmPerPx === 0.5 &&

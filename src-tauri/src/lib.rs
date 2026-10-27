@@ -55,6 +55,8 @@ pub fn run() {
             camera::capture_preview,
             camera::set_camera_focus,
             camera::set_camera_autofocus,
+            camera::set_camera_exposure,
+            camera::set_camera_gain,
             training::default_training_folder,
             training::check_training_folder,
             training::pick_training_folder,

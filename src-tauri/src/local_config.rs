@@ -213,12 +213,28 @@ fn default_config() -> Value {
         "trainingDir": "",
         "trainingImageName": "",
         "camera": {
+            "type": "uvc",
             "index": 0,
+            "deviceIndex": 0,
             "resolution": "",
             "focus": null,
             "brightness": null,
             "contrast": null,
-            "displayFps": 15
+            "displayFps": 15,
+            "uvcSettings": {
+                "autoExposure": false,
+                "exposureAbsolute": 156,
+                "autoFocus": false,
+                "focusAbsolute": 25,
+                "autoWhiteBalance": false,
+                "whiteBalanceKelvin": 4500,
+                "gain": 0
+            },
+            "pylonSettings": {
+                "exposureTimeUs": 15000.0,
+                "gainDb": 0.0,
+                "pixelFormat": "RGB8"
+            }
         }
     })
 }

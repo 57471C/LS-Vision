@@ -34,13 +34,29 @@
 	"trainingDir": "",
 	"trainingImageName": "",
 	"camera": {
+		"type": "uvc",
 		"index": 0,
+		"deviceIndex": 0,
 		"resolution": "",
 		"focus": null,
 		"brightness": null,
 		"contrast": null,
 		"displayFps": 15,
 		"scale": null,
+		"uvcSettings": {
+			"autoExposure": false,
+			"exposureAbsolute": 156,
+			"autoFocus": false,
+			"focusAbsolute": 25,
+			"autoWhiteBalance": false,
+			"whiteBalanceKelvin": 4500,
+			"gain": 0
+		},
+		"pylonSettings": {
+			"exposureTimeUs": 15000.0,
+			"gainDb": 0.0,
+			"pixelFormat": "RGB8"
+		},
 		"byIndex": {
 			"0": {
 				"resolution": "",
