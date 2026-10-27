@@ -66,9 +66,13 @@ pub trait InspectionCamera: Send + Sync {
     fn capture_frame(&mut self) -> Result<image::RgbImage, String>;
     fn set_exposure(&mut self, config: &ExposureConfig) -> Result<(), String>;
     fn set_gain(&mut self, gain: f32) -> Result<(), String>;
+    /// Pylon inherits this no-op. UVC focus is written on the open device.
+    #[allow(dead_code)]
     fn set_focus(&mut self, _auto: bool, _focus_absolute: Option<i32>) -> Result<(), String> {
         Ok(())
     }
+    /// Pylon inherits this no-op. UVC white balance is written on the open device.
+    #[allow(dead_code)]
     fn set_white_balance(&mut self, _auto: bool, _kelvin: Option<i32>) -> Result<(), String> {
         Ok(())
     }
@@ -174,29 +178,6 @@ impl InspectionCamera for UvcBackend {
     fn set_gain(&mut self, gain: f32) -> Result<(), String> {
         self.settings.gain = gain;
         let applied = apply_gain(self.index, gain)?;
-        self.applied = Some(applied);
-        Ok(())
-    }
-
-    fn set_focus(&mut self, auto: bool, focus_absolute: Option<i32>) -> Result<(), String> {
-        self.settings.auto_focus = auto;
-        if let Some(value) = focus_absolute {
-            self.settings.focus_absolute = value.clamp(0, 100) as u32;
-        }
-        let request = if auto {
-            FocusRequest::Auto
-        } else {
-            FocusRequest::Manual(self.settings.focus_absolute)
-        };
-        submit_focus(self.index, request)
-    }
-
-    fn set_white_balance(&mut self, auto: bool, kelvin: Option<i32>) -> Result<(), String> {
-        self.settings.auto_white_balance = auto;
-        if let Some(value) = kelvin {
-            self.settings.white_balance_kelvin = value;
-        }
-        let applied = apply_white_balance(self.index, auto, self.settings.white_balance_kelvin)?;
         self.applied = Some(applied);
         Ok(())
     }
@@ -363,12 +344,6 @@ enum Job {
         gain: f32,
         reply: Sender<Result<i32, String>>,
     },
-    WhiteBalance {
-        index: u32,
-        auto: bool,
-        kelvin: i32,
-        reply: Sender<Result<i32, String>>,
-    },
 }
 
 static JOBS: OnceLock<Sender<Job>> = OnceLock::new();
@@ -406,9 +381,6 @@ fn camera_loop(incoming: mpsc::Receiver<Job>) {
                     let _ = reply.send(Err(message));
                 }
                 Job::Gain { reply, .. } => {
-                    let _ = reply.send(Err(message));
-                }
-                Job::WhiteBalance { reply, .. } => {
                     let _ = reply.send(Err(message));
                 }
             }
@@ -449,14 +421,6 @@ fn camera_loop(incoming: mpsc::Receiver<Job>) {
                 reply,
             } => {
                 let _ = reply.send(apply_gain_job(&mut open, index, gain));
-            }
-            Job::WhiteBalance {
-                index,
-                auto,
-                kelvin,
-                reply,
-            } => {
-                let _ = reply.send(apply_white_balance_job(&mut open, index, auto, kelvin));
             }
         }
     }
@@ -882,20 +846,6 @@ fn apply_gain(index: u32, gain: f32) -> Result<i32, String> {
         .map_err(|_| "Camera thread stopped.".to_string())?
 }
 
-fn apply_white_balance(index: u32, auto: bool, kelvin: i32) -> Result<i32, String> {
-    let (tx, rx) = mpsc::channel();
-    jobs()
-        .send(Job::WhiteBalance {
-            index,
-            auto,
-            kelvin,
-            reply: tx,
-        })
-        .map_err(|_| "Camera thread stopped.".to_string())?;
-    rx.recv()
-        .map_err(|_| "Camera thread stopped.".to_string())?
-}
-
 fn apply_exposure_job(
     open: &mut Option<session::Device>,
     index: u32,
@@ -925,25 +875,6 @@ fn apply_gain_job(open: &mut Option<session::Device>, index: u32, gain: f32) -> 
     let applied = device.set_gain_control(gain)?;
     if gain.is_finite() {
         log_if_clamped("gain", i64::from(gain.round() as i32), applied);
-    }
-    Ok(applied)
-}
-
-fn apply_white_balance_job(
-    open: &mut Option<session::Device>,
-    index: u32,
-    auto: bool,
-    kelvin: i32,
-) -> Result<i32, String> {
-    refuse_unlinked_pylon(open)?;
-    let opened = ensure_device(open, index)?;
-    if opened {
-        apply_open_controls(open);
-    }
-    let device = open.as_ref().expect("camera was opened");
-    let applied = device.set_white_balance_control(auto, kelvin)?;
-    if !auto {
-        log_if_clamped("white balance", i64::from(kelvin), applied);
     }
     Ok(applied)
 }
