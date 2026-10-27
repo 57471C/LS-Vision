@@ -14,8 +14,10 @@ import {
 import MeasureOverlay from "$lib/MeasureOverlay.svelte";
 import {
 	type CameraScale,
+	formatPxMm,
 	formatReadout,
 	formatScale,
+	imagePoint,
 	type ImageLine,
 	lineLength,
 	type MeasureDraw,
@@ -23,6 +25,7 @@ import {
 	parseMillimetres,
 	scaleFromLength,
 } from "$lib/measure";
+import { marqueeGesture, topMarkAt } from "$lib/preview-marquee";
 
 const PREVIEW_CHANNEL = "ls-vision-camera-preview";
 const ADMIN_FLAG = "ls-vision-settings-open";
@@ -115,6 +118,13 @@ type Region = {
 	h: number;
 };
 
+type Aim = {
+	x: number;
+	y: number;
+	left: number;
+	top: number;
+};
+
 const MIN_MARQUEE = 8;
 
 const DETECT_COLORS = [
@@ -140,6 +150,7 @@ let detectH = 0;
 let detectMarks: DetectMark[] = [];
 let detectNote = "";
 let admin = false;
+// The each block has to read this array itself. A helper is not redrawn when it changes.
 let selected: number[] = [];
 let saveMode: "append" | "replace" = "append";
 let saveBusy = false;
@@ -147,7 +158,6 @@ let saveNote = "";
 let saveGeneration = 0;
 let sourceW = 0;
 let sourceH = 0;
-let detectImgEl: HTMLImageElement | undefined;
 let classNames: string[] = [];
 let marquee: Region | null = null;
 let marqueeDraft: Region | null = null;
@@ -171,10 +181,14 @@ let pendingScale: { pixels: number; width: number; height: number } | null =
 	null;
 let measureOn = false;
 let measureLine: ImageLine | null = null;
+let crosshairs = false;
+let aim: Aim | null = null;
+let aimClient: { x: number; y: number } | null = null;
+let aimFrame = 0;
+let frameEl: HTMLDivElement | undefined;
+let pressMark: DetectMark | null = null;
 
 $: shownMarquee = marqueeDraft ?? marquee;
-$: marqueeCursor =
-	admin && !!detectImage && !spaceDown && !panning && !snapshotOpen;
 
 function formatStatus(body: PreviewBody, canvasRate: string): string {
 	const width = body.width;
@@ -247,6 +261,7 @@ function fitFrame() {
 	fitLeft = (viewW - fitW) / 2;
 	fitTop = (viewH - fitH) / 2;
 	clampPan();
+	scheduleAim();
 }
 
 function clampAxis(
@@ -268,6 +283,7 @@ function clampPan() {
 	if (!view || fitW <= 0 || fitH <= 0) return;
 	panX = clampAxis(panX, fitLeft, fitW * zoom, view.clientWidth);
 	panY = clampAxis(panY, fitTop, fitH * zoom, view.clientHeight);
+	scheduleAim();
 }
 
 function resetView() {
@@ -302,6 +318,7 @@ function applyZoom(next: number, clientX: number, clientY: number) {
 		zoom = 1;
 		panX = 0;
 		panY = 0;
+		scheduleAim();
 		return;
 	}
 	panX = cx - fitLeft - contentX * zoom;
@@ -640,24 +657,89 @@ function marqueeField(event: KeyboardEvent): boolean {
 	return target instanceof HTMLInputElement && target.id === "marquee-ic";
 }
 
-function eventOnDetection(event: Event): boolean {
-	const target = event.target;
-	return (
-		target instanceof Element && target.closest("[data-detection]") !== null
-	);
+function eventOnFrame(event: Event): boolean {
+	const node = frameEl;
+	if (!node || !(event.target instanceof Node)) return false;
+	return node === event.target || node.contains(event.target);
 }
 
 function previewPoint(event: PointerEvent): { x: number; y: number } | null {
-	const node = detectImgEl;
+	const node = frameEl;
 	if (!node || detectW < 1 || detectH < 1) return null;
+	return imagePoint(
+		event.clientX,
+		event.clientY,
+		node.getBoundingClientRect(),
+		detectW,
+		detectH,
+	);
+}
+
+function placeAim(clientX: number, clientY: number, keepOutside: boolean) {
+	if (!admin || !crosshairs || snapshotOpen || scaleModal) {
+		if (aim) aim = null;
+		return;
+	}
+	const node = frameEl;
+	const view = viewportEl;
+	if (!node || !view || overlayW < 1 || overlayH < 1) {
+		aim = null;
+		return;
+	}
 	const rect = node.getBoundingClientRect();
-	if (rect.width < 1 || rect.height < 1) return null;
-	const x = ((event.clientX - rect.left) / rect.width) * detectW;
-	const y = ((event.clientY - rect.top) / rect.height) * detectH;
-	return {
-		x: Math.min(detectW, Math.max(0, x)),
-		y: Math.min(detectH, Math.max(0, y)),
-	};
+	const inside =
+		clientX >= rect.left &&
+		clientX <= rect.right &&
+		clientY >= rect.top &&
+		clientY <= rect.bottom;
+	if (!inside && !keepOutside) {
+		if (aim) aim = null;
+		return;
+	}
+	const point = imagePoint(clientX, clientY, rect, overlayW, overlayH);
+	if (!point) {
+		aim = null;
+		return;
+	}
+	const box = view.getBoundingClientRect();
+	const labelW = 220;
+	const labelH = drawing && marqueeDraft ? 78 : 42;
+	let left = clientX - box.left + 14;
+	let top = clientY - box.top + 14;
+	if (left + labelW > box.width) left = clientX - box.left - labelW - 8;
+	if (top + labelH > box.height) top = clientY - box.top - labelH - 8;
+	if (left < 4) left = 4;
+	if (top < 4) top = 4;
+	aim = { x: point.x, y: point.y, left, top };
+}
+
+function notePointer(event: PointerEvent) {
+	aimClient = { x: event.clientX, y: event.clientY };
+	placeAim(event.clientX, event.clientY, drawing);
+}
+
+function scheduleAim() {
+	if (!aimClient || !crosshairs || !admin) return;
+	if (aimFrame) cancelAnimationFrame(aimFrame);
+	aimFrame = requestAnimationFrame(() => {
+		aimFrame = 0;
+		if (!aimClient) return;
+		placeAim(aimClient.x, aimClient.y, drawing);
+	});
+}
+
+function onViewportLeave() {
+	if (drawing) return;
+	aim = null;
+	aimClient = null;
+}
+
+function toggleCrosshairs() {
+	crosshairs = !crosshairs;
+	if (!crosshairs) {
+		aim = null;
+		aimClient = null;
+	}
 }
 
 function regionFrom(
@@ -682,11 +764,18 @@ function toSource(region: Region): Region | null {
 	};
 }
 
+function cancelDraft() {
+	drawing = false;
+	marqueeDraft = null;
+	pressMark = null;
+}
+
 function forgetMarquee(mode: "vector" | "frame" | "view") {
 	marqueeGen += 1;
 	marquee = null;
 	marqueeDraft = null;
 	drawing = false;
+	pressMark = null;
 	marqueeReady = false;
 	marqueeBusy = false;
 	marqueeNote = "";
@@ -706,17 +795,19 @@ function onPointerDown(event: PointerEvent) {
 		viewportEl?.setPointerCapture(event.pointerId);
 		return;
 	}
-	if (!admin || !detectImage || spaceDown || drawing || eventOnDetection(event))
-		return;
+	if (!marqueeHit || drawing || !eventOnFrame(event)) return;
 	const point = previewPoint(event);
 	if (!point) return;
+	event.preventDefault();
 	drawing = true;
 	drawOrigin = point;
+	pressMark = topMarkAt(detectMarks, point.x, point.y);
 	marqueeDraft = { x: point.x, y: point.y, w: 0, h: 0 };
 	viewportEl?.setPointerCapture(event.pointerId);
 }
 
 function onPointerMove(event: PointerEvent) {
+	if (crosshairs) notePointer(event);
 	if (panning) {
 		panX = panOrigin.panX + (event.clientX - panOrigin.x);
 		panY = panOrigin.panY + (event.clientY - panOrigin.y);
@@ -738,14 +829,26 @@ function onPointerUp(event: PointerEvent) {
 	drawing = false;
 	const point = previewPoint(event);
 	const draft = point ? regionFrom(drawOrigin, point) : marqueeDraft;
+	const pressed = pressMark;
 	marqueeDraft = null;
-	if (!draft || draft.w < MIN_MARQUEE || draft.h < MIN_MARQUEE) return;
-	void commitMarquee(draft);
+	pressMark = null;
+	const gesture = marqueeGesture(
+		draft?.w ?? 0,
+		draft?.h ?? 0,
+		pressed,
+		MIN_MARQUEE,
+	);
+	if (gesture.type === "select") {
+		toggleMark(gesture.index);
+		return;
+	}
+	if (gesture.type === "marquee" && draft) void commitMarquee(draft);
 }
 
 function onPointerCancel() {
 	drawing = false;
 	marqueeDraft = null;
+	pressMark = null;
 	panning = false;
 }
 
@@ -896,6 +999,7 @@ function cancelScaleMode() {
 
 function toggleScaleMode() {
 	if (!admin) return;
+	cancelDraft();
 	if (scaleMode || scaleModal) {
 		cancelScaleMode();
 		return;
@@ -906,6 +1010,7 @@ function toggleScaleMode() {
 }
 
 function toggleMeasure() {
+	cancelDraft();
 	if (measureOn) {
 		measureOn = false;
 		measureLine = null;
@@ -999,6 +1104,18 @@ $: lineActive =
 	!snapshotOpen &&
 	!spaceDown &&
 	!panning;
+$: overlayW = detectImage && detectW > 0 ? detectW : frameW;
+$: overlayH = detectImage && detectH > 0 ? detectH : frameH;
+// The measure layer sits on the still. This flag is the drag surface, so a
+// detection box does not take the press and measuring keeps the line.
+$: marqueeHit =
+	admin &&
+	!!detectImage &&
+	!lineActive &&
+	!spaceDown &&
+	!panning &&
+	!snapshotOpen &&
+	!scaleModal;
 
 function invokeMessage(err: unknown, fallback: string): string {
 	return typeof err === "string" && err.trim() ? err : fallback;
@@ -1220,6 +1337,9 @@ function applyAdmin(next: boolean) {
 		selected = [];
 		forgetMarquee("vector");
 		cancelScaleMode();
+		crosshairs = false;
+		aim = null;
+		aimClient = null;
 	} else if (detectImage) {
 		void loadClassNames();
 	}
@@ -1253,17 +1373,6 @@ function toggleMark(index: number) {
 	selected = selected.includes(index)
 		? selected.filter((item) => item !== index)
 		: [...selected, index];
-}
-
-function onMarkClick(event: MouseEvent, index: number) {
-	if (!admin || spaceDown) return;
-	event.preventDefault();
-	event.stopPropagation();
-	toggleMark(index);
-}
-
-function markSelected(index: number): boolean {
-	return selected.includes(index);
 }
 
 async function loadClassNames() {
@@ -1471,6 +1580,7 @@ onDestroy(() => {
 	closed = true;
 	generation += 1;
 	if (focusTimer) clearTimeout(focusTimer);
+	if (aimFrame) cancelAnimationFrame(aimFrame);
 	void invoke("release_preview_frame").catch(() => {
 		// The window is closing. The held still can stay until the process exits.
 	});
@@ -1582,6 +1692,20 @@ onDestroy(() => {
 			>
 				Measure
 			</button>
+			{#if admin}
+				<button
+					type="button"
+					class="inline-flex h-7 shrink-0 items-center border px-2 text-xs font-semibold {crosshairs
+						? 'border-blue-500 bg-blue-600 text-white'
+						: 'border-neutral-600 bg-neutral-800 text-neutral-100'}"
+					aria-pressed={crosshairs}
+					aria-label="Crosshairs"
+					disabled={snapshotOpen}
+					on:click={toggleCrosshairs}
+				>
+					Crosshairs
+				</button>
+			{/if}
 			{#if status}
 				<p class="min-w-0 truncate text-xs tabular-nums text-neutral-200">{status}</p>
 			{:else}
@@ -1605,13 +1729,14 @@ onDestroy(() => {
 	<div
 		bind:this={viewportEl}
 		class="relative min-h-0 flex-1 select-none overflow-hidden bg-black"
-		class:cursor-crosshair={marqueeCursor}
+		class:cursor-crosshair={marqueeHit}
 		class:cursor-grab={spaceDown && zoom > 1 && !panning}
 		class:cursor-grabbing={panning}
 		on:pointerdown={onPointerDown}
 		on:pointermove={onPointerMove}
 		on:pointerup={onPointerUp}
 		on:pointercancel={onPointerCancel}
+		on:pointerleave={onViewportLeave}
 	>
 		<canvas
 			bind:this={canvasEl}
@@ -1627,8 +1752,7 @@ onDestroy(() => {
 		></canvas>
 		{#if painted && frameW > 0 && frameH > 0}
 			<div
-				class="absolute z-[1]"
-				class:pointer-events-none={!lineActive}
+				class="pointer-events-none absolute z-[3]"
 				style:left="{fitLeft}px"
 				style:top="{fitTop}px"
 				style:width="{fitW}px"
@@ -1645,10 +1769,87 @@ onDestroy(() => {
 					on:line={onMeasureLine}
 				/>
 			</div>
+			<div
+				bind:this={frameEl}
+				class="absolute z-[2] touch-none"
+				class:pointer-events-none={!marqueeHit}
+				class:cursor-crosshair={marqueeHit}
+				style:left="{fitLeft}px"
+				style:top="{fitTop}px"
+				style:width="{fitW}px"
+				style:height="{fitH}px"
+				style:transform="translate({panX}px, {panY}px) scale({zoom})"
+				style:transform-origin="0 0"
+				data-preview-frame
+				data-marquee-hit={marqueeHit ? "true" : "false"}
+			>
+				{#if overlayW > 0 && overlayH > 0 && (shownMarquee || (crosshairs && aim))}
+					<svg
+						class="pointer-events-none absolute inset-0 h-full w-full"
+						viewBox="0 0 {overlayW} {overlayH}"
+						preserveAspectRatio="none"
+						aria-hidden="true"
+					>
+						{#if crosshairs && aim}
+							<line
+								x1={aim.x}
+								y1="0"
+								x2={aim.x}
+								y2={overlayH}
+								stroke="rgba(0,0,0,0.35)"
+								stroke-width="1"
+								vector-effect="non-scaling-stroke"
+							/>
+							<line
+								x1={aim.x}
+								y1="0"
+								x2={aim.x}
+								y2={overlayH}
+								stroke="rgba(255,255,255,0.5)"
+								stroke-width="1"
+								vector-effect="non-scaling-stroke"
+								data-crosshair="v"
+							/>
+							<line
+								x1="0"
+								y1={aim.y}
+								x2={overlayW}
+								y2={aim.y}
+								stroke="rgba(0,0,0,0.35)"
+								stroke-width="1"
+								vector-effect="non-scaling-stroke"
+							/>
+							<line
+								x1="0"
+								y1={aim.y}
+								x2={overlayW}
+								y2={aim.y}
+								stroke="rgba(255,255,255,0.5)"
+								stroke-width="1"
+								vector-effect="non-scaling-stroke"
+								data-crosshair="h"
+							/>
+						{/if}
+						{#if shownMarquee}
+							<rect
+								x={shownMarquee.x}
+								y={shownMarquee.y}
+								width={shownMarquee.w}
+								height={shownMarquee.h}
+								fill="rgba(250, 204, 21, 0.18)"
+								stroke="#facc15"
+								stroke-width="2"
+								stroke-dasharray="8 4"
+								vector-effect="non-scaling-stroke"
+								data-marquee
+							/>
+						{/if}
+					</svg>
+				{/if}
+			</div>
 		{/if}
 		{#if detectImage}
 			<img
-				bind:this={detectImgEl}
 				src={detectImage}
 				alt=""
 				class="pointer-events-none absolute"
@@ -1671,22 +1872,8 @@ onDestroy(() => {
 				preserveAspectRatio="none"
 				aria-hidden="true"
 			>
-				{#if shownMarquee}
-					<rect
-						x={shownMarquee.x}
-						y={shownMarquee.y}
-						width={shownMarquee.w}
-						height={shownMarquee.h}
-						fill="rgba(250, 204, 21, 0.18)"
-						stroke="#facc15"
-						stroke-width="2"
-						stroke-dasharray="8 4"
-						vector-effect="non-scaling-stroke"
-						pointer-events="none"
-					/>
-				{/if}
 				{#each detectMarks as mark, markIndex (`${markIndex}:${mark.ic}`)}
-					{#if markSelected(mark.index)}
+					{#if selected.includes(mark.index)}
 						<rect
 							x={mark.x}
 							y={mark.y}
@@ -1704,15 +1891,13 @@ onDestroy(() => {
 						y={mark.y}
 						width={mark.w}
 						height={mark.h}
-						fill={admin && mark.embed ? "transparent" : "none"}
+						fill="none"
 						stroke={mark.color}
 						stroke-width="2"
 						vector-effect="non-scaling-stroke"
+						pointer-events="none"
 						data-detection={mark.ic}
-						data-selected={markSelected(mark.index) ? "true" : "false"}
-						class:pointer-events-auto={admin && mark.embed}
-						class:cursor-pointer={admin && mark.embed}
-						on:click={(event) => onMarkClick(event, mark.index)}
+						data-selected={selected.includes(mark.index) ? "true" : "false"}
 					/>
 					<text
 						x={mark.x}
@@ -1728,7 +1913,7 @@ onDestroy(() => {
 				{/each}
 			</svg>
 			<div
-				class="absolute left-3 top-3 z-[2] max-h-80 max-w-xs overflow-auto border border-neutral-700 bg-neutral-950/90 px-3 py-2"
+				class="absolute left-3 top-3 z-[4] max-h-80 max-w-xs overflow-auto border border-neutral-700 bg-neutral-950/90 px-3 py-2"
 				on:pointerdown|stopPropagation
 			>
 				<p class="text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
@@ -1744,8 +1929,8 @@ onDestroy(() => {
 									<button
 										type="button"
 										class="w-full px-1 text-left font-mono text-sm text-neutral-100"
-										class:bg-neutral-800={markSelected(mark.index)}
-										aria-pressed={markSelected(mark.index)}
+										class:bg-neutral-800={selected.includes(mark.index)}
+										aria-pressed={selected.includes(mark.index)}
 										on:click={() => toggleMark(mark.index)}
 									>
 										{mark.ic}
@@ -1805,7 +1990,7 @@ onDestroy(() => {
 			</div>
 			{#if admin && (marquee || marqueeNote)}
 				<div
-					class="absolute right-3 top-3 z-[3] w-56 border border-neutral-700 bg-neutral-950/95 px-3 py-2"
+					class="absolute right-3 top-3 z-[5] w-56 border border-neutral-700 bg-neutral-950/95 px-3 py-2"
 					on:pointerdown|stopPropagation
 				>
 					<label
@@ -1870,8 +2055,24 @@ onDestroy(() => {
 				{message || "Opening camera…"}
 			</p>
 		{/if}
+		{#if admin && crosshairs && aim}
+			<p
+				class="pointer-events-none absolute z-[6] bg-neutral-950/80 px-2 py-1 font-mono text-xs leading-5 text-neutral-100"
+				style:left="{aim.left}px"
+				style:top="{aim.top}px"
+				data-crosshair-readout
+			>
+				x {formatPxMm(aim.x, overlayW, scale)}<br />
+				y {formatPxMm(aim.y, overlayW, scale)}
+				{#if drawing && marqueeDraft}
+					<br />
+					w {formatPxMm(marqueeDraft.w, overlayW, scale)}<br />
+					h {formatPxMm(marqueeDraft.h, overlayW, scale)}
+				{/if}
+			</p>
+		{/if}
 		<div
-			class="absolute inset-x-0 bottom-0 z-[1] flex flex-col gap-2 bg-neutral-950/80 px-4 py-2"
+			class="absolute inset-x-0 bottom-0 z-[4] flex flex-col gap-2 bg-neutral-950/80 px-4 py-2"
 			on:pointerdown|stopPropagation
 		>
 			<div class="flex items-center gap-3">

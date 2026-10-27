@@ -159,6 +159,20 @@ export function formatReadout(readout: MeasureReadout): string {
 	return `${readout.pixels}. ${readout.message ?? "No scale set for this camera."}`;
 }
 
+/** Pixels, and millimetres when this image has a scale. */
+export function formatPxMm(
+	pixels: number,
+	imageWidth: number,
+	scale: CameraScale | null,
+): string {
+	if (!Number.isFinite(pixels)) return "";
+	const px = formatPixels(Math.max(0, pixels));
+	if (!scale) return px;
+	const mm = lengthMm(Math.max(0, pixels), imageWidth, scale);
+	if (mm === null) return px;
+	return `${px} · ${formatLengthMm(mm)}`;
+}
+
 export function measureReadout(
 	pixels: number,
 	imageWidth: number,
