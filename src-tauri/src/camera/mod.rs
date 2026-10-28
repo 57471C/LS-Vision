@@ -462,11 +462,7 @@ fn camera_loop(incoming: mpsc::Receiver<Job>) {
             } => {
                 let _ = reply.send(apply_exposure_job(&mut open, index, auto, absolute));
             }
-            Job::Gain {
-                index,
-                gain,
-                reply,
-            } => {
+            Job::Gain { index, gain, reply } => {
                 let _ = reply.send(apply_gain_job(&mut open, index, gain));
             }
         }
@@ -918,7 +914,11 @@ fn apply_exposure_job(
     Ok(applied)
 }
 
-fn apply_gain_job(open: &mut Option<session::Device>, index: u32, gain: f32) -> Result<i32, String> {
+fn apply_gain_job(
+    open: &mut Option<session::Device>,
+    index: u32,
+    gain: f32,
+) -> Result<i32, String> {
     refuse_unlinked_pylon(open)?;
     let opened = ensure_device(open, index)?;
     if opened {
@@ -984,10 +984,7 @@ fn saved_index() -> u32 {
     let Ok(config) = local_config::load_document(&root) else {
         return 0;
     };
-    config
-        .get("camera")
-        .map(camera_device_index)
-        .unwrap_or(0)
+    config.get("camera").map(camera_device_index).unwrap_or(0)
 }
 
 /// `index` is the camera Settings selects. `deviceIndex` is the driver field
@@ -2301,12 +2298,9 @@ mod session {
         property: i32,
         label: &str,
     ) -> Result<ControlSpan, String> {
-        read_control_range(
-            label,
-            |min, max, step, default_value, caps| unsafe {
-                control.GetRange(property, min, max, step, default_value, caps)
-            },
-        )
+        read_control_range(label, |min, max, step, default_value, caps| unsafe {
+            control.GetRange(property, min, max, step, default_value, caps)
+        })
     }
 
     fn proc_amp_range(
@@ -2314,12 +2308,9 @@ mod session {
         property: i32,
         label: &str,
     ) -> Result<ControlSpan, String> {
-        read_control_range(
-            label,
-            |min, max, step, default_value, caps| unsafe {
-                control.GetRange(property, min, max, step, default_value, caps)
-            },
-        )
+        read_control_range(label, |min, max, step, default_value, caps| unsafe {
+            control.GetRange(property, min, max, step, default_value, caps)
+        })
     }
 
     fn read_control_range(
@@ -2331,21 +2322,15 @@ mod session {
         let mut step = 0_i32;
         let mut default_value = 0_i32;
         let mut caps = 0_i32;
-        read(
-            &mut min,
-            &mut max,
-            &mut step,
-            &mut default_value,
-            &mut caps,
-        )
-        .map_err(|err| short_camera(&mf_error(&err)))
-        .map_err(|err| {
-            if err == "Camera did not open." {
-                format!("This camera does not support {label}.")
-            } else {
-                err
-            }
-        })?;
+        read(&mut min, &mut max, &mut step, &mut default_value, &mut caps)
+            .map_err(|err| short_camera(&mf_error(&err)))
+            .map_err(|err| {
+                if err == "Camera did not open." {
+                    format!("This camera does not support {label}.")
+                } else {
+                    err
+                }
+            })?;
         Ok(ControlSpan {
             min,
             max,
@@ -2558,7 +2543,11 @@ mod session {
             }
         }
 
-        pub(super) fn set_exposure_control(&self, auto: bool, absolute: i32) -> Result<i32, String> {
+        pub(super) fn set_exposure_control(
+            &self,
+            auto: bool,
+            absolute: i32,
+        ) -> Result<i32, String> {
             self.set_named_camera_control(
                 CameraControl_Exposure.0,
                 "exposure",
@@ -2585,7 +2574,11 @@ mod session {
             write_proc_amp(&control, VideoProcAmp_Gain.0, value, manual, "gain")
         }
 
-        pub(super) fn set_white_balance_control(&self, auto: bool, kelvin: i32) -> Result<i32, String> {
+        pub(super) fn set_white_balance_control(
+            &self,
+            auto: bool,
+            kelvin: i32,
+        ) -> Result<i32, String> {
             let source = self
                 .source
                 .as_ref()
@@ -3542,11 +3535,19 @@ mod session {
             Err("Camera capture is only available on Windows.".to_string())
         }
 
-        pub(super) fn apply_uvc(&self, _settings: &UvcSettings, _phase: &str) -> Result<(), String> {
+        pub(super) fn apply_uvc(
+            &self,
+            _settings: &UvcSettings,
+            _phase: &str,
+        ) -> Result<(), String> {
             Err("Camera capture is only available on Windows.".to_string())
         }
 
-        pub(super) fn set_exposure_control(&self, _auto: bool, _absolute: i32) -> Result<i32, String> {
+        pub(super) fn set_exposure_control(
+            &self,
+            _auto: bool,
+            _absolute: i32,
+        ) -> Result<i32, String> {
             Err("Camera capture is only available on Windows.".to_string())
         }
 
@@ -4230,7 +4231,10 @@ mod tests {
             backend.set_exposure(&exposure).unwrap_err(),
             "Pylon backend not linked yet"
         );
-        assert_eq!(backend.set_gain(0.0).unwrap_err(), "Pylon backend not linked yet");
+        assert_eq!(
+            backend.set_gain(0.0).unwrap_err(),
+            "Pylon backend not linked yet"
+        );
         assert!(backend.set_focus(false, Some(25)).is_ok());
         assert!(backend.set_white_balance(false, Some(4500)).is_ok());
     }
@@ -4251,7 +4255,10 @@ mod tests {
         assert_eq!(exposure_device_value(156, -13, -1, 1), -6);
         assert_eq!(gain_device_value(0.0, 0, 255, 1), 0);
         assert_eq!(snap_control_value(12, 0, 100, 5), 10);
-        assert_eq!(white_balance_device_value(4500, 2800, 6500, 10).unwrap(), 4500);
+        assert_eq!(
+            white_balance_device_value(4500, 2800, 6500, 10).unwrap(),
+            4500
+        );
         assert!(white_balance_device_value(4500, 0, 255, 1).is_err());
     }
 

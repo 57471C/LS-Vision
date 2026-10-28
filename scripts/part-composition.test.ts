@@ -396,6 +396,32 @@ check(
 	JSON.stringify(twinCounts),
 );
 
+const labelled = applyPartRules(
+	[
+		{
+			...box("Hinge_Plate", [0, 0, 100, 80]),
+			catalogMatch: {
+				recognized: true,
+				label: "FAST-00124 (94%)",
+				top: {
+					ic: "FAST-00124",
+					description: "Bolt",
+					partType: "fastener",
+					score: 0.94,
+				},
+				runnersUp: [],
+			},
+		},
+		box("P02_Logo", [10, 10, 30, 30]),
+	],
+	[hingeRules[0]],
+);
+check(
+	"a catalogue label stays on the box when a part rule renames it",
+	labelled.detections[0]?.ic === "2QHP02" &&
+		labelled.detections[0]?.catalogMatch?.label === "FAST-00124 (94%)",
+);
+
 if (failed > 0) {
 	throw new Error(`${failed} part composition checks failed`);
 }

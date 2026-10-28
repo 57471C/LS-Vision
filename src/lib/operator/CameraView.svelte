@@ -4,6 +4,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { onMount } from "svelte";
 import { readCameraScale, settingsForCamera } from "$lib/camera-settings";
+import { type CatalogMatch, overlayLabel } from "$lib/catalog-match";
 import { type DetectRoi, overlayDetections, slotColor } from "$lib/detect-rois";
 // biome-ignore lint/correctness/noUnusedImports: the template uses this component
 import MeasureOverlay from "$lib/MeasureOverlay.svelte";
@@ -53,6 +54,7 @@ type Detection = {
 	bbox: number[];
 	consumed?: boolean;
 	slot?: number;
+	catalogMatch?: CatalogMatch;
 };
 
 type DetectionMark = {
@@ -63,6 +65,7 @@ type DetectionMark = {
 	y: number;
 	w: number;
 	h: number;
+	label: string;
 	labelX: number;
 	labelY: number;
 	labelW: number;
@@ -162,8 +165,9 @@ function detectionMarks(
 		const y = originY + y1 * scale;
 		const w = (x2 - x1) * scale;
 		const h = (y2 - y1) * scale;
+		const label = overlayLabel(item.catalogMatch, item.ic);
 		const labelW =
-			Math.ceil(item.ic.length * LABEL_FONT * 0.62) + LABEL_PAD_X * 2;
+			Math.ceil(label.length * LABEL_FONT * 0.62) + LABEL_PAD_X * 2;
 		const labelH = LABEL_FONT + LABEL_PAD_Y * 2;
 		let labelX = x;
 		let labelY = y - labelH;
@@ -176,6 +180,7 @@ function detectionMarks(
 		marks.push({
 			key: `${item.slot ?? 0}:${index}:${item.ic}:${x1}:${y1}`,
 			ic: item.ic,
+			label,
 			color: tint || colorForIc(item.ic),
 			slot: item.slot,
 			x,
@@ -549,7 +554,7 @@ $: bannerCount = (wrongParts ? 1 : 0) + (extraParts > 0 ? 1 : 0);
 										font-weight="600"
 										data-part-role="child"
 									>
-										{mark.ic}
+										{mark.label}
 									</text>
 								{:else}
 									{#if mark.unexpected}
@@ -596,7 +601,7 @@ $: bannerCount = (wrongParts ? 1 : 0) + (extraParts > 0 ? 1 : 0);
 										font-weight="600"
 										dominant-baseline="central"
 									>
-										{mark.ic}
+										{mark.label}
 									</text>
 								{/if}
 								{#if mark.slot}

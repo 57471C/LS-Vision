@@ -1,5 +1,6 @@
 import { getContext, setContext } from "svelte";
 import { derived, type Readable, type Writable } from "svelte/store";
+import type { CatalogMatch } from "$lib/catalog-match";
 import {
 	type DetectRoi,
 	emptyDetectRois,
@@ -49,6 +50,8 @@ export type Detection = {
 	// False when saved references for this class scored at or below the threshold.
 	// Absent when that class has no reference, so the box still counts.
 	referenceMatch?: boolean;
+	// Catalogue IC drawn on the box. The BoM count still uses `ic`.
+	catalogMatch?: CatalogMatch;
 };
 
 export type SlotDetections = {
