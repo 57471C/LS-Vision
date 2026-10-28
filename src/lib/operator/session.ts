@@ -8,7 +8,11 @@ import {
 import { tick } from "svelte";
 import { get, writable } from "svelte/store";
 import { activateCamera, readDisplayFps } from "$lib/camera-settings";
-import { readCatalogMatch } from "$lib/catalog-match";
+import {
+	inventoryCodesOutsideBom,
+	partsOutsideBom,
+	readCatalogMatch,
+} from "$lib/catalog-match";
 import {
 	compactClearedSlot,
 	detectSlotNumber,
@@ -491,17 +495,15 @@ function attachSession(
 						detections: includeDetection && !detectFailed ? detections : [],
 					}) === "pass"
 				: view.status === "pass";
-			const known = new Set(parts.map((part) => part.ic));
 			const extras =
 				counts === null
 					? []
-					: Object.entries(counts)
-							.filter(([ic]) => !known.has(ic))
-							.sort((left, right) => left[0].localeCompare(right[0]))
-							.map(([ic, count]) => {
-								const des = descriptions[ic]?.trim() ?? "";
-								return des ? { ic, count, des } : { ic, count };
-							});
+					: partsOutsideBom(detections, parts, descriptions).map((row) => {
+							const des = row.des.trim();
+							return des
+								? { ic: row.ic, count: row.count, des }
+								: { ic: row.ic, count: row.count };
+						});
 			const detail = {
 				message: view.message ?? "",
 				info: view.info ?? "",
@@ -578,10 +580,7 @@ function attachSession(
 	function unexpectedIcs(): string[] {
 		const parts = op.bom?.parts ?? [];
 		if (!op.bom || parts.length === 0) return [];
-		const known = new Set(parts.map((part) => part.ic));
-		return Object.keys(detectionCounts(op.detections))
-			.filter((ic) => !known.has(ic))
-			.sort((left, right) => left.localeCompare(right));
+		return inventoryCodesOutsideBom(partsOutsideBom(op.detections, parts, {}));
 	}
 
 	function descriptionMap(body: { items?: unknown }): Record<string, string> {

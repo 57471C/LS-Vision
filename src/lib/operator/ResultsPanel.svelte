@@ -1,10 +1,16 @@
 <script lang="ts">
 // biome-ignore-all lint/correctness/noUnusedVariables: Biome 2.4 does not treat Svelte template references as uses
+// biome-ignore-all lint/correctness/noUnusedImports: Biome 2.4 does not treat Svelte template references as uses
 
+import { partsOutsideBom } from "$lib/catalog-match";
 import { panelsForSlots } from "$lib/detect-rois";
-import { detectionCounts, inspectionVerdict, lineTally } from "$lib/operator/verdict";
-import { useOperator } from "$lib/stores/operator";
+import {
+	detectionCounts,
+	inspectionVerdict,
+	lineTally,
+} from "$lib/operator/verdict";
 import type { Detection, SlotDetections } from "$lib/stores/operator";
+import { useOperator } from "$lib/stores/operator";
 
 const { chooseAndDetect, chooseAndSaveReferences, operator } = useOperator();
 
@@ -26,27 +32,8 @@ type BomView = {
 	parts: Part[];
 };
 
-type DetectedCount = {
-	ic: string;
-	count: number;
-	des: string;
-};
-
 function isLoadedBom(view: InspectView | null, bom: BomView | null): boolean {
 	return !!bom && !!view?.parts?.length && view.kitCode === bom.kitCode;
-}
-
-function partsOutsideBom(
-	items: Detection[],
-	parts: Part[] | null,
-	descriptions: Record<string, string>,
-): DetectedCount[] {
-	const counts = detectionCounts(items);
-	const known = new Set((parts ?? []).map((part) => part.ic));
-	return Object.entries(counts)
-		.filter(([ic]) => !known.has(ic))
-		.sort((a, b) => a[0].localeCompare(b[0]))
-		.map(([ic, count]) => ({ ic, count, des: descriptions[ic] ?? "" }));
 }
 
 function tallyClass(status: "pass" | "short" | "extra"): string {
