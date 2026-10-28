@@ -72,6 +72,9 @@ struct Detection {
         skip_serializing_if = "Option::is_none"
     )]
     catalog_match: Option<crate::catalog::CatalogMatch>,
+    /// Two-pass catalogue result. Absent only before matching runs.
+    #[serde(default, rename = "twoPass", skip_serializing_if = "Option::is_none")]
+    two_pass: Option<crate::catalog::TwoPassMatch>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -265,6 +268,11 @@ fn match_threshold(document: &Value) -> f32 {
         return DEFAULT_MATCH_THRESHOLD;
     }
     (number as f32).clamp(MIN_MATCH_THRESHOLD, MAX_MATCH_THRESHOLD)
+}
+
+/// Settings > Training debug switch. Missing or any value other than true is off.
+fn catalog_debug(document: &Value) -> bool {
+    document.get("catalogDebug").and_then(Value::as_bool) == Some(true)
 }
 
 /// `enabled` defaults to true when the field is missing or not a boolean.
@@ -953,6 +961,7 @@ fn detections_from_output(
             reference_match: None,
             embed: None,
             catalog_match: None,
+            two_pass: None,
         });
         items.push(DetectedItem {
             ic,
@@ -1715,6 +1724,7 @@ fn detect_pixels(
     height: u32,
     capture_references: bool,
     hold_references: bool,
+    active_bom_ics: Option<Vec<String>>,
 ) -> Result<Value, String> {
     let root = match local_config::project_root() {
         Ok(root) => root,
@@ -1737,6 +1747,8 @@ fn detect_pixels(
         .as_ref()
         .map(detect_plan)
         .unwrap_or(DetectPlan::FullFrame);
+    let include_candidates = document.as_ref().is_some_and(catalog_debug);
+    let bom_ics = crate::catalog::bom_ic_set(active_bom_ics);
     // No slot is the full frame, in the same object the page already reads.
     // Saved slots that are all off return an empty list, not the full frame.
     let slots = match plan {
@@ -1764,7 +1776,15 @@ fn detect_pixels(
                         crate::dinov2::hold_embeddings(held);
                         crate::dinov2::hold_frame(rgb, width, height);
                     }
-                    let catalog = attach_catalog(rgb, width, height, &mut found.detections);
+                    let catalog = attach_catalog(
+                        rgb,
+                        width,
+                        height,
+                        &mut found.detections,
+                        bom_ics.as_ref(),
+                        cutoff,
+                        include_candidates,
+                    );
                     Ok(detection_value(found, dinov2, catalog))
                 }
                 Err(message) => Ok(failure(&model_status_message(&message))),
@@ -1804,7 +1824,15 @@ fn detect_pixels(
                 if hold_references {
                     held_all.extend(held);
                 }
-                let catalog = attach_catalog(rgb, width, height, &mut found.detections);
+                let catalog = attach_catalog(
+                    rgb,
+                    width,
+                    height,
+                    &mut found.detections,
+                    bom_ics.as_ref(),
+                    cutoff,
+                    include_candidates,
+                );
                 let mut row = detection_value(found, dinov2, catalog);
                 if let Some(object) = row.as_object_mut() {
                     object.insert("slot".to_string(), json!(slot));
@@ -1885,16 +1913,38 @@ fn attach_catalog(
     width: u32,
     height: u32,
     detections: &mut [Detection],
+    bom_ics: Option<&std::collections::HashSet<String>>,
+    threshold: f32,
+    include_candidates: bool,
 ) -> Vec<String> {
     if detections.is_empty() {
         return Vec::new();
     }
     let entries = crate::catalog::snapshot();
     let boxes: Vec<[i32; 4]> = detections.iter().map(|item| item.bbox).collect();
-    let matches = crate::catalog::match_pixel_boxes(entries.as_ref(), rgb, width, height, &boxes);
+    let matches = crate::catalog::match_hierarchy(
+        entries.as_ref(),
+        rgb,
+        width,
+        height,
+        &boxes,
+        bom_ics,
+        threshold,
+        include_candidates,
+    );
     let mut lines = Vec::with_capacity(detections.len());
-    for (detection, matched) in detections.iter_mut().zip(matches) {
-        lines.push(format!("Catalogue {} -> {}", detection.ic, matched.label));
+    for (detection, (two_pass, matched)) in detections.iter_mut().zip(matches) {
+        let status = match two_pass.status {
+            crate::catalog::MatchStatus::MatchedBom => "matched_bom",
+            crate::catalog::MatchStatus::WrongPart => "wrong_part",
+            crate::catalog::MatchStatus::Unrecognized => "unrecognized",
+        };
+        lines.push(format!(
+            "Catalogue {} -> {status} {}",
+            detection.ic,
+            two_pass.resolved_ic.as_deref().unwrap_or("-")
+        ));
+        detection.two_pass = Some(two_pass);
         detection.catalog_match = Some(matched);
     }
     lines
@@ -1915,6 +1965,7 @@ fn detect_raw(
     frame: Option<RawFrame>,
     capture_references: bool,
     hold_references: bool,
+    active_bom_ics: Option<Vec<String>>,
 ) -> Result<Value, String> {
     let Some(frame) = frame else {
         return Ok(failure("No frame"));
@@ -1923,13 +1974,21 @@ fn detect_raw(
         Ok(rgb) => rgb,
         Err(message) => return Ok(failure(&message)),
     };
-    detect_pixels(rgb, width, height, capture_references, hold_references)
+    detect_pixels(
+        rgb,
+        width,
+        height,
+        capture_references,
+        hold_references,
+        active_bom_ics,
+    )
 }
 
 fn detect_encoded(
     text: &str,
     capture_references: bool,
     hold_references: bool,
+    active_bom_ics: Option<Vec<String>>,
 ) -> Result<Value, String> {
     let bytes = match payload_bytes(text) {
         Ok(bytes) => bytes,
@@ -1939,7 +1998,14 @@ fn detect_encoded(
         Ok(decoded) => decoded,
         Err(message) => return Ok(failure(&message)),
     };
-    detect_pixels(&rgb, width, height, capture_references, hold_references)
+    detect_pixels(
+        &rgb,
+        width,
+        height,
+        capture_references,
+        hold_references,
+        active_bom_ics,
+    )
 }
 
 #[tauri::command]
@@ -1948,6 +2014,7 @@ pub async fn detect_image(
     image: Option<String>,
     capture_references: Option<bool>,
     hold_references: Option<bool>,
+    active_bom_ics: Option<Vec<String>>,
 ) -> Result<Value, String> {
     // Test mode passes the chosen file. A live detect leaves this empty and
     // uses the raw frame stored by capture_snapshot. Saving references stores
@@ -1958,7 +2025,7 @@ pub async fn detect_image(
     let hold_references = hold_references.unwrap_or(false);
     if let Some(text) = image.filter(|value| !value.trim().is_empty()) {
         return tauri::async_runtime::spawn_blocking(move || {
-            detect_encoded(&text, capture_references, hold_references)
+            detect_encoded(&text, capture_references, hold_references, active_bom_ics)
         })
         .await
         .map_err(|_| "Detect failed".to_string())?;
@@ -1968,7 +2035,7 @@ pub async fn detect_image(
         guard.clone()
     };
     tauri::async_runtime::spawn_blocking(move || {
-        detect_raw(frame, capture_references, hold_references)
+        detect_raw(frame, capture_references, hold_references, active_bom_ics)
     })
     .await
     .map_err(|_| "Detect failed".to_string())?

@@ -1,5 +1,6 @@
 <script lang="ts">
 // biome-ignore-all lint/correctness/noUnusedVariables: Biome 2.4 does not treat Svelte template references as uses
+// biome-ignore-all lint/correctness/noUnusedImports: Biome 2.4 does not treat Svelte template references as uses
 
 import { onDestroy, onMount, tick } from "svelte";
 import ClassPicker from "$lib/ClassPicker.svelte";
@@ -129,6 +130,10 @@ let matchNotice = "";
 let matchTimer: ReturnType<typeof setTimeout> | null = null;
 let matchGeneration = 0;
 let matchChain: Promise<void> = Promise.resolve();
+let catalogDebug = false;
+let catalogDebugNotice = "";
+let catalogDebugGeneration = 0;
+let catalogDebugChain: Promise<void> = Promise.resolve();
 let inferenceProviders: string[] = ["cpu"];
 let inferenceEp = "cpu";
 let inferenceActive = "cpu";
@@ -714,6 +719,7 @@ function queueMatchSave() {
 
 async function loadMatchThreshold() {
 	const generation = matchGeneration;
+	const debugGeneration = catalogDebugGeneration;
 	try {
 		const data = await loadDocument();
 		if (generation !== matchGeneration) return;
@@ -722,6 +728,9 @@ async function loadMatchThreshold() {
 				? data.matchThreshold
 				: MATCH_DEFAULT,
 		);
+		if (debugGeneration === catalogDebugGeneration) {
+			catalogDebug = data.catalogDebug === true;
+		}
 	} catch (err: unknown) {
 		if (generation !== matchGeneration) return;
 		matchNotice = invokeError(err, "Could not load the match threshold");
@@ -768,6 +777,38 @@ function commitMatch() {
 	}
 	showMatch(parsed);
 	queueMatchSave();
+}
+
+function onCatalogDebugChange(event: Event) {
+	const input = event.currentTarget;
+	if (!(input instanceof HTMLInputElement)) return;
+	const enabled = input.checked;
+	catalogDebug = enabled;
+	const generation = ++catalogDebugGeneration;
+	catalogDebugChain = catalogDebugChain
+		.catch(() => undefined)
+		.then(() => persistCatalogDebug(enabled, generation));
+}
+
+async function persistCatalogDebug(enabled: boolean, generation: number) {
+	catalogDebugNotice = "";
+	try {
+		const current = await loadDocument();
+		if (generation !== catalogDebugGeneration) return;
+		current.catalogDebug = enabled;
+		await storeDocument(current);
+		if (generation !== catalogDebugGeneration) return;
+		catalogDebugNotice = enabled
+			? "Saved. Catalogue candidates are included."
+			: "Saved. Catalogue candidates are hidden.";
+	} catch (err: unknown) {
+		if (generation !== catalogDebugGeneration) return;
+		catalogDebug = !enabled;
+		catalogDebugNotice = invokeError(
+			err,
+			"Could not save the catalogue debug flag",
+		);
+	}
 }
 
 function modelNoticeClass(text: string): string {
@@ -3414,10 +3455,25 @@ onDestroy(() => {
 									Current value <span class="font-mono text-neutral-100">{matchThreshold.toFixed(2)}</span>
 								</p>
 								<p class="text-sm text-neutral-400">
-									A part with saved references counts toward the BoM only when its best match is above this score. Range 0.50 to 0.95. A part with no reference still counts.
+									A catalogue match counts toward the BoM only when its score is above this value. The same score decides a wrong part against the whole catalogue. Range 0.50 to 0.95.
 								</p>
 								{#if matchNotice}
 									<p class="text-sm text-neutral-200">{matchNotice}</p>
+								{/if}
+								<label class="flex items-center gap-3 text-sm font-medium text-neutral-100">
+									<input
+										type="checkbox"
+										class="h-5 w-5 accent-blue-500"
+										checked={catalogDebug}
+										on:change={onCatalogDebugChange}
+									/>
+									Debug catalogue candidates
+								</label>
+								<p class="text-sm text-neutral-400">
+									When this is on, each detection includes the top two global catalogue candidates.
+								</p>
+								{#if catalogDebugNotice}
+									<p class="text-sm text-neutral-200">{catalogDebugNotice}</p>
 								{/if}
 							</fieldset>
 							<div class="flex flex-wrap gap-2">

@@ -9,12 +9,31 @@ type CountedDetection = {
 	ic: string;
 	consumed?: boolean;
 	referenceMatch?: boolean;
+	twoPass?: {
+		status?: string;
+		resolvedIc?: string | null;
+	};
 };
 
 // A child box used by a matching part rule is not a BoM part.
-// A box with saved references counts only when its cosine is above the threshold.
+// A two-pass box counts only when it matched the active BoM.
+// Without that result, a box with saved references counts only when its cosine
+// is above the threshold.
 function countsTowardBom(item: CountedDetection): boolean {
-	return item.ic !== "" && item.consumed !== true && item.referenceMatch !== false;
+	if (item.consumed === true) return false;
+	if (item.twoPass) {
+		return (
+			item.twoPass.status === "matched_bom" && !!item.twoPass.resolvedIc?.trim()
+		);
+	}
+	return item.ic !== "" && item.referenceMatch !== false;
+}
+
+function countedIc(item: CountedDetection): string {
+	if (item.twoPass?.status === "matched_bom") {
+		return item.twoPass.resolvedIc?.trim() ?? "";
+	}
+	return item.ic;
 }
 
 export type LineTally = "pass" | "short" | "extra";
@@ -32,7 +51,9 @@ export function detectionCounts(
 	const counts: Record<string, number> = {};
 	for (const item of items) {
 		if (!countsTowardBom(item)) continue;
-		counts[item.ic] = (counts[item.ic] ?? 0) + 1;
+		const ic = countedIc(item);
+		if (!ic) continue;
+		counts[ic] = (counts[ic] ?? 0) + 1;
 	}
 	return counts;
 }
@@ -60,6 +81,7 @@ export function extraPartCount(
 }
 
 // A class is unexpected only when a BoM is loaded and the class is not on it.
+// A two-pass wrong part or unrecognised box is unexpected. A BoM match is not.
 // Extra boxes of a listed class, including 2VDSWN02, are a quantity check.
 export function hasUnexpected(
 	items: CountedDetection[],
@@ -67,7 +89,20 @@ export function hasUnexpected(
 ): boolean {
 	if (!parts.length) return false;
 	const known = new Set(parts.map((part) => part.ic));
-	return items.some((item) => countsTowardBom(item) && !known.has(item.ic));
+	return items.some((item) => {
+		if (item.consumed === true) return false;
+		if (item.twoPass) {
+			if (item.twoPass.status === "matched_bom") {
+				const ic = item.twoPass.resolvedIc?.trim() ?? "";
+				return ic === "" || !known.has(ic);
+			}
+			return (
+				item.twoPass.status === "wrong_part" ||
+				item.twoPass.status === "unrecognized"
+			);
+		}
+		return countsTowardBom(item) && !known.has(item.ic);
+	});
 }
 
 export function inspectionVerdict(args: {

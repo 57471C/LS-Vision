@@ -230,7 +230,7 @@ function slotVerdict(panel: SlotDetections): "pass" | "fail" | "incomplete" {
 							</tr>
 						</thead>
 						<tbody>
-							{#each extras as row (row.ic)}
+							{#each extras as row (`${row.ic}|${row.des}`)}
 								<tr class="border-b border-neutral-800">
 									<td class="py-2 pr-3 font-mono font-medium">{row.ic}</td>
 									{#if showDes}
@@ -387,7 +387,7 @@ function slotVerdict(panel: SlotDetections): "pass" | "fail" | "incomplete" {
 									</tr>
 								</thead>
 								<tbody>
-									{#each extras as row (row.ic)}
+									{#each extras as row (`${row.ic}|${row.des}`)}
 										<tr class="border-b border-neutral-800">
 											<td class="py-2 pr-3 font-mono font-medium">{row.ic}</td>
 											{#if showDes}
