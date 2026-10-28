@@ -19,6 +19,12 @@ vision/config.local.json.tmp
 # DINOv2 reference embeddings captured on this bench. Next to config.local.json.
 vision/dinov2-references.json
 vision/dinov2-references.json.tmp
+# Imported part catalogue and the JPEG crops copied out of a tar.
+vision/catalogue.json
+vision/catalogue.json.tmp
+vision/catalogue-crops/
+vision/catalogue-crops.incoming/
+vision/catalogue-crops.previous/
 # Trained weights stay on the machine. Place best.pt in vision/models/.
 vision/models/*.pt
 vision/models/*.onnx

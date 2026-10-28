@@ -2,6 +2,7 @@ mod barcode;
 mod bom;
 mod bom_sql;
 mod camera;
+mod catalogue;
 mod detect;
 mod dinov2;
 mod frame;
@@ -29,6 +30,7 @@ pub fn run() {
             }
             // Optional. A missing file logs a warning and leaves YOLO detection alone.
             dinov2::load_on_startup();
+            catalogue::load_on_startup();
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -59,6 +61,9 @@ pub fn run() {
             detect::benchmark_detect,
             detect::model_class_names,
             dinov2::dinov2_status,
+            catalogue::import_catalogue,
+            catalogue::list_catalogue,
+            catalogue::delete_catalogue_part,
             dinov2::update_references,
             dinov2::list_references,
             dinov2::set_reference_threshold,

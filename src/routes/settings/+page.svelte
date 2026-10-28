@@ -93,24 +93,24 @@ let modelNotice = "";
 let savingModel = false;
 let updatingModel = false;
 let updatingReferences = false;
-let referenceNotice = "";
-let referencePath = "";
-type ReferenceRow = {
+type CataloguePart = {
 	ic: string;
-	threshold: number | null;
-	count: number;
+	description: string;
+	type: string;
+	dimensions: string;
+	thumbs: string[];
 };
-let referencesOpen = false;
-let referencesLoading = false;
-let referencesNotice = "";
-let referenceRows: ReferenceRow[] = [];
-let referenceDrafts: Record<string, string> = {};
-let referenceSort: "ic" | "threshold" = "ic";
-let referenceSortDir: "asc" | "desc" = "asc";
-let savingReferenceIc = "";
-let deletingReferenceIc = "";
-let referencesGeneration = 0;
-let referencesClose: HTMLButtonElement | null = null;
+let catalogueOpen = false;
+let catalogueLoading = false;
+let catalogueNotice = "";
+let catalogueParts: CataloguePart[] = [];
+let cataloguePath = "";
+let deletingCatalogueIc = "";
+let catalogueGeneration = 0;
+let catalogueClose: HTMLButtonElement | null = null;
+let toastText = "";
+let toastKind: "ok" | "neutral" | "error" = "ok";
+let toastTimer: ReturnType<typeof setTimeout> | null = null;
 const CONFIDENCE_MIN = 0.15;
 const CONFIDENCE_MAX = 0.8;
 const CONFIDENCE_DEFAULT = 0.45;
@@ -1050,252 +1050,155 @@ async function updateModel() {
 	}
 }
 
-function referenceNoticeClass(text: string): string {
-	if (text.startsWith("References loaded ") || text === "No file selected.") {
-		return "text-neutral-200";
+function showToast(message: string, kind: "ok" | "neutral" | "error") {
+	toastText = message;
+	toastKind = kind;
+	if (toastTimer) clearTimeout(toastTimer);
+	const wait = kind === "error" ? 7000 : 4500;
+	toastTimer = setTimeout(() => {
+		toastText = "";
+		toastTimer = null;
+	}, wait);
+}
+
+function toastClass(kind: "ok" | "neutral" | "error"): string {
+	if (kind === "error") {
+		return "border-red-800 bg-neutral-900 text-red-300";
 	}
-	return "text-red-300";
+	return "border-neutral-600 bg-neutral-800 text-neutral-100";
 }
 
 async function updateReferences() {
 	updatingReferences = true;
-	referenceNotice = "";
 	try {
 		const data = await invokeRust<{
-			classes?: unknown;
+			parts?: unknown;
 			message?: unknown;
 			path?: unknown;
-		}>("update_references");
+		}>("import_catalogue");
 		if (!data || typeof data !== "object") {
-			referenceNotice = "Could not update the references";
+			showToast("Could not update the catalogue", "error");
 			return;
 		}
-		if (typeof data.path === "string" && data.path) referencePath = data.path;
-		referenceNotice =
+		if (typeof data.path === "string" && data.path) cataloguePath = data.path;
+		const message =
 			typeof data.message === "string" && data.message
 				? data.message
-				: "References loaded.";
+				: "Could not update the catalogue";
+		if (message.startsWith("Catalogue loaded ")) {
+			showToast(message, "ok");
+			if (catalogueOpen) void openReferences();
+		} else if (message === "No file selected.") {
+			showToast(message, "neutral");
+		} else {
+			showToast(message, "error");
+		}
 	} catch (err: unknown) {
-		referenceNotice = invokeError(err, "Could not update the references");
+		showToast(invokeError(err, "Could not update the catalogue"), "error");
 	} finally {
 		updatingReferences = false;
 	}
 }
 
-function readReferenceRow(value: unknown): ReferenceRow | null {
+function readCataloguePart(value: unknown): CataloguePart | null {
 	if (!value || typeof value !== "object") return null;
 	const record = value as Record<string, unknown>;
 	const ic = typeof record.ic === "string" ? record.ic.trim() : "";
 	if (!ic) return null;
-	const count =
-		typeof record.count === "number" && Number.isFinite(record.count)
-			? record.count
-			: 0;
-	const threshold =
-		typeof record.threshold === "number" && Number.isFinite(record.threshold)
-			? record.threshold
-			: null;
-	return { ic, threshold, count };
+	const description =
+		typeof record.description === "string" ? record.description.trim() : "";
+	const type = typeof record.type === "string" ? record.type.trim() : "";
+	const dimensions =
+		typeof record.dimensions === "string" ? record.dimensions.trim() : "";
+	const thumbs = Array.isArray(record.thumbs)
+		? record.thumbs.filter(
+				(item): item is string =>
+					typeof item === "string" && item.startsWith("data:image/"),
+			)
+		: [];
+	return { ic, description, type, dimensions, thumbs };
 }
 
-function readReferenceRows(value: unknown): ReferenceRow[] {
-	if (!Array.isArray(value)) return [];
-	const rows: ReferenceRow[] = [];
-	for (const item of value) {
-		const row = readReferenceRow(item);
-		if (row) rows.push(row);
-	}
-	return rows;
-}
-
-function readReferenceList(
+function readCatalogueList(
 	value: unknown,
-): { path: string; rows: ReferenceRow[]; rawCount: number } | null {
+): { path: string; parts: CataloguePart[]; rawCount: number } | null {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
 	const record = value as Record<string, unknown>;
 	const path = typeof record.path === "string" ? record.path : "";
-	const rawCount = Array.isArray(record.rows) ? record.rows.length : -1;
-	return { path, rows: readReferenceRows(record.rows), rawCount };
-}
-
-function effectiveReferenceThreshold(row: ReferenceRow): number {
-	return row.threshold ?? matchThreshold;
-}
-
-function sortReferenceRows(
-	rows: ReferenceRow[],
-	key: "ic" | "threshold",
-	dir: "asc" | "desc",
-	fallback: number,
-): ReferenceRow[] {
-	const copy = [...rows];
-	copy.sort((left, right) => {
-		let order = 0;
-		if (key === "ic") {
-			order = left.ic.localeCompare(right.ic);
-		} else {
-			order = (left.threshold ?? fallback) - (right.threshold ?? fallback);
-			if (order === 0) order = left.ic.localeCompare(right.ic);
-		}
-		return dir === "asc" ? order : -order;
-	});
-	return copy;
-}
-
-function showReferenceRows(rows: ReferenceRow[]) {
-	referenceRows = rows;
-	const drafts: Record<string, string> = {};
-	for (const row of rows) {
-		drafts[row.ic] = effectiveReferenceThreshold(row).toFixed(2);
+	const raw = Array.isArray(record.parts) ? record.parts : null;
+	if (!raw) return { path, parts: [], rawCount: -1 };
+	const parts: CataloguePart[] = [];
+	for (const item of raw) {
+		const part = readCataloguePart(item);
+		if (part) parts.push(part);
 	}
-	referenceDrafts = drafts;
+	return { path, parts, rawCount: raw.length };
 }
 
-function referencesNoticeClass(text: string): string {
-	if (text.startsWith("Saved.") || text.startsWith("Removed "))
-		return "text-neutral-200";
+function catalogueNoticeClass(text: string): string {
+	if (text.startsWith("Removed ")) return "text-neutral-200";
 	return "text-red-300";
 }
 
 async function openReferences() {
-	referencesOpen = true;
-	referencesNotice = "";
-	referencesLoading = true;
-	const generation = ++referencesGeneration;
+	catalogueOpen = true;
+	catalogueNotice = "";
+	catalogueLoading = true;
+	const generation = ++catalogueGeneration;
 	try {
-		const data = await invokeRust<unknown>("list_references");
-		if (generation !== referencesGeneration || !referencesOpen) return;
-		const list = readReferenceList(data);
-		if (!list) {
-			referenceRows = [];
-			referenceDrafts = {};
-			referencesNotice = "Could not load the references";
+		const data = await invokeRust<unknown>("list_catalogue");
+		if (generation !== catalogueGeneration || !catalogueOpen) return;
+		const list = readCatalogueList(data);
+		if (
+			!list ||
+			list.rawCount < 0 ||
+			(list.rawCount > 0 && list.parts.length === 0)
+		) {
+			catalogueParts = [];
+			catalogueNotice = "Could not load the references";
 			return;
 		}
-		if (list.path) referencePath = list.path;
-		if (list.rawCount < 0 || (list.rawCount > 0 && list.rows.length === 0)) {
-			referenceRows = [];
-			referenceDrafts = {};
-			referencesNotice = "Could not load the references";
-			return;
-		}
-		showReferenceRows(list.rows);
+		if (list.path) cataloguePath = list.path;
+		catalogueParts = list.parts;
 	} catch (err: unknown) {
-		if (generation !== referencesGeneration || !referencesOpen) return;
-		referenceRows = [];
-		referenceDrafts = {};
-		referencesNotice = invokeError(err, "Could not load the references");
+		if (generation !== catalogueGeneration || !catalogueOpen) return;
+		catalogueParts = [];
+		catalogueNotice = invokeError(err, "Could not load the references");
 	} finally {
-		if (generation === referencesGeneration) referencesLoading = false;
+		if (generation === catalogueGeneration) catalogueLoading = false;
 	}
-	if (referencesOpen && generation === referencesGeneration) {
+	if (catalogueOpen && generation === catalogueGeneration) {
 		await tick();
-		referencesClose?.focus();
+		catalogueClose?.focus();
 	}
 }
 
 function closeReferences() {
-	referencesOpen = false;
-	referencesGeneration += 1;
-	referencesLoading = false;
+	catalogueOpen = false;
+	catalogueGeneration += 1;
+	catalogueLoading = false;
 }
 
 function onReferencesKey(event: KeyboardEvent) {
-	if (!referencesOpen || event.key !== "Escape") return;
+	if (!catalogueOpen || event.key !== "Escape") return;
 	event.preventDefault();
 	closeReferences();
 }
 
-function sortReferencesBy(key: "ic" | "threshold") {
-	if (referenceSort === key) {
-		referenceSortDir = referenceSortDir === "asc" ? "desc" : "asc";
-		return;
-	}
-	referenceSort = key;
-	referenceSortDir = "asc";
-}
-
-function setReferenceDraft(ic: string, value: string) {
-	referenceDrafts = { ...referenceDrafts, [ic]: value };
-}
-
-function showReferenceDraft(
-	ic: string,
-	shown: string,
-	field?: HTMLInputElement,
-) {
-	setReferenceDraft(ic, shown);
-	if (field) field.value = shown;
-}
-
-async function commitReferenceThreshold(ic: string, field?: HTMLInputElement) {
-	const row = referenceRows.find((item) => item.ic === ic);
-	if (!row || savingReferenceIc || deletingReferenceIc) return;
-	const parsed = Number(referenceDrafts[ic] ?? "");
-	if (!Number.isFinite(parsed)) {
-		showReferenceDraft(ic, effectiveReferenceThreshold(row).toFixed(2), field);
-		referencesNotice = "Enter a threshold from 0.50 to 0.95.";
-		return;
-	}
-	const next = Math.min(
-		MATCH_MAX,
-		Math.max(MATCH_MIN, Math.round(parsed * 100) / 100),
-	);
-	const current = effectiveReferenceThreshold(row);
-	if (Math.abs(next - current) < 0.001) {
-		showReferenceDraft(ic, current.toFixed(2), field);
-		return;
-	}
-	savingReferenceIc = ic;
-	referencesNotice = "";
+async function deleteCataloguePart(ic: string) {
+	if (deletingCatalogueIc) return;
+	deletingCatalogueIc = ic;
+	catalogueNotice = "";
 	try {
-		const data = await invokeRust<unknown>("set_reference_threshold", {
-			ic,
-			threshold: next,
-		});
-		const saved = readReferenceRow(data);
-		if (!saved) {
-			showReferenceDraft(ic, current.toFixed(2), field);
-			referencesNotice = "Could not save the threshold.";
-			return;
-		}
-		referenceRows = referenceRows.map((item) =>
-			item.ic === ic ? saved : item,
-		);
-		showReferenceDraft(saved.ic, (saved.threshold ?? next).toFixed(2), field);
-		referencesNotice = `Saved. ${saved.ic} threshold is ${(saved.threshold ?? next).toFixed(2)}.`;
+		await invokeRust("delete_catalogue_part", { ic });
+		catalogueParts = catalogueParts.filter((part) => part.ic !== ic);
+		catalogueNotice = `Removed ${ic}.`;
 	} catch (err: unknown) {
-		showReferenceDraft(ic, current.toFixed(2), field);
-		referencesNotice = invokeError(err, "Could not save the threshold");
+		catalogueNotice = invokeError(err, "Could not delete the part");
 	} finally {
-		savingReferenceIc = "";
+		deletingCatalogueIc = "";
 	}
 }
-
-async function deleteReferenceRow(ic: string) {
-	if (savingReferenceIc || deletingReferenceIc) return;
-	deletingReferenceIc = ic;
-	referencesNotice = "";
-	try {
-		await invokeRust("delete_reference", { ic });
-		referenceRows = referenceRows.filter((item) => item.ic !== ic);
-		const drafts = { ...referenceDrafts };
-		delete drafts[ic];
-		referenceDrafts = drafts;
-		referencesNotice = `Removed ${ic}.`;
-	} catch (err: unknown) {
-		referencesNotice = invokeError(err, "Could not delete the reference");
-	} finally {
-		deletingReferenceIc = "";
-	}
-}
-
-$: sortedReferenceRows = sortReferenceRows(
-	referenceRows,
-	referenceSort,
-	referenceSortDir,
-	matchThreshold,
-);
 
 async function loadScan() {
 	try {
@@ -2580,6 +2483,7 @@ onMount(() => {
 onDestroy(() => {
 	cancelCameraApply();
 	cancelConfidenceSave();
+	if (toastTimer) clearTimeout(toastTimer);
 	window.removeEventListener("focus", onWindowFocus);
 	previewChannel?.close();
 	previewChannel = null;
@@ -3510,7 +3414,7 @@ onDestroy(() => {
 									Current value <span class="font-mono text-neutral-100">{matchThreshold.toFixed(2)}</span>
 								</p>
 								<p class="text-sm text-neutral-400">
-									A part with saved references counts toward the BoM only when its best match is above this score. View references can set a different score for one IC. Range 0.50 to 0.95. A part with no reference still counts.
+									A part with saved references counts toward the BoM only when its best match is above this score. Range 0.50 to 0.95. A part with no reference still counts.
 								</p>
 								{#if matchNotice}
 									<p class="text-sm text-neutral-200">{matchNotice}</p>
@@ -3539,33 +3443,6 @@ onDestroy(() => {
 							{#if modelNotice}
 								<p class="break-all text-sm {modelNoticeClass(modelNotice)}">{modelNotice}</p>
 							{/if}
-							<div class="flex flex-col items-start gap-2">
-								<button
-									type="button"
-									class="inline-flex min-h-11 w-fit items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100 disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
-									on:click={updateReferences}
-									disabled={updatingReferences}
-								>
-									{updatingReferences ? "Updating..." : "Update references"}
-								</button>
-								<button
-									type="button"
-									class="inline-flex min-h-11 w-fit items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100 disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
-									on:click={openReferences}
-									disabled={updatingReferences}
-								>
-									View references
-								</button>
-								<p class="text-sm text-neutral-400">
-									Replaces the saved DINOv2 references. The next detection uses the loaded embeddings.
-								</p>
-								{#if referenceNotice}
-									<p class="text-sm {referenceNoticeClass(referenceNotice)}">{referenceNotice}</p>
-								{/if}
-								{#if referencePath}
-									<p class="break-all font-mono text-xs text-neutral-500">{referencePath}</p>
-								{/if}
-							</div>
 						</form>
 						<form
 							class="flex flex-col gap-4 border border-neutral-700 bg-neutral-900 p-4"
@@ -3628,8 +3505,30 @@ onDestroy(() => {
 						</form>
 					{:else if section === "parts"}
 						<h2 id="settings-section-heading" class="text-lg font-semibold tracking-tight xl:col-span-2">
-							Part rules
+							Parts
 						</h2>
+						<div class="flex flex-col items-start gap-2 border border-neutral-700 bg-neutral-900 p-4 xl:col-span-2">
+							<button
+								type="button"
+								class="inline-flex min-h-11 w-fit items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100 disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
+								on:click={updateReferences}
+								disabled={updatingReferences}
+							>
+								{updatingReferences ? "Updating..." : "Update references"}
+							</button>
+							<button
+								type="button"
+								class="inline-flex min-h-11 w-fit items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100 disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
+								on:click={openReferences}
+								disabled={updatingReferences}
+							>
+								View references
+							</button>
+							<p class="text-sm text-neutral-400">
+								Opens a .tar catalogue. Each JPEG in crops/ is embedded with DINOv2 and saved on this PC. The next start loads the same catalogue.
+							</p>
+						</div>
+						<h3 class="text-base font-semibold tracking-tight xl:col-span-2">Part rules</h3>
 						<form
 							class="flex flex-col gap-4 border border-neutral-700 bg-neutral-900 p-4 xl:col-span-2"
 							on:submit|preventDefault={savePartRules}
@@ -4014,13 +3913,13 @@ onDestroy(() => {
 	{/if}
 </div>
 
-{#if referencesOpen}
+{#if catalogueOpen}
 	<div
 		class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
 		on:click={closeReferences}
 	>
 		<div
-			class="flex max-h-[80vh] w-full max-w-3xl flex-col border border-neutral-700 bg-neutral-900 p-4"
+			class="flex max-h-[80vh] w-full max-w-4xl flex-col border border-neutral-700 bg-neutral-900 p-4"
 			role="dialog"
 			aria-modal="true"
 			aria-labelledby="references-title"
@@ -4028,112 +3927,72 @@ onDestroy(() => {
 		>
 			<h2 id="references-title" class="text-lg font-semibold tracking-tight">DINOv2 references</h2>
 			<p class="mt-2 text-sm text-neutral-400">
-				Each IC uses its saved threshold. An IC without one uses the Training match score,
-				currently <span class="font-mono text-neutral-100">{matchThreshold.toFixed(2)}</span>.
-				The next detection uses a change without a restart.
+				Imported parts. Delete removes one part from the catalogue.
 			</p>
-			{#if referencePath}
-				<p class="mt-2 break-all font-mono text-xs text-neutral-500">{referencePath}</p>
+			{#if cataloguePath}
+				<p class="mt-2 break-all font-mono text-xs text-neutral-500">{cataloguePath}</p>
 			{/if}
-			{#if referencesNotice}
-				<p class="mt-3 text-sm {referencesNoticeClass(referencesNotice)}">{referencesNotice}</p>
+			{#if catalogueNotice}
+				<p class="mt-3 text-sm {catalogueNoticeClass(catalogueNotice)}">{catalogueNotice}</p>
 			{/if}
 			<div class="mt-4 min-h-0 flex-1 overflow-auto">
-				{#if referencesLoading}
+				{#if catalogueLoading}
 					<p class="text-sm text-neutral-200">Loading...</p>
-				{:else if referenceRows.length === 0}
-					{#if !referencesNotice || referencesNotice.startsWith("Removed ")}
+				{:else if catalogueParts.length === 0}
+					{#if !catalogueNotice || catalogueNotice.startsWith("Removed ")}
 						<p class="text-sm text-neutral-200">No references loaded.</p>
 					{/if}
 				{:else}
-					<table class="w-full border-collapse text-left text-sm">
-						<thead class="sticky top-0 bg-neutral-900">
-							<tr class="border-b border-neutral-700 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
-								<th
-									class="px-2 py-2"
-									aria-sort={referenceSort === "ic"
-										? referenceSortDir === "asc"
-											? "ascending"
-											: "descending"
-										: "none"}
-								>
-									<button
-										type="button"
-										class="inline-flex items-center gap-1 uppercase tracking-widest"
-										on:click={() => sortReferencesBy("ic")}
-									>
-										IC
-										{#if referenceSort === "ic"}
-											{referenceSortDir === "asc" ? "↑" : "↓"}
-										{/if}
-									</button>
-								</th>
-								<th
-									class="px-2 py-2"
-									aria-sort={referenceSort === "threshold"
-										? referenceSortDir === "asc"
-											? "ascending"
-											: "descending"
-										: "none"}
-								>
-									<button
-										type="button"
-										class="inline-flex items-center gap-1 uppercase tracking-widest"
-										on:click={() => sortReferencesBy("threshold")}
-									>
-										Threshold
-										{#if referenceSort === "threshold"}
-											{referenceSortDir === "asc" ? "↑" : "↓"}
-										{/if}
-									</button>
-								</th>
-								<th class="px-2 py-2 text-right">Embeddings</th>
-								<th class="px-2 py-2"><span class="sr-only">Delete</span></th>
-							</tr>
-						</thead>
-						<tbody>
-							{#each sortedReferenceRows as row (row.ic)}
-								<tr class="border-b border-neutral-800">
-									<td class="px-2 py-2 font-mono text-neutral-100">{row.ic}</td>
-									<td class="px-2 py-2">
-										<input
-											type="text"
-											inputmode="decimal"
-											class="h-9 w-20 border border-neutral-600 bg-neutral-950 text-center font-mono text-sm text-neutral-100 disabled:text-neutral-500"
-											aria-label="Threshold for {row.ic}"
-											value={referenceDrafts[row.ic] ?? effectiveReferenceThreshold(row).toFixed(2)}
-											disabled={savingReferenceIc === row.ic || deletingReferenceIc === row.ic}
-											on:input={(event) => setReferenceDraft(row.ic, event.currentTarget.value)}
-											on:blur={(event) =>
-												commitReferenceThreshold(row.ic, event.currentTarget)}
-											on:keydown={(event) => {
-												if (event.key !== "Enter") return;
-												event.preventDefault();
-												commitReferenceThreshold(row.ic, event.currentTarget);
-											}}
-										/>
-									</td>
-									<td class="px-2 py-2 text-right font-mono text-neutral-100">{row.count}</td>
-									<td class="px-2 py-2 text-right">
-										<button
-											type="button"
-											class="inline-flex min-h-9 items-center border border-neutral-600 bg-neutral-800 px-3 text-sm font-semibold text-neutral-100 disabled:border-neutral-700 disabled:text-neutral-500"
-											on:click={() => deleteReferenceRow(row.ic)}
-											disabled={deletingReferenceIc === row.ic || savingReferenceIc === row.ic}
+					<ul class="flex flex-col">
+						{#each catalogueParts as part (part.ic)}
+							<li class="flex items-start gap-3 border-b border-neutral-800 py-3">
+								<div class="flex w-44 shrink-0 flex-wrap gap-1">
+									{#if part.thumbs.length === 0}
+										<div
+											class="flex h-16 w-16 items-center justify-center border border-neutral-800 text-[10px] font-semibold uppercase tracking-wide text-neutral-500"
 										>
-											{deletingReferenceIc === row.ic ? "Deleting..." : "Delete"}
-										</button>
-									</td>
-								</tr>
-							{/each}
-						</tbody>
-					</table>
+											No crop
+										</div>
+									{:else}
+										{#each part.thumbs as src, index (`${part.ic}-${index}`)}
+											<img
+												src={src}
+												alt="{part.ic} crop {index + 1}"
+												class="h-16 w-16 border border-neutral-800 bg-neutral-950 object-contain"
+											/>
+										{/each}
+									{/if}
+								</div>
+								<div class="min-w-0 flex-1">
+									<p class="font-mono text-sm text-neutral-100">{part.ic}</p>
+									{#if part.description}
+										<p class="text-sm text-neutral-200">{part.description}</p>
+									{/if}
+									{#if part.type}
+										<p class="text-sm text-neutral-400">Type {part.type}</p>
+									{/if}
+									{#if part.dimensions}
+										<p class="text-sm text-neutral-400">{part.dimensions}</p>
+									{/if}
+								</div>
+								<button
+									type="button"
+									class="inline-flex min-h-9 shrink-0 items-center border border-neutral-600 bg-neutral-800 px-3 text-sm font-semibold text-neutral-100 disabled:border-neutral-700 disabled:text-neutral-500"
+									aria-label="Delete {part.ic}"
+									on:click={() => deleteCataloguePart(part.ic)}
+									disabled={deletingCatalogueIc !== ""}
+								>
+									{deletingCatalogueIc === part.ic ? "Deleting..." : "Delete"}
+								</button>
+							</li>
+						{/each}
+					</ul>
 				{/if}
 			</div>
 			<div class="mt-4 flex justify-end">
 				<button
 					type="button"
-					bind:this={referencesClose}
+					bind:this={catalogueClose}
 					class="inline-flex min-h-11 items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100"
 					on:click={closeReferences}
 				>
@@ -4141,6 +4000,15 @@ onDestroy(() => {
 				</button>
 			</div>
 		</div>
+	</div>
+{/if}
+
+{#if toastText}
+	<div
+		class="fixed bottom-4 right-4 z-[60] max-w-sm border px-4 py-3 text-sm shadow-lg {toastClass(toastKind)}"
+		role="status"
+	>
+		{toastText}
 	</div>
 {/if}
 

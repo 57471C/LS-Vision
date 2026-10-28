@@ -335,6 +335,30 @@ pub(crate) fn embed_debug_crop(
     embed_one(session, rgb, width, height, crop)
 }
 
+/// Embed one whole RGB image with the session opened at startup.
+/// The image is the crop. This does not open another model file.
+pub(crate) fn embed_image(rgb: &[u8], width: u32, height: u32) -> Result<Vec<f32>, String> {
+    if width == 0 || height == 0 || width > i32::MAX as u32 || height > i32::MAX as u32 {
+        return Err("Could not read the image.".to_string());
+    }
+    let mut guard = lock(&STATE);
+    let Some(session) = guard.as_mut().and_then(|state| state.session.as_mut()) else {
+        return Err("DINOv2 model is not loaded.".to_string());
+    };
+    let crop = DebugCrop {
+        class_name: "",
+        confidence: 1.0,
+        bbox: [0, 0, width as i32, height as i32],
+    };
+    embed_one(session, rgb, width, height, &crop).map_err(|err| {
+        if err == "empty crop" {
+            "Could not read the image.".to_string()
+        } else {
+            format!("Could not embed the crop: {err}")
+        }
+    })
+}
+
 #[cfg(test)]
 pub(crate) fn clear_references() {
     *lock(&REFERENCES) = ReferenceBook::empty();
