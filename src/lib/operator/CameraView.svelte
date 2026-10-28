@@ -4,7 +4,12 @@
 import { invoke } from "@tauri-apps/api/core";
 import { onMount } from "svelte";
 import { readCameraScale, settingsForCamera } from "$lib/camera-settings";
-import { type CatalogMatch, overlayLabel } from "$lib/catalog-match";
+import {
+	badgeStyle,
+	type CatalogMatch,
+	overlayLabel,
+	type TwoPassMatch,
+} from "$lib/catalog-match";
 import { type DetectRoi, overlayDetections, slotColor } from "$lib/detect-rois";
 // biome-ignore lint/correctness/noUnusedImports: the template uses this component
 import MeasureOverlay from "$lib/MeasureOverlay.svelte";
@@ -55,6 +60,7 @@ type Detection = {
 	consumed?: boolean;
 	slot?: number;
 	catalogMatch?: CatalogMatch;
+	twoPass?: TwoPassMatch;
 };
 
 type DetectionMark = {
@@ -72,6 +78,8 @@ type DetectionMark = {
 	labelH: number;
 	unexpected: boolean;
 	child: boolean;
+	dashed: boolean;
+	labelInk: string;
 	slot?: number;
 };
 
@@ -165,7 +173,9 @@ function detectionMarks(
 		const y = originY + y1 * scale;
 		const w = (x2 - x1) * scale;
 		const h = (y2 - y1) * scale;
-		const label = overlayLabel(item.catalogMatch, item.ic);
+		const pass = item.consumed ? undefined : item.twoPass;
+		const style = pass ? badgeStyle(pass) : null;
+		const label = style?.label ?? overlayLabel(item.catalogMatch, item.ic);
 		const labelW =
 			Math.ceil(label.length * LABEL_FONT * 0.62) + LABEL_PAD_X * 2;
 		const labelH = LABEL_FONT + LABEL_PAD_Y * 2;
@@ -181,7 +191,7 @@ function detectionMarks(
 			key: `${item.slot ?? 0}:${index}:${item.ic}:${x1}:${y1}`,
 			ic: item.ic,
 			label,
-			color: tint || colorForIc(item.ic),
+			color: style?.color || tint || colorForIc(item.ic),
 			slot: item.slot,
 			x,
 			y,
@@ -191,12 +201,15 @@ function detectionMarks(
 			labelY,
 			labelW,
 			labelH,
-			unexpected:
-				!item.consumed &&
-				known !== null &&
-				item.ic !== "" &&
-				!known.has(item.ic),
+			unexpected: style
+				? false
+				: !item.consumed &&
+					known !== null &&
+					item.ic !== "" &&
+					!known.has(item.ic),
 			child: item.consumed === true,
+			dashed: style?.dashed === true,
+			labelInk: style?.labelInk ?? "#ffffff",
 		});
 	}
 	return marks;
@@ -583,6 +596,7 @@ $: bannerCount = (wrongParts ? 1 : 0) + (extraParts > 0 ? 1 : 0);
 											fill="none"
 											stroke={mark.color}
 											stroke-width={BOX_STROKE}
+											stroke-dasharray={mark.dashed ? "8 5" : undefined}
 										/>
 									{/if}
 									<rect
@@ -595,7 +609,7 @@ $: bannerCount = (wrongParts ? 1 : 0) + (extraParts > 0 ? 1 : 0);
 									<text
 										x={mark.labelX + LABEL_PAD_X}
 										y={mark.labelY + mark.labelH / 2}
-										fill="#ffffff"
+										fill={mark.labelInk}
 										font-size={LABEL_FONT}
 										font-family="ui-monospace, monospace"
 										font-weight="600"

@@ -23,6 +23,10 @@ use tauri::State;
 use crate::frame::FrameState;
 use crate::inference::dino;
 
+mod matcher;
+
+pub(crate) use matcher::{MatchStatus, TwoPassMatch, bom_ic_set, classify, unrecognized_box};
+
 /// A score below this is not a named part.
 pub(crate) const MATCH_THRESHOLD: f32 = 0.50;
 const RUNNERS_UP: usize = 3;
@@ -31,7 +35,6 @@ const CATALOGUE_VERSION: u32 = 1;
 /// One catalogue crop after its embedding has been L2-normalised.
 #[derive(Clone, Debug)]
 pub(crate) struct CatalogEntry {
-    pub id: String,
     pub ic: String,
     pub description: String,
     pub part_type: String,
@@ -189,12 +192,11 @@ fn entries_from_parts(parts: Vec<StoredPart>) -> Vec<CatalogEntry> {
         if ic.is_empty() {
             continue;
         }
-        for (index, values) in part.embeddings.into_iter().enumerate() {
+        for values in part.embeddings {
             let Some(embedding) = unit_embedding(&values) else {
                 continue;
             };
             entries.push(CatalogEntry {
-                id: format!("{ic}#{index}"),
                 ic: ic.to_string(),
                 description: part.description.trim().to_string(),
                 part_type: part.part_type.trim().to_string(),
@@ -229,20 +231,53 @@ struct StoredPart {
     embeddings: Vec<Vec<f32>>,
 }
 
-/// Score pixel boxes from a detector. Coordinates are clamped to the frame.
-pub(crate) fn match_pixel_boxes(
+/// Embed each box once, then run the two-pass matcher.
+/// An empty catalogue does not call DINOv2.
+pub(crate) fn match_hierarchy(
     entries: &[CatalogEntry],
     rgb: &[u8],
     width: u32,
     height: u32,
     boxes: &[[i32; 4]],
-) -> Vec<CatalogMatch> {
+    bom_ics: Option<&std::collections::HashSet<String>>,
+    threshold: f32,
+    include_candidates: bool,
+) -> Vec<(TwoPassMatch, CatalogMatch)> {
+    if entries.is_empty() {
+        return boxes
+            .iter()
+            .map(|bbox| (unrecognized_box(*bbox), unrecognized()))
+            .collect();
+    }
     let mut warned = false;
     boxes
         .iter()
         .map(|bbox| {
             let norm = pixels_to_normalized(*bbox, width, height);
-            match_normalized_warned(entries, rgb, width, height, norm, &mut warned)
+            let pixels = normalized_to_pixels(norm, width, height);
+            let (crop, crop_w, crop_h) = match crop_clamped(rgb, width, height, pixels) {
+                Ok(crop) => crop,
+                Err(err) => {
+                    warn_once(&mut warned, &err);
+                    return (unrecognized_box(*bbox), unrecognized());
+                }
+            };
+            let query = match dino::embed_rgb(&crop, crop_w, crop_h) {
+                Ok(query) => query,
+                Err(err) => {
+                    warn_once(&mut warned, &err);
+                    return (unrecognized_box(*bbox), unrecognized());
+                }
+            };
+            let two_pass = classify(
+                entries,
+                &query,
+                *bbox,
+                bom_ics,
+                threshold,
+                include_candidates,
+            );
+            (two_pass, score_query(entries, &query))
         })
         .collect()
 }
@@ -498,7 +533,6 @@ mod tests {
 
     fn entry(ic: &str, description: &str, part_type: &str, embedding: Vec<f32>) -> CatalogEntry {
         CatalogEntry {
-            id: format!("{ic}#0"),
             ic: ic.to_string(),
             description: description.to_string(),
             part_type: part_type.to_string(),
@@ -556,7 +590,6 @@ mod tests {
         .unwrap();
         let entries = read_catalogue(&path);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].id, "FAST-00124#0");
         assert_eq!(entries[0].ic, "FAST-00124");
         assert_eq!(entries[0].description, "Bolt");
         assert_eq!(entries[0].part_type, "fastener");
@@ -573,11 +606,11 @@ mod tests {
     #[test]
     fn an_empty_catalogue_is_no_match_without_inference() {
         let rgb = [255u8, 0, 0];
-        let matched = match_pixel_boxes(&[], &rgb, 1, 1, &[[-5, -5, 9, 9]]);
+        let matched = match_hierarchy(&[], &rgb, 1, 1, &[[-5, -5, 9, 9]], None, 0.70, false);
         assert_eq!(matched.len(), 1);
-        assert!(!matched[0].recognized);
-        assert_eq!(matched[0].label, "No Match");
-        assert!(matched[0].top.is_none());
+        assert!(!matched[0].1.recognized);
+        assert_eq!(matched[0].1.label, "No Match");
+        assert!(matched[0].1.top.is_none());
         let direct = score_query(&[], &[1.0, 0.0]);
         assert_eq!(direct.label, "No Match");
     }

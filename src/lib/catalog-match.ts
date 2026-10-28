@@ -1,4 +1,6 @@
-// Catalogue label drawn on a YOLO box. The BoM count still uses the class IC.
+// Catalogue labels for a YOLO box.
+// A two-pass result drives the badge, the seen count, and the Not in BoM list.
+// Without one, the older catalogue label and the YOLO class stay in use.
 
 export type CatalogCandidate = {
 	ic: string;
@@ -49,6 +51,109 @@ export function readCatalogMatch(value: unknown): CatalogMatch | undefined {
 	};
 }
 
+export type TwoPassStatus = "matched_bom" | "wrong_part" | "unrecognized";
+
+export type TwoPassMatch = {
+	boundingBox: number[];
+	status: TwoPassStatus;
+	resolvedIc: string | null;
+	description: string | null;
+	partType: string | null;
+	score: number;
+	inBom: boolean;
+	candidates?: CatalogCandidate[];
+};
+
+function readText(value: unknown): string | null {
+	if (typeof value !== "string") return null;
+	const text = value.trim();
+	return text ? text : null;
+}
+
+function isTwoPassStatus(value: unknown): value is TwoPassStatus {
+	return (
+		value === "matched_bom" ||
+		value === "wrong_part" ||
+		value === "unrecognized"
+	);
+}
+
+// Undefined when this detect did not return a two-pass result.
+// `candidates` stays absent unless the payload included that field.
+export function readTwoPass(value: unknown): TwoPassMatch | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	const row = value as Record<string, unknown>;
+	if (!isTwoPassStatus(row.status)) return undefined;
+	const score = typeof row.score === "number" ? row.score : Number.NaN;
+	if (!Number.isFinite(score)) return undefined;
+	const box = Array.isArray(row.boundingBox) ? row.boundingBox : [];
+	const boundingBox =
+		box.length >= 4 &&
+		box
+			.slice(0, 4)
+			.every((item) => typeof item === "number" && Number.isFinite(item))
+			? box.slice(0, 4)
+			: [0, 0, 0, 0];
+	const match: TwoPassMatch = {
+		boundingBox,
+		status: row.status,
+		resolvedIc: readText(row.resolvedIc),
+		description: readText(row.description),
+		partType: readText(row.partType),
+		score,
+		inBom: row.inBom === true,
+	};
+	if (Array.isArray(row.candidates)) {
+		const candidates: CatalogCandidate[] = [];
+		for (const item of row.candidates) {
+			const candidate = readCandidate(item);
+			if (candidate) candidates.push(candidate);
+		}
+		match.candidates = candidates;
+	}
+	return match;
+}
+
+function matchPercent(score: number): number {
+	const clamped = Math.min(1, Math.max(0, score));
+	return Math.round(clamped * 100);
+}
+
+// Operator badge. The percent is the cosine score, rounded.
+export function badgeLabel(match: TwoPassMatch): string {
+	const pct = matchPercent(match.score);
+	if (match.status === "matched_bom") {
+		return `${match.resolvedIc ?? "—"} - ${pct}%`;
+	}
+	if (match.status === "wrong_part") {
+		return `WRONG PART: ${match.resolvedIc ?? "—"} (${pct}%)`;
+	}
+	const kind = match.partType?.trim();
+	return kind ? `UNKNOWN ${kind} (${pct}%)` : `UNKNOWN (${pct}%)`;
+}
+
+export type BadgeStyle = {
+	label: string;
+	color: string;
+	dashed: boolean;
+	labelInk: string;
+};
+
+const BADGE_COLOR: Record<TwoPassStatus, string> = {
+	matched_bom: "#16a34a",
+	wrong_part: "#ea580c",
+	unrecognized: "#eab308",
+};
+
+export function badgeStyle(match: TwoPassMatch): BadgeStyle {
+	return {
+		label: badgeLabel(match),
+		color: BADGE_COLOR[match.status],
+		dashed: match.status === "unrecognized",
+		labelInk: match.status === "unrecognized" ? "#171717" : "#ffffff",
+	};
+}
+
 // A missing match keeps the class IC. "No Match" is the low-score label.
 export function overlayLabel(
 	match: CatalogMatch | undefined,
@@ -83,6 +188,7 @@ type OutsideBox = {
 	consumed?: boolean;
 	referenceMatch?: boolean;
 	catalogMatch?: CatalogMatch;
+	twoPass?: TwoPassMatch;
 };
 
 function catalogueDescription(item: OutsideBox): string {
@@ -91,41 +197,73 @@ function catalogueDescription(item: OutsideBox): string {
 	return match.top?.description.trim() ?? "";
 }
 
-// Not in BoM rows, grouped by the catalogue IC. The description is the one
-// stored on that catalogue part. `descriptions` fills a code the catalogue
-// left blank. The BoM quantity check still uses the YOLO class on the box.
+function unknownGroup(partType: string | null): string {
+	const kind = partType?.trim() ?? "";
+	return kind ? `Unknown ${kind}` : "Unknown";
+}
+
+// Not in BoM rows. A two-pass box groups a wrong part by its catalogue IC and
+// description, and an unrecognised box as "Unknown <part type>". A matched BoM
+// box is left out. Without a two-pass result, the row still uses the catalogue
+// IC drawn on the box. `descriptions` fills a code the catalogue left blank.
 export function partsOutsideBom(
 	items: readonly OutsideBox[],
 	parts: readonly { ic: string }[] | null,
 	descriptions: Readonly<Record<string, string>>,
 ): OutsideCount[] {
-	const counts = new Map<string, number>();
-	const named = new Map<string, string>();
-	for (const item of items) {
-		if (item.consumed === true || item.referenceMatch === false) continue;
-		const ic = resolvedItemIc(item.catalogMatch, item.ic).trim();
-		if (!ic) continue;
-		counts.set(ic, (counts.get(ic) ?? 0) + 1);
-		const fromCatalogue = catalogueDescription(item);
-		if (fromCatalogue && !named.has(ic)) named.set(ic, fromCatalogue);
-	}
+	const groups = new Map<string, OutsideCount>();
 	const known = new Set((parts ?? []).map((part) => part.ic));
-	return [...counts.entries()]
-		.filter(([ic]) => !known.has(ic))
-		.sort((left, right) => left[0].localeCompare(right[0]))
-		.map(([ic, count]) => ({
-			ic,
-			count,
-			des: named.get(ic) || descriptions[ic]?.trim() || "",
-		}));
+	function add(key: string, ic: string, des: string) {
+		const current = groups.get(key);
+		if (current) {
+			current.count += 1;
+			if (!current.des && des) current.des = des;
+			return;
+		}
+		groups.set(key, { ic, count: 1, des });
+	}
+	for (const item of items) {
+		if (item.consumed === true) continue;
+		const pass = item.twoPass;
+		if (pass) {
+			if (pass.status === "matched_bom") continue;
+			if (pass.status === "wrong_part") {
+				const ic = pass.resolvedIc?.trim() ?? "";
+				if (!ic) continue;
+				const des = pass.description?.trim() ?? "";
+				add(`${ic}\0${des}`, ic, des);
+				continue;
+			}
+			const label = unknownGroup(pass.partType);
+			add(label, label, "");
+			continue;
+		}
+		if (item.referenceMatch === false) continue;
+		const ic = resolvedItemIc(item.catalogMatch, item.ic).trim();
+		if (!ic || known.has(ic)) continue;
+		add(ic, ic, catalogueDescription(item));
+	}
+	return [...groups.values()]
+		.map((row) => ({
+			...row,
+			des: row.des || descriptions[row.ic]?.trim() || "",
+		}))
+		.sort(
+			(left, right) =>
+				left.ic.localeCompare(right.ic) || left.des.localeCompare(right.des),
+		);
+}
+
+function skipsDescriptionLookup(ic: string): boolean {
+	return ic === "No Match" || ic === "Unknown" || ic.startsWith("Unknown ");
 }
 
 // Codes that still need the description endpoint. A catalogue description,
-// and the "No Match" label, are not posted.
+// a "No Match" label, and an Unknown part-type row are not posted.
 export function inventoryCodesOutsideBom(
 	rows: readonly { ic: string; des?: string }[],
 ): string[] {
 	return rows
-		.filter((row) => row.ic !== "No Match" && !(row.des ?? "").trim())
+		.filter((row) => !skipsDescriptionLookup(row.ic) && !(row.des ?? "").trim())
 		.map((row) => row.ic);
 }

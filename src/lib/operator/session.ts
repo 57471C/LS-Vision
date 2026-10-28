@@ -12,6 +12,7 @@ import {
 	inventoryCodesOutsideBom,
 	partsOutsideBom,
 	readCatalogMatch,
+	readTwoPass,
 } from "$lib/catalog-match";
 import {
 	compactClearedSlot,
@@ -314,12 +315,14 @@ function attachSession(
 			const catalogMatch = readCatalogMatch(
 				(row as { catalogMatch?: unknown }).catalogMatch,
 			);
+			const twoPass = readTwoPass((row as { twoPass?: unknown }).twoPass);
 			found.push({
 				ic: row.ic,
 				confidence: typeof row.confidence === "number" ? row.confidence : 0,
 				bbox: Array.isArray(row.bbox) ? row.bbox : [],
 				referenceMatch,
 				catalogMatch,
+				twoPass,
 			});
 		}
 		return found;
@@ -395,6 +398,21 @@ function attachSession(
 		noteLines(value);
 	}
 
+	// Item codes on the loaded job card. None skips the BoM pass in Rust.
+	function activeBomIcs(): string[] | null {
+		const parts = op.bom?.parts ?? [];
+		if (!op.bom || parts.length === 0) return null;
+		const seen = new Set<string>();
+		const ics: string[] = [];
+		for (const part of parts) {
+			const ic = part.ic.trim();
+			if (!ic || seen.has(ic)) continue;
+			seen.add(ic);
+			ics.push(ic);
+		}
+		return ics.length > 0 ? ics : null;
+	}
+
 	async function requestDetections(
 		image?: string,
 		captureReferences = false,
@@ -406,6 +424,7 @@ function attachSession(
 			return await invoke("detect_image", {
 				image: image?.trim() ? image : null,
 				captureReferences,
+				activeBomIcs: activeBomIcs(),
 			});
 		}
 		return {
