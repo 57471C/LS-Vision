@@ -8,6 +8,7 @@ import {
 import { tick } from "svelte";
 import { get, writable } from "svelte/store";
 import { activateCamera, readDisplayFps } from "$lib/camera-settings";
+import { readCatalogMatch } from "$lib/catalog-match";
 import {
 	compactClearedSlot,
 	detectSlotNumber,
@@ -306,11 +307,15 @@ function attachSession(
 					: row.referenceMatch === false
 						? false
 						: undefined;
+			const catalogMatch = readCatalogMatch(
+				(row as { catalogMatch?: unknown }).catalogMatch,
+			);
 			found.push({
 				ic: row.ic,
 				confidence: typeof row.confidence === "number" ? row.confidence : 0,
 				bbox: Array.isArray(row.bbox) ? row.bbox : [],
 				referenceMatch,
+				catalogMatch,
 			});
 		}
 		return found;
@@ -368,13 +373,22 @@ function attachSession(
 		message?: unknown;
 		slot?: unknown;
 		dinov2?: unknown;
+		catalog?: unknown;
 	};
 
-	function noteDinov2(value: unknown) {
+	function noteLines(value: unknown) {
 		if (!Array.isArray(value)) return;
 		for (const line of value) {
 			if (typeof line === "string" && line.trim()) writeConsole(line);
 		}
+	}
+
+	function noteDinov2(value: unknown) {
+		noteLines(value);
+	}
+
+	function noteCatalog(value: unknown) {
+		noteLines(value);
 	}
 
 	async function requestDetections(
@@ -386,7 +400,7 @@ function attachSession(
 		// stores each surviving box under its IC and does not change the result.
 		if (op.modelName.toLowerCase().endsWith(".onnx")) {
 			return await invoke("detect_image", {
-				image: image && image.trim() ? image : null,
+				image: image?.trim() ? image : null,
 				captureReferences,
 			});
 		}
@@ -401,7 +415,8 @@ function attachSession(
 	}
 
 	function noteRawSize(frame: WatchBody) {
-		if (typeof frame.width === "number" && frame.width > 0) heldRawW = frame.width;
+		if (typeof frame.width === "number" && frame.width > 0)
+			heldRawW = frame.width;
 		if (typeof frame.height === "number" && frame.height > 0)
 			heldRawH = frame.height;
 	}
@@ -616,7 +631,9 @@ function attachSession(
 		if (op.result !== viewAtStart) return;
 		const parts = viewAtStart?.parts ?? [];
 		const bomLoaded =
-			!!op.bom && parts.length > 0 && op.bom.kitCode === (viewAtStart?.kitCode ?? "");
+			!!op.bom &&
+			parts.length > 0 &&
+			op.bom.kitCode === (viewAtStart?.kitCode ?? "");
 		const panels = panelsForSlots(op.slotResults, bomLoaded);
 		if (panels.length > 0) {
 			for (const panel of panels) {
@@ -636,7 +653,10 @@ function attachSession(
 
 	function noteDetectMessage(message: string) {
 		op.detectMessage = message;
-		if (message === "Model is missing." || message === "Model failed to load.") {
+		if (
+			message === "Model is missing." ||
+			message === "Model failed to load."
+		) {
 			op.modelNotice = message;
 		} else if (
 			!message &&
@@ -686,6 +706,7 @@ function attachSession(
 				for (const entry of payload) {
 					if (!isDetectObject(entry)) continue;
 					noteDinov2(entry.dinov2);
+					noteCatalog(entry.catalog);
 					const slot = detectSlotNumber(entry.slot);
 					if (slot === null) continue;
 					const composed = await composeDetections(
@@ -714,6 +735,7 @@ function attachSession(
 			} else {
 				if (!isDetectObject(payload)) throw new Error("Detect failed");
 				noteDinov2(payload.dinov2);
+				noteCatalog(payload.catalog);
 				const composed = await composeDetections(
 					fitDetections(asDetections(payload.detections)),
 					modelClassList(payload.classes),
@@ -1730,7 +1752,8 @@ function attachSession(
 		const snapshot = slots.map((item) => (item ? { ...item } : null));
 		const run = async () => {
 			try {
-				const config = await invoke<Record<string, unknown>>("load_local_config");
+				const config =
+					await invoke<Record<string, unknown>>("load_local_config");
 				config.detectRois = snapshot;
 				config.detectRoi = snapshot[0];
 				await invoke("save_local_config", { config });

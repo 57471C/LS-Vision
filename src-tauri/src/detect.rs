@@ -65,6 +65,13 @@ struct Detection {
     /// True when a finite embedding was kept. Absent on a normal inspection.
     #[serde(default, rename = "embed", skip_serializing_if = "Option::is_none")]
     embed: Option<bool>,
+    /// Catalogue IC for this box. Absent only before matching runs.
+    #[serde(
+        default,
+        rename = "catalogMatch",
+        skip_serializing_if = "Option::is_none"
+    )]
+    catalog_match: Option<crate::catalog::CatalogMatch>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -945,6 +952,7 @@ fn detections_from_output(
             bbox: round_sensor_box(sensor),
             reference_match: None,
             embed: None,
+            catalog_match: None,
         });
         items.push(DetectedItem {
             ic,
@@ -1630,7 +1638,7 @@ fn infer_prepared(
     })
 }
 
-fn detection_value(found: Inference, dinov2: Vec<String>) -> Value {
+fn detection_value(found: Inference, dinov2: Vec<String>, catalog: Vec<String>) -> Value {
     let Inference {
         detections,
         items,
@@ -1643,6 +1651,7 @@ fn detection_value(found: Inference, dinov2: Vec<String>) -> Value {
         object.insert("detections".to_string(), json!(detections));
         object.insert("classes".to_string(), json!(classes));
         object.insert("dinov2".to_string(), json!(dinov2));
+        object.insert("catalog".to_string(), json!(catalog));
     }
     value
 }
@@ -1755,7 +1764,8 @@ fn detect_pixels(
                         crate::dinov2::hold_embeddings(held);
                         crate::dinov2::hold_frame(rgb, width, height);
                     }
-                    Ok(detection_value(found, dinov2))
+                    let catalog = attach_catalog(rgb, width, height, &mut found.detections);
+                    Ok(detection_value(found, dinov2, catalog))
                 }
                 Err(message) => Ok(failure(&model_status_message(&message))),
             };
@@ -1794,7 +1804,8 @@ fn detect_pixels(
                 if hold_references {
                     held_all.extend(held);
                 }
-                let mut row = detection_value(found, dinov2);
+                let catalog = attach_catalog(rgb, width, height, &mut found.detections);
+                let mut row = detection_value(found, dinov2, catalog);
                 if let Some(object) = row.as_object_mut() {
                     object.insert("slot".to_string(), json!(slot));
                 }
@@ -1865,6 +1876,28 @@ fn log_dinov2_embeddings(
         held.resize_with(detections.len(), || None);
     }
     (embedded.lines, if hold { held } else { Vec::new() })
+}
+
+/// Name each box from the imported catalogue. An empty catalogue is "No Match"
+/// and does not run DINOv2 again. The YOLO class on the box is left as it is.
+fn attach_catalog(
+    rgb: &[u8],
+    width: u32,
+    height: u32,
+    detections: &mut [Detection],
+) -> Vec<String> {
+    if detections.is_empty() {
+        return Vec::new();
+    }
+    let entries = crate::catalog::snapshot();
+    let boxes: Vec<[i32; 4]> = detections.iter().map(|item| item.bbox).collect();
+    let matches = crate::catalog::match_pixel_boxes(entries.as_ref(), rgb, width, height, &boxes);
+    let mut lines = Vec::with_capacity(detections.len());
+    for (detection, matched) in detections.iter_mut().zip(matches) {
+        lines.push(format!("Catalogue {} -> {}", detection.ic, matched.label));
+        detection.catalog_match = Some(matched);
+    }
+    lines
 }
 
 fn held_embed(ic: &str, values: Vec<f32>) -> Option<crate::dinov2::HeldEmbed> {

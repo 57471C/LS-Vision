@@ -25,6 +25,9 @@
 //!
 //! `ic`, `description` (`des`), `type` (`partType`), `dimensions`, and `crops`
 //! (`images` or `files`) are read. A top-level array is also accepted.
+//! A crop path is `crops/<file>.jpg` or `crops/<IC>/<file>.jpg`. The folder
+//! after `crops/` groups those images under that IC. An IC is left out when
+//! its crop list is empty or none of the listed files are in the tar.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -257,7 +260,8 @@ pub fn delete_catalogue_part(ic: String) -> Result<(), String> {
 
 fn embed_jpeg(bytes: &[u8]) -> Result<Vec<f32>, String> {
     let (rgb, width, height) = decode_jpeg(bytes)?;
-    crate::dinov2::embed_image(&rgb, width, height)
+    // Same 224×224 stretch the box matcher uses, so a stored crop matches itself.
+    crate::inference::dino::embed_rgb(&rgb, width, height)
 }
 
 fn import_tar_bytes(
@@ -269,6 +273,7 @@ fn import_tar_bytes(
     let count = built.book.parts.len();
     commit_book(vision, &built)?;
     *lock(&CATALOGUE) = built.book;
+    crate::catalog::reload_installed();
     Ok(count)
 }
 
@@ -365,15 +370,26 @@ fn is_crop_key(key: &str) -> bool {
 fn crop_name<'a>(key: &'a str, prefix: &str) -> Option<&'a str> {
     let rest = key.strip_prefix(prefix).unwrap_or(key);
     let name = rest.strip_prefix("crops/")?;
-    if name.is_empty() || name.contains('/') || name.contains("..") {
+    if !jpeg_crop_path(name) {
         return None;
     }
-    let lower = name.to_ascii_lowercase();
-    if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
-        Some(name)
-    } else {
-        None
+    Some(name)
+}
+
+/// `crops/<file>.jpg` and `crops/<IC>/<file>.jpg` are both crop files.
+fn jpeg_crop_path(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
     }
+    let mut file_name = "";
+    for part in name.split('/') {
+        if part.is_empty() || part == "." || part == ".." {
+            return false;
+        }
+        file_name = part;
+    }
+    let lower = file_name.to_ascii_lowercase();
+    lower.ends_with(".jpg") || lower.ends_with(".jpeg")
 }
 
 fn locate_catalogue(files: &HashMap<String, Vec<u8>>) -> Result<(String, String), String> {
@@ -520,7 +536,7 @@ fn crop_list(map: &Map<String, Value>, ic: &str) -> Result<Vec<String>, String> 
         .or_else(|| map.get("crop"))
         .or_else(|| map.get("image"));
     let Some(value) = value else {
-        return Err(format!("Part {ic} has no crops."));
+        return Ok(Vec::new());
     };
     let items: Vec<String> = match value {
         Value::String(text) => vec![text.clone()],
@@ -534,7 +550,7 @@ fn crop_list(map: &Map<String, Value>, ic: &str) -> Result<Vec<String>, String> 
         _ => return Err(format!("Part {ic} has no crops.")),
     };
     if items.is_empty() {
-        return Err(format!("Part {ic} has no crops."));
+        return Ok(Vec::new());
     }
     if items.len() > MAX_CROPS {
         return Err(format!("Part {ic} has too many crops."));
@@ -559,14 +575,48 @@ fn normalise_crop(raw: &str, ic: &str) -> Result<String, String> {
     } else {
         return Err(format!("Part {ic} names a crop outside crops/."));
     };
-    if name.is_empty() || name.contains('/') {
-        return Err(format!("Part {ic} names a crop outside crops/."));
-    }
-    let lower = name.to_ascii_lowercase();
-    if !lower.ends_with(".jpg") && !lower.ends_with(".jpeg") {
-        return Err(format!("Crop {name} is not a JPEG."));
+    if !jpeg_crop_path(name) {
+        let label = name.rsplit('/').next().unwrap_or(name);
+        if label.is_empty() || name.split('/').any(|part| part.is_empty() || part == ".") {
+            return Err(format!("Part {ic} names a crop outside crops/."));
+        }
+        return Err(format!("Crop {label} is not a JPEG."));
     }
     Ok(format!("crops/{name}"))
+}
+
+/// Folder after `crops/` when the file lives at `crops/<IC>/<file>`.
+/// A file directly in `crops/` stays with the part that listed it.
+fn crop_group(key: &str, part_ic: &str) -> String {
+    let Some(rest) = key.strip_prefix("crops/") else {
+        return part_ic.to_string();
+    };
+    match rest.split_once('/') {
+        Some((folder, file)) if !folder.is_empty() && !file.is_empty() => folder.to_string(),
+        _ => part_ic.to_string(),
+    }
+}
+
+fn group_crops(sources: &[SourcePart]) -> HashMap<String, Vec<String>> {
+    let known: HashSet<&str> = sources.iter().map(|part| part.ic.as_str()).collect();
+    let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
+    for source in sources {
+        grouped.entry(source.ic.clone()).or_default();
+        for key in &source.crops {
+            let folder = crop_group(key, &source.ic);
+            let group = if known.contains(folder.as_str()) {
+                folder
+            } else {
+                source.ic.clone()
+            };
+            grouped.entry(group).or_default().push(key.clone());
+        }
+    }
+    grouped
+}
+
+fn log_resolved_crops(ic: &str, count: usize) {
+    eprintln!("DINOv2 catalogue {ic}: {count} crops");
 }
 
 fn merge_parts(parts: Vec<SourcePart>) -> Result<Vec<SourcePart>, String> {
@@ -599,18 +649,29 @@ fn build_from_tar(
 ) -> Result<Built, String> {
     let archive = read_tar(bytes)?;
     let sources = parse_source(&archive.catalogue)?;
+    let mut grouped = group_crops(&sources);
     let mut used = HashSet::new();
     let mut parts = Vec::with_capacity(sources.len());
     let mut files = Vec::new();
     for source in sources {
+        let keys = grouped.remove(&source.ic).unwrap_or_default();
+        let mut resolved = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(jpeg) = archive.files.get(&key) {
+                resolved.push((key, jpeg.clone()));
+            }
+        }
+        log_resolved_crops(&source.ic, resolved.len());
+        if resolved.is_empty() {
+            continue;
+        }
+        if resolved.len() > MAX_CROPS {
+            return Err(format!("Part {} has too many crops.", source.ic));
+        }
         let folder = allocate_folder(&mut used, &source.ic);
-        let mut crops = Vec::with_capacity(source.crops.len());
-        let mut embeddings = Vec::with_capacity(source.crops.len());
-        for (index, key) in source.crops.iter().enumerate() {
-            let jpeg = archive
-                .files
-                .get(key)
-                .ok_or_else(|| format!("Could not read crop {key}."))?;
+        let mut crops = Vec::with_capacity(resolved.len());
+        let mut embeddings = Vec::with_capacity(resolved.len());
+        for (index, (key, jpeg)) in resolved.iter().enumerate() {
             let values =
                 embed(jpeg).map_err(|err| format!("Could not embed {}: {err}", source.ic))?;
             if values.is_empty() || values.iter().any(|value| !value.is_finite()) {
@@ -630,6 +691,9 @@ fn build_from_tar(
             crops,
             embeddings,
         });
+    }
+    if parts.is_empty() {
+        return Err("Catalogue has no parts.".to_string());
     }
     Ok(Built {
         book: Book { parts },
@@ -883,6 +947,7 @@ fn remove_part(vision: &Path, ic: &str) -> Result<(), String> {
     let bytes = book_json(&book)?;
     replace_file_bytes(&catalogue_path(vision), &bytes)?;
     *lock(&CATALOGUE) = book;
+    crate::catalog::reload_installed();
     for crop in &removed.crops {
         if let Some(path) = crop_file(vision, crop) {
             let _ = fs::remove_file(&path);
@@ -1204,6 +1269,75 @@ mod tests {
             Ok(_) => panic!("expected no parts"),
         };
         assert!(empty_err.contains("no parts"), "{empty_err}");
+    }
+
+    #[test]
+    fn ic_folder_crops_are_imported_and_empty_ics_are_skipped() {
+        let jpeg = tiny_jpeg();
+        let catalogue = br#"{
+            "parts": [
+                {
+                    "ic": "2ERGM22",
+                    "description": "Hinge plate",
+                    "type": "plate",
+                    "dimensions": "10 mm",
+                    "crops": [
+                        "crops/2ERGM22/000001_crop_007.jpg",
+                        "crops/2ERGM22/000001_crop_008.jpg"
+                    ]
+                },
+                { "ic": "EMPTY", "description": "No crops", "crops": [] },
+                {
+                    "ic": "GONE",
+                    "description": "Missing file",
+                    "crops": ["crops/GONE/absent.jpg"]
+                },
+                { "ic": "FLAT", "description": "Flat crop", "crops": ["crops/flat.jpg"] },
+                {
+                    "ic": "OTHER",
+                    "description": "Listed under the hinge folder",
+                    "crops": ["crops/2ERGM22/000001_crop_009.jpg"]
+                }
+            ]
+        }"#;
+        let bytes = pack(&[
+            ("catalogue.json", catalogue),
+            ("crops/2ERGM22/000001_crop_007.jpg", &jpeg),
+            ("crops/2ERGM22/000001_crop_008.jpg", &jpeg),
+            ("crops/2ERGM22/000001_crop_009.jpg", &jpeg),
+            ("crops/flat.jpg", &jpeg),
+        ]);
+        let built = build_from_tar(&bytes, &mut stub_embed).unwrap();
+        assert_eq!(built.book.parts.len(), 2);
+        assert_eq!(built.book.parts[0].ic, "2ERGM22");
+        assert_eq!(built.book.parts[0].description, "Hinge plate");
+        assert_eq!(built.book.parts[0].kind, "plate");
+        assert_eq!(
+            built.book.parts[0].dimensions,
+            Value::String("10 mm".to_string())
+        );
+        assert_eq!(built.book.parts[0].crops.len(), 3);
+        assert_eq!(built.book.parts[0].embeddings.len(), 3);
+        assert!(built.book.parts[0].crops[0].ends_with("000001_crop_007.jpg"));
+        assert!(built.book.parts[0].crops[1].ends_with("000001_crop_008.jpg"));
+        assert!(built.book.parts[0].crops[2].ends_with("000001_crop_009.jpg"));
+        assert_eq!(built.book.parts[1].ic, "FLAT");
+        assert_eq!(built.book.parts[1].crops.len(), 1);
+        assert_eq!(built.book.parts[1].embeddings.len(), 1);
+
+        let packed = pack(&[
+            (
+                "pack/catalogue.json",
+                br#"{"parts":[{"ic":"2ERGM22","description":"Hinge","crops":["crops/2ERGM22/000001_crop_007.jpg"]}]}"#,
+            ),
+            ("pack/crops/2ERGM22/000001_crop_007.jpg", jpeg.as_slice()),
+        ]);
+        let nested = build_from_tar(&packed, &mut stub_embed).unwrap();
+        assert_eq!(nested.book.parts.len(), 1);
+        assert_eq!(nested.book.parts[0].description, "Hinge");
+        assert_eq!(nested.book.parts[0].crops.len(), 1);
+        assert!(nested.book.parts[0].crops[0].ends_with("000001_crop_007.jpg"));
+        assert_eq!(nested.book.parts[0].embeddings.len(), 1);
     }
 
     #[test]

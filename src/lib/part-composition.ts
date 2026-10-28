@@ -3,6 +3,8 @@
 // Rules run once, top to bottom, against those original class names.
 // The first match renames that parent box. A result IC is not matched again.
 
+import type { CatalogMatch } from "$lib/catalog-match";
+
 export const PART_RULE_LIMIT = 40;
 export const PART_LABEL_LIMIT = 80;
 
@@ -23,6 +25,8 @@ export type PartBox = {
 	consumed?: boolean;
 	// Kept from detection. A part rule rename does not clear it.
 	referenceMatch?: boolean;
+	// Kept from detection. The overlay reads it. The BoM count does not.
+	catalogMatch?: CatalogMatch;
 };
 
 export type PartComposition = {
