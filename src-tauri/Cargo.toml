@@ -29,6 +29,7 @@ native-tls = "0.2"
 url = "2"
 base64 = "0.22"
 image = { version = "=0.25.8", default-features = false, features = ["jpeg", "png"] }
+tar = "0.4"
 turbojpeg = "=1.5.1"
 rxing = { version = "0.9.3", default-features = false, features = ["image", "decoders", "encoders", "encoding_rs", "oned", "qrcode"] }
 ort = { version = "=2.0.0-rc.14", features = ["ndarray", "download-binaries", "copy-dylibs", "openvino"] }

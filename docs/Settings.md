@@ -29,11 +29,13 @@ Settings are stored in `vision/config.local.json` (gitignored). The unlock passw
 
 Training lists `.pt` and `.onnx` files in the app data models folder. Update model copies an `.onnx` file over the selected `.onnx` name, or over `best.onnx`. The selected basename is `model` in `vision/config.local.json`. Detection runs only for `.onnx`, and the next run loads the copied file.
 
-Update references, under that control, opens a native file dialog that accepts `.json`. The chosen file replaces `vision/dinov2-references.json`, beside `vision/config.local.json`, and loads those embeddings. The status line is "References loaded N ICs." The next detection uses them. A missing file, a file that is not valid JSON, or a permission error stays on that status line. Cancel says "No file selected." The saved file and the in-memory map stay in place when the chosen file is refused.
-
-View references, under that button, reads that same file and opens a table of each saved IC, its threshold, and how many embeddings it has. The dialog shows the file path. A missing or empty file says "No references loaded." The IC and threshold columns sort. Editing a threshold, or deleting an IC, writes `vision/dinov2-references.json` and the in-memory map. The next detection uses that change. An IC with no saved threshold uses the Training match score. Close returns to Settings.
-
 ## Part rules
+
+Update references, above the part rules, opens a native file dialog that accepts `.tar`. The archive contains `catalogue.json` and JPEG crops in `crops/`. Each crop is embedded with the DINOv2 model already loaded at startup. The IC, description, type, dimensions, crop paths, and embeddings are written to `vision/catalogue.json`, beside `vision/config.local.json`. The JPEGs are copied under `vision/catalogue-crops/`. The next start loads that file. Success says "Catalogue loaded N parts." Cancel says "No file selected." A bad archive, a missing DINOv2 model, or a write error leaves the saved catalogue in place and shows an error toast.
+
+View references lists every imported part. Each row shows the IC and description, the type and dimensions when they are present, and a thumbnail of the first crop, or a small gallery when there are several. Delete removes that part. The dialog does not edit the other fields. A missing or empty catalogue says "No references loaded."
+
+The parent and child rules stay below that control.
 
 Settings > Parts stores `partRules` in `vision/config.local.json`. Each row is a parent class, a child class, a condition (`contains` or `no child`), and a result IC. Parent and child are chosen from the active ONNX model's class list. Type in the field to filter that list. Add and remove rows, then Save. Up and Down set the order. Rules run from top to bottom and the first match wins.
 
