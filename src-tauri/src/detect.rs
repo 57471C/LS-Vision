@@ -79,6 +79,9 @@ struct Detection {
     /// off, the box is unrecognized, or the crop could not be measured.
     #[serde(default, rename = "metrology", skip_serializing_if = "Option::is_none")]
     metrology: Option<crate::metrology::MetrologyResult>,
+    /// YOLO class index. Not part of the detect payload. Class 3 is a label.
+    #[serde(skip)]
+    class_id: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -967,6 +970,7 @@ fn detections_from_output(
             catalog_match: None,
             two_pass: None,
             metrology: None,
+            class_id: item.class_id,
         });
         items.push(DetectedItem {
             ic,
@@ -1945,6 +1949,7 @@ fn apply_metrology(
                 bbox: item.bbox,
                 matched: resolved.is_some(),
                 ic: resolved.unwrap_or_default(),
+                class_id: item.class_id,
             }
         })
         .collect();
