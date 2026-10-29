@@ -174,6 +174,46 @@ check(
 	layoutDimensions([], false, [], null, 1).length === 0,
 );
 
+const washerMarks = layoutDimensions(
+	[
+		{
+			kind: "outer_diameter",
+			text: "Ø 8.0 mm",
+			x1: 30,
+			y1: 48,
+			x2: 110,
+			y2: 48,
+		},
+		{
+			kind: "inner_diameter",
+			text: "Ø 4.0 mm",
+			x1: 50,
+			y1: 48,
+			x2: 90,
+			y2: 48,
+		},
+		{
+			kind: "thickness",
+			text: "1.6 mm",
+			x1: 70,
+			y1: 40,
+			x2: 70,
+			y2: 56,
+		},
+	],
+	false,
+	[],
+	{ x: 0, y: 0, w: 160, h: 90 },
+	1,
+);
+check("a washer draws each method span", washerMarks.length === 3);
+check(
+	"diameter labels keep the symbol and thickness does not",
+	washerMarks.some((mark) => mark.text === "Ø 8.0 mm") &&
+		washerMarks.some((mark) => mark.text === "Ø 4.0 mm") &&
+		washerMarks.some((mark) => mark.text === "1.6 mm"),
+);
+
 if (failed > 0) {
 	throw new Error(`${failed} metrology checks failed`);
 }

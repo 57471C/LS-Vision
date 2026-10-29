@@ -16,7 +16,8 @@
 //!       "ic": "2BBMNM08",
 //!       "description": "M8 nut",
 //!       "type": "fastener",
-//!       "dimensions": { "diameterMm": 8, "lengthMm": 12 },
+//!       "measurementMethod": "nut",
+//!       "dimensions": { "acrossFlats": 13, "thickness": 6.5 },
 //!       "crops": ["crops/2BBMNM08.jpg"]
 //!     }
 //!   ]
@@ -24,7 +25,9 @@
 //! ```
 //!
 //! `ic`, `description` (`des`), `type` (`partType`), `dimensions`, and `crops`
-//! (`images` or `files`) are read. A top-level array is also accepted.
+//! (`images` or `files`) are read. `measurementMethod` is optional. Expected
+//! sizes for that method may sit in `dimensions` or beside it. A top-level
+//! array is also accepted.
 //! A crop path is `crops/<file>.jpg` or `crops/<IC>/<file>.jpg`. The folder
 //! after `crops/` groups those images under that IC. An IC is left out when
 //! its crop list is empty or none of the listed files are in the tar.
@@ -56,6 +59,9 @@ struct Part {
     ic: String,
     description: String,
     kind: String,
+    /// Empty when the part has no measurement method. Metrology then uses the
+    /// generic length and diameter caliper.
+    measurement_method: String,
     dimensions: Value,
     crops: Vec<String>,
     embeddings: Vec<Vec<f32>>,
@@ -371,6 +377,7 @@ fn append_catalogue_crop(
             ic: ic.clone(),
             description: String::new(),
             kind: String::new(),
+            measurement_method: String::new(),
             dimensions: Value::Null,
             crops: vec![relative.clone()],
             embeddings: vec![embedding.to_vec()],
@@ -613,6 +620,7 @@ struct SourcePart {
     ic: String,
     description: String,
     kind: String,
+    measurement_method: String,
     dimensions: Value,
     crops: Vec<String>,
 }
@@ -664,23 +672,114 @@ fn source_part(map: &Map<String, Value>) -> Result<SourcePart, String> {
         &field_string(map, &["type", "partType", "part_type"]),
         &format!("Type for {ic}"),
     )?;
-    let dimensions = map
+    let mut dimensions = map
         .get("dimensions")
         .or_else(|| map.get("dimension"))
         .or_else(|| map.get("size"))
         .cloned()
         .unwrap_or(Value::Null);
+    fold_expected(&mut dimensions, map);
     if dimensions.to_string().len() > MAX_TEXT {
         return Err(format!("Dimensions for {ic} are too long."));
     }
+    let measurement_method = clean_method(&field_string(
+        map,
+        &["measurementMethod", "measurement_method"],
+    ));
     let crops = crop_list(map, &ic)?;
     Ok(SourcePart {
         ic,
         description,
         kind,
+        measurement_method,
         dimensions,
         crops,
     })
+}
+
+/// `bolt`, `nut`, `washer`, `cable_tie`, `spring`, or `custom`. Anything else
+/// is empty, and metrology keeps the generic caliper.
+fn clean_method(raw: &str) -> String {
+    match raw
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', ' '], "_")
+        .as_str()
+    {
+        "bolt" => "bolt".to_string(),
+        "nut" => "nut".to_string(),
+        "washer" => "washer".to_string(),
+        "cable_tie" | "cabletie" => "cable_tie".to_string(),
+        "spring" => "spring".to_string(),
+        "custom" => "custom".to_string(),
+        _ => String::new(),
+    }
+}
+
+const EXPECTED_KEYS: &[&str] = &[
+    "lengthUnderHead",
+    "threadDiameter",
+    "acrossFlats",
+    "height",
+    "outerDiameter",
+    "innerDiameter",
+    "thickness",
+    "freeHeight",
+    "strapWidth",
+    "lengthMm",
+    "diameterMm",
+    "length",
+    "diameter",
+    "width",
+    "OD",
+    "ID",
+    "h",
+];
+
+/// Copy expected sizes that were written beside `dimensions` into that value
+/// so a later save keeps them.
+fn fold_expected(dimensions: &mut Value, map: &Map<String, Value>) {
+    let mut extras = Map::new();
+    for key in EXPECTED_KEYS {
+        let Some(value) = map.get(*key) else {
+            continue;
+        };
+        if !size_value(value) {
+            continue;
+        }
+        extras.insert((*key).to_string(), value.clone());
+    }
+    if extras.is_empty() {
+        return;
+    }
+    match dimensions {
+        Value::Null => *dimensions = Value::Object(extras),
+        Value::Object(existing) => {
+            for (key, value) in extras {
+                existing.entry(key).or_insert(value);
+            }
+        }
+        Value::Array(items) => {
+            for (key, value) in extras {
+                items.push(serde_json::json!({ "name": key, "mm": value }));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn size_value(value: &Value) -> bool {
+    match value {
+        Value::Number(number) => number
+            .as_f64()
+            .is_some_and(|number| number.is_finite() && number > 0.0),
+        Value::String(text) => text
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .is_some_and(|number| number.is_finite() && number > 0.0),
+        _ => false,
+    }
 }
 
 fn field_string(map: &Map<String, Value>, keys: &[&str]) -> String {
@@ -821,6 +920,9 @@ fn merge_parts(parts: Vec<SourcePart>) -> Result<Vec<SourcePart>, String> {
             if !part.kind.is_empty() {
                 existing.kind = part.kind;
             }
+            if !part.measurement_method.is_empty() {
+                existing.measurement_method = part.measurement_method;
+            }
             if !part.dimensions.is_null() {
                 existing.dimensions = part.dimensions;
             }
@@ -879,6 +981,7 @@ fn build_from_tar(
             ic: source.ic,
             description: source.description,
             kind: source.kind,
+            measurement_method: source.measurement_method,
             dimensions: source.dimensions,
             crops,
             embeddings,
@@ -1014,6 +1117,7 @@ fn book_json(book: &Book) -> Result<Vec<u8>, String> {
                 ic: part.ic.clone(),
                 description: part.description.clone(),
                 kind: part.kind.clone(),
+                measurement_method: part.measurement_method.clone(),
                 dimensions: part.dimensions.clone(),
                 crops: part.crops.clone(),
                 embeddings: part.embeddings.clone(),
@@ -1055,6 +1159,12 @@ struct StoredPart {
     description: String,
     #[serde(default, rename = "type")]
     kind: String,
+    #[serde(
+        default,
+        rename = "measurementMethod",
+        skip_serializing_if = "String::is_empty"
+    )]
+    measurement_method: String,
     #[serde(default)]
     dimensions: Value,
     crops: Vec<String>,
@@ -1112,6 +1222,7 @@ fn stored_part(part: StoredPart, path: &Path) -> Result<Part, String> {
         ic,
         description: part.description.trim().to_string(),
         kind: part.kind.trim().to_string(),
+        measurement_method: clean_method(&part.measurement_method),
         dimensions: part.dimensions,
         crops: part.crops,
         embeddings: part.embeddings,
@@ -1178,16 +1289,26 @@ fn views_from(book: &Book, vision: &Path) -> Vec<CatalogueView> {
         .collect()
 }
 
-/// Description and stored dimensions for one catalogue item code.
+/// Description, dimensions, and measurement method for one catalogue item code.
 /// Detection reads these when metrology is on. The catalogue file is unchanged.
-pub(crate) fn part_dimensions(ic: &str) -> Option<(String, Value)> {
+pub(crate) struct CatalogueSize {
+    pub description: String,
+    pub dimensions: Value,
+    pub measurement_method: String,
+}
+
+pub(crate) fn part_dimensions(ic: &str) -> Option<CatalogueSize> {
     let wanted = ic.trim();
     if wanted.is_empty() {
         return None;
     }
     let book = lock(&CATALOGUE);
     let part = book.parts.iter().find(|part| part.ic == wanted)?;
-    Some((part.description.clone(), part.dimensions.clone()))
+    Some(CatalogueSize {
+        description: part.description.clone(),
+        dimensions: part.dimensions.clone(),
+        measurement_method: part.measurement_method.clone(),
+    })
 }
 
 fn dimensions_text(value: &Value) -> String {
@@ -1641,6 +1762,84 @@ mod tests {
         let listed = catalogue_list_from(&dir).unwrap();
         assert!(listed.parts.is_empty());
         assert!(listed.path.ends_with("catalogue.json"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn measurement_method_round_trips_and_keeps_expected_sizes() {
+        let dir = temp_dir("method");
+        let stored = serde_json::json!({
+            "version": 1,
+            "parts": [{
+                "ic": "BOLT-1",
+                "description": "M6x40",
+                "type": "bolt",
+                "measurementMethod": "Bolt",
+                "dimensions": { "headHeight": 5 },
+                "lengthUnderHead": 40,
+                "threadDiameter": 6,
+                "crops": [],
+                "embeddings": []
+            }]
+        });
+        fs::write(
+            dir.join("catalogue.json"),
+            serde_json::to_vec(&stored).unwrap(),
+        )
+        .unwrap();
+        let book = load_book(&dir).unwrap().unwrap();
+        assert_eq!(book.parts[0].measurement_method, "bolt");
+        assert_eq!(book.parts[0].dimensions["headHeight"], serde_json::json!(5));
+        let bytes = book_json(&book).unwrap();
+        let saved: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(saved["parts"][0]["measurementMethod"], "bolt");
+        assert!(saved["parts"][0].get("lengthUnderHead").is_none());
+
+        let jpeg = tiny_jpeg();
+        let catalogue = br#"{
+            "parts": [{
+                "ic": "W-1",
+                "description": "Washer",
+                "measurementMethod": "cable-tie",
+                "dimensions": [{ "name": "OD", "mm": 12 }],
+                "outerDiameter": 16,
+                "thickness": 1.5,
+                "crops": ["crops/w.jpg"]
+            }]
+        }"#;
+        let packed = pack(&[
+            ("catalogue.json", catalogue),
+            ("crops/w.jpg", jpeg.as_slice()),
+        ]);
+        let built = build_from_tar(&packed, &mut stub_embed).unwrap();
+        assert_eq!(built.book.parts[0].measurement_method, "cable_tie");
+        assert_eq!(built.book.parts[0].dimensions[0]["name"], "OD");
+        assert_eq!(built.book.parts[0].dimensions[1]["name"], "outerDiameter");
+        assert_eq!(
+            built.book.parts[0].dimensions[2]["mm"],
+            serde_json::json!(1.5)
+        );
+
+        let plain = serde_json::json!({
+            "version": 1,
+            "parts": [{
+                "ic": "PLAIN",
+                "description": "No method",
+                "type": "other",
+                "dimensions": "M6x40",
+                "crops": [],
+                "embeddings": []
+            }]
+        });
+        fs::write(
+            dir.join("catalogue.json"),
+            serde_json::to_vec(&plain).unwrap(),
+        )
+        .unwrap();
+        let plain_book = load_book(&dir).unwrap().unwrap();
+        assert!(plain_book.parts[0].measurement_method.is_empty());
+        let plain_json: Value = serde_json::from_slice(&book_json(&plain_book).unwrap()).unwrap();
+        assert!(plain_json["parts"][0].get("measurementMethod").is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 }
