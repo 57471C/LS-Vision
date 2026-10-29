@@ -22,6 +22,7 @@ import {
 	measureFrameBox,
 	measureReadout,
 } from "$lib/measure";
+import { mismatchNote } from "$lib/metrology";
 import {
 	detectionCounts,
 	extraPartCount,
@@ -61,6 +62,7 @@ type Detection = {
 	slot?: number;
 	catalogMatch?: CatalogMatch;
 	twoPass?: TwoPassMatch;
+	metrology?: unknown;
 };
 
 type DetectionMark = {
@@ -81,6 +83,11 @@ type DetectionMark = {
 	dashed: boolean;
 	labelInk: string;
 	slot?: number;
+	note: string;
+	noteX: number;
+	noteY: number;
+	noteW: number;
+	noteH: number;
 };
 
 // OpenCV stored these as BGR.
@@ -186,6 +193,17 @@ function detectionMarks(
 			labelX = Math.max(originX, imageRight - labelW);
 		if (labelY + labelH > imageBottom)
 			labelY = Math.max(originY, imageBottom - labelH);
+		const note = item.consumed ? "" : mismatchNote(item.metrology);
+		const noteW = note
+			? Math.ceil(note.length * LABEL_FONT * 0.62) + LABEL_PAD_X * 2
+			: 0;
+		const noteH = note ? LABEL_FONT + LABEL_PAD_Y * 2 : 0;
+		let noteX = x;
+		let noteY = y + h + 2;
+		if (note && noteY + noteH > imageBottom)
+			noteY = Math.max(originY, y - noteH);
+		if (note && noteX + noteW > imageRight)
+			noteX = Math.max(originX, imageRight - noteW);
 		const tint = item.slot ? slotColor(item.slot).stroke : "";
 		marks.push({
 			key: `${item.slot ?? 0}:${index}:${item.ic}:${x1}:${y1}`,
@@ -210,6 +228,11 @@ function detectionMarks(
 			child: item.consumed === true,
 			dashed: style?.dashed === true,
 			labelInk: style?.labelInk ?? "#ffffff",
+			note,
+			noteX,
+			noteY,
+			noteW,
+			noteH,
 		});
 	}
 	return marks;
@@ -617,6 +640,27 @@ $: bannerCount = (wrongParts ? 1 : 0) + (extraParts > 0 ? 1 : 0);
 									>
 										{mark.label}
 									</text>
+									{#if mark.note}
+										<rect
+											x={mark.noteX}
+											y={mark.noteY}
+											width={mark.noteW}
+											height={mark.noteH}
+											fill="#dc2626"
+											data-metrology="DIMENSION_MISMATCH"
+										/>
+										<text
+											x={mark.noteX + LABEL_PAD_X}
+											y={mark.noteY + mark.noteH / 2}
+											fill="#ffffff"
+											font-size={LABEL_FONT}
+											font-family="ui-monospace, monospace"
+											font-weight="600"
+											dominant-baseline="central"
+										>
+											{mark.note}
+										</text>
+									{/if}
 								{/if}
 								{#if mark.slot}
 									<rect

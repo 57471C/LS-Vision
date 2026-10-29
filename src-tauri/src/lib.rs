@@ -10,6 +10,7 @@ mod frame;
 mod inference;
 mod inference_ep;
 mod local_config;
+mod metrology;
 mod results;
 mod training;
 mod vision;

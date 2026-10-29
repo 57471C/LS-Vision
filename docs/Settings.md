@@ -16,6 +16,7 @@ Settings are stored in `vision/config.local.json` (gitignored). The unlock passw
 - **Barcode scan**: whole seconds from 1 to 60. The default is 8. This is the operator countdown.
 - **Part detection**: up to four regions (`detectRois`, each `x`, `y`, `w`, `h` as fractions from 0 to 1, plus `enabled`). The Slot dropdown chooses which region the fields edit. Blank leaves the fields idle. An empty slot is skipped. With no slots saved, detection uses the full image. `detectRoi` is slot 1. Save writes the selected slot. A new box starts enabled. Clear removes that slot and packs the rest to the front, so the saved list has no gap. The fields then show whatever region now sits in the selected slot. The four squares flip `enabled` and save it immediately. Grey has no box, green is on, and red is off. Detection skips a slot that is off.
 - **Barcode**: a region of the frame (`barcodeRoi`: `x`, `y`, `width`, `height` as fractions from 0 to 1). The operator crop uses the same object. With no region, decode uses the full frame. The operator page can also draw this region on the live feed when Settings is unlocked.
+- **Metrology**: off by default (`metrology.enabled`). When it is on, the margin, threshold mode (Otsu or fixed), fixed threshold, minimum contour area, and the length and diameter tolerances are shown. Save writes that object. Detection then measures each catalogue match on the full-resolution frame and can attach `pass` or `DIMENSION_MISMATCH`. The check needs a camera scale. It does not change pass or fail.
 
 ## Inference EP
 

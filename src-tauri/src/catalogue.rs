@@ -1178,6 +1178,18 @@ fn views_from(book: &Book, vision: &Path) -> Vec<CatalogueView> {
         .collect()
 }
 
+/// Description and stored dimensions for one catalogue item code.
+/// Detection reads these when metrology is on. The catalogue file is unchanged.
+pub(crate) fn part_dimensions(ic: &str) -> Option<(String, Value)> {
+    let wanted = ic.trim();
+    if wanted.is_empty() {
+        return None;
+    }
+    let book = lock(&CATALOGUE);
+    let part = book.parts.iter().find(|part| part.ic == wanted)?;
+    Some((part.description.clone(), part.dimensions.clone()))
+}
+
 fn dimensions_text(value: &Value) -> String {
     match value {
         Value::Null => String::new(),

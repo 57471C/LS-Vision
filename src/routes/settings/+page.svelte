@@ -20,6 +20,7 @@ import {
 	parseDetectRois,
 	withSlotEnabled,
 } from "$lib/detect-rois";
+import { metrologyDocument, readMetrology } from "$lib/metrology";
 import {
 	PART_LABEL_LIMIT,
 	PART_RULE_LIMIT,
@@ -71,6 +72,15 @@ let testMode = false;
 let skipResultSave = true;
 let testNotice = "";
 let savingTest = false;
+let metrologyOn = false;
+let metrologyMargin = 5;
+let metrologyMode: "otsu" | "fixed" = "otsu";
+let metrologyFixed = 128;
+let metrologyMinArea = 200;
+let metrologyLengthTol = 1.5;
+let metrologyDiameterTol = 0.8;
+let metrologyNotice = "";
+let savingMetrology = false;
 let roi: DetectRoi | null = null;
 let roiSlot = "";
 let roiSlots: (DetectRoi | null)[] = [null, null, null, null];
@@ -514,6 +524,7 @@ async function loadSource() {
 		await loadErp();
 		await loadScan();
 		await loadTestMode();
+		await loadMetrology();
 		await loadRoi();
 		await loadModel();
 		await loadPartRules();
@@ -1258,6 +1269,52 @@ async function loadTestMode() {
 		skipResultSave = data.skipResultSave !== false;
 	} catch (err: unknown) {
 		testNotice = invokeError(err, "Could not load Test mode");
+	}
+}
+
+function applyMetrology(value: unknown) {
+	const saved = readMetrology(value);
+	metrologyOn = saved.enabled;
+	metrologyMargin = saved.marginPercent;
+	metrologyMode = saved.thresholdMode;
+	metrologyFixed = saved.fixedThreshold;
+	metrologyMinArea = saved.minContourAreaPx;
+	metrologyLengthTol = saved.lengthToleranceMm;
+	metrologyDiameterTol = saved.diameterToleranceMm;
+}
+
+async function loadMetrology() {
+	try {
+		const data = await loadDocument();
+		applyMetrology(data.metrology);
+	} catch (err: unknown) {
+		metrologyNotice = invokeError(err, "Could not load metrology");
+	}
+}
+
+async function saveMetrology() {
+	savingMetrology = true;
+	metrologyNotice = "";
+	const previous = {
+		enabled: metrologyOn,
+		marginPercent: metrologyMargin,
+		thresholdMode: metrologyMode,
+		fixedThreshold: metrologyFixed,
+		minContourAreaPx: metrologyMinArea,
+		lengthToleranceMm: metrologyLengthTol,
+		diameterToleranceMm: metrologyDiameterTol,
+	};
+	try {
+		const current = await loadDocument();
+		current.metrology = metrologyDocument(previous);
+		const saved = await storeDocument(current);
+		applyMetrology(saved.metrology);
+		metrologyNotice = "Saved";
+	} catch (err: unknown) {
+		applyMetrology(previous);
+		metrologyNotice = errorMessage(err, "Could not save metrology");
+	} finally {
+		savingMetrology = false;
 	}
 }
 
@@ -3325,6 +3382,111 @@ onDestroy(() => {
 							</div>
 							{#if barcodeNotice}
 								<p class="text-sm text-neutral-200">{barcodeNotice}</p>
+							{/if}
+						</form>
+
+						<form
+							class="flex flex-col gap-4 border border-neutral-700 bg-neutral-900 p-4 xl:col-span-2"
+							on:submit|preventDefault={saveMetrology}
+						>
+							<fieldset class="flex flex-col gap-3">
+								<legend class="text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+									Metrology
+								</legend>
+								<label class="flex items-center gap-3 text-sm font-medium text-neutral-100">
+									<input
+										type="checkbox"
+										class="h-5 w-5 accent-blue-500"
+										bind:checked={metrologyOn}
+										disabled={savingMetrology}
+									/>
+									Enable metrology
+								</label>
+								<p class="text-sm text-neutral-400">
+									After a catalogue match, measure the part length and diameter on the full-resolution frame. A mismatch is shown on the overlay. Pass and fail stay the same. This needs a camera scale.
+								</p>
+								{#if metrologyOn}
+									<div class="grid grid-cols-2 gap-3 sm:grid-cols-3">
+										<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+											Margin %
+											<input
+												type="number"
+												class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
+												bind:value={metrologyMargin}
+												min="0"
+												max="100"
+												step="any"
+												disabled={savingMetrology}
+											/>
+										</label>
+										<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+											Threshold mode
+											<select
+												class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
+												bind:value={metrologyMode}
+												disabled={savingMetrology}
+											>
+												<option value="otsu">Otsu</option>
+												<option value="fixed">Fixed</option>
+											</select>
+										</label>
+										<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+											Fixed threshold
+											<input
+												type="number"
+												class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100 disabled:text-neutral-500"
+												bind:value={metrologyFixed}
+												min="0"
+												max="255"
+												step="1"
+												disabled={savingMetrology || metrologyMode !== "fixed"}
+											/>
+										</label>
+										<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+											Min contour area px
+											<input
+												type="number"
+												class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
+												bind:value={metrologyMinArea}
+												min="0"
+												step="1"
+												disabled={savingMetrology}
+											/>
+										</label>
+										<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+											Length tolerance mm
+											<input
+												type="number"
+												class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
+												bind:value={metrologyLengthTol}
+												min="0"
+												step="any"
+												disabled={savingMetrology}
+											/>
+										</label>
+										<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+											Diameter tolerance mm
+											<input
+												type="number"
+												class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
+												bind:value={metrologyDiameterTol}
+												min="0"
+												step="any"
+												disabled={savingMetrology}
+											/>
+										</label>
+									</div>
+								{/if}
+							</fieldset>
+							<button
+								type="submit"
+								class="inline-flex min-h-11 w-fit items-center border border-blue-500 bg-blue-600 px-4 text-sm font-semibold text-white disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
+								disabled={savingMetrology}
+							>
+								{savingMetrology ? "Saving..." : "Save"}
+							</button>
+							{#if metrologyNotice}
+								<p class="text-sm text-neutral-200">{metrologyNotice}</p>
 							{/if}
 						</form>
 					{:else if section === "training"}

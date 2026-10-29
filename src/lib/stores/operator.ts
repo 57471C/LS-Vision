@@ -6,6 +6,7 @@ import {
 	emptyDetectRois,
 	soleDetectRoi,
 } from "$lib/detect-rois";
+import type { MetrologyResult } from "$lib/metrology";
 import type { ConsoleLine } from "$lib/operator/console";
 
 export type { DetectRoi };
@@ -54,6 +55,8 @@ export type Detection = {
 	catalogMatch?: CatalogMatch;
 	// Two-pass catalogue result. QTY SEEN counts only `matched_bom`.
 	twoPass?: TwoPassMatch;
+	// Length and diameter check. Absent when metrology is off.
+	metrology?: MetrologyResult;
 };
 
 export type SlotDetections = {
