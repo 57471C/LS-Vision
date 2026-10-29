@@ -1695,15 +1695,33 @@ onDestroy(() => {
 			{#if admin}
 				<button
 					type="button"
-					class="inline-flex h-7 shrink-0 items-center border px-2 text-xs font-semibold {crosshairs
+					class="inline-flex h-7 w-7 shrink-0 items-center justify-center border text-xs font-semibold {crosshairs
 						? 'border-blue-500 bg-blue-600 text-white'
 						: 'border-neutral-600 bg-neutral-800 text-neutral-100'}"
 					aria-pressed={crosshairs}
 					aria-label="Crosshairs"
+					title="Crosshairs"
 					disabled={snapshotOpen}
 					on:click={toggleCrosshairs}
 				>
-					Crosshairs
+					<svg
+						xmlns="http://www.w3.org/2000/svg"
+						viewBox="0 0 24 24"
+						class="h-4 w-4"
+						fill="none"
+						stroke="currentColor"
+						stroke-width="2"
+						stroke-linecap="round"
+						stroke-linejoin="round"
+						aria-hidden="true"
+					>
+						<circle cx="12" cy="12" r="8" />
+						<line x1="12" y1="2" x2="12" y2="6" />
+						<line x1="12" y1="18" x2="12" y2="22" />
+						<line x1="2" y1="12" x2="6" y2="12" />
+						<line x1="18" y1="12" x2="22" y2="12" />
+						<circle cx="12" cy="12" r="1.5" fill="currentColor" stroke="none" />
+					</svg>
 				</button>
 			{/if}
 			{#if status}
@@ -1796,16 +1814,7 @@ onDestroy(() => {
 								y1="0"
 								x2={aim.x}
 								y2={overlayH}
-								stroke="rgba(0,0,0,0.35)"
-								stroke-width="1"
-								vector-effect="non-scaling-stroke"
-							/>
-							<line
-								x1={aim.x}
-								y1="0"
-								x2={aim.x}
-								y2={overlayH}
-								stroke="rgba(255,255,255,0.5)"
+								stroke="#ef4444"
 								stroke-width="1"
 								vector-effect="non-scaling-stroke"
 								data-crosshair="v"
@@ -1815,16 +1824,7 @@ onDestroy(() => {
 								y1={aim.y}
 								x2={overlayW}
 								y2={aim.y}
-								stroke="rgba(0,0,0,0.35)"
-								stroke-width="1"
-								vector-effect="non-scaling-stroke"
-							/>
-							<line
-								x1="0"
-								y1={aim.y}
-								x2={overlayW}
-								y2={aim.y}
-								stroke="rgba(255,255,255,0.5)"
+								stroke="#ef4444"
 								stroke-width="1"
 								vector-effect="non-scaling-stroke"
 								data-crosshair="h"
