@@ -18,6 +18,7 @@ use crate::local_config::{self, load_document, save_document};
 
 const MAX_STEM: usize = 80;
 const DEFAULT_BASE: &str = "image";
+const PLACEHOLDER_CLASS: i32 = 999999;
 pub const TRAINING_JPEG_QUALITY: i32 = 95;
 
 #[derive(Debug, Serialize)]
@@ -132,6 +133,18 @@ pub fn save_training_image(
     let bytes = resolve_snapshot_bytes(raw_frame, image)?;
     let root = local_config::project_root()?;
     save_jpeg(&root, &name, &bytes, &today_folder())
+}
+
+/// YOLO label file for one preview Detect. The class id is always the placeholder.
+/// The name follows the training JPEG stem and does not change `trainingImageName`.
+#[tauri::command]
+pub fn save_detect_labels(
+    width: u32,
+    height: u32,
+    boxes: Vec<[f64; 4]>,
+) -> Result<TrainingSave, String> {
+    let root = local_config::project_root()?;
+    write_detect_labels(&root, &today_folder(), width, height, &boxes)
 }
 
 fn today_folder() -> String {
@@ -295,6 +308,118 @@ fn remember_base(stem: &str) -> String {
     } else {
         base.to_string()
     }
+}
+
+/// Preview Detect label. Same `{base}` / `{base} (n)` stem as a JPEG, but a stem is
+/// taken when either `{stem}.jpg` or `{stem}.txt` already exists. This does not
+/// update `trainingImageName`, so the Enter dialog still looks at JPEG files only.
+fn write_detect_labels(
+    root: &Path,
+    day: &str,
+    width: u32,
+    height: u32,
+    boxes: &[[f64; 4]],
+) -> Result<TrainingSave, String> {
+    if width == 0 || height == 0 {
+        return Err("The snapshot has invalid dimensions.".to_string());
+    }
+    let text = yolo_label_text(width, height, boxes);
+    let folder = configured_dir(root)?;
+    let day = day_folder(day)?;
+    let dir = folder.join(&day);
+    if local_config::path_is_program_files(&dir) {
+        return Err("Training images cannot be written under Program Files.".to_string());
+    }
+    fs::create_dir_all(&dir).map_err(|err| {
+        format!(
+            "Could not create the training folder {}: {err}",
+            dir.display()
+        )
+    })?;
+    let base = stored_base(root)?;
+    for _ in 0..10_000 {
+        let stem = next_free_label_name(&dir, &base);
+        let path = dir.join(format!("{stem}.txt"));
+        let opened = OpenOptions::new().write(true).create_new(true).open(&path);
+        let mut file = match opened {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(format!("Could not save the label file: {err}")),
+        };
+        file.write_all(text.as_bytes())
+            .map_err(|err| format!("Could not save the label file: {err}"))?;
+        let message = format!("Saved {stem}.txt");
+        return Ok(TrainingSave {
+            saved: true,
+            name: stem,
+            path: display_path(&path),
+            message,
+        });
+    }
+    Err("Could not save the label file.".to_string())
+}
+
+fn yolo_label_text(width: u32, height: u32, boxes: &[[f64; 4]]) -> String {
+    let frame_w = f64::from(width);
+    let frame_h = f64::from(height);
+    let mut lines = Vec::new();
+    for box_xyxy in boxes {
+        let Some(line) = yolo_line(frame_w, frame_h, *box_xyxy) else {
+            continue;
+        };
+        lines.push(line);
+    }
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", lines.join("\n"))
+    }
+}
+
+fn yolo_line(frame_w: f64, frame_h: f64, box_xyxy: [f64; 4]) -> Option<String> {
+    let [left, top, right, bottom] = box_xyxy;
+    if ![left, top, right, bottom].into_iter().all(f64::is_finite) {
+        return None;
+    }
+    let x1 = left.min(right).clamp(0.0, frame_w);
+    let y1 = top.min(bottom).clamp(0.0, frame_h);
+    let x2 = left.max(right).clamp(0.0, frame_w);
+    let y2 = top.max(bottom).clamp(0.0, frame_h);
+    let box_w = x2 - x1;
+    let box_h = y2 - y1;
+    if box_w <= 0.0 || box_h <= 0.0 {
+        return None;
+    }
+    Some(format!(
+        "{PLACEHOLDER_CLASS} {:.6} {:.6} {:.6} {:.6}",
+        (x1 + box_w / 2.0) / frame_w,
+        (y1 + box_h / 2.0) / frame_h,
+        box_w / frame_w,
+        box_h / frame_h
+    ))
+}
+
+/// Same copy numbers as `next_free_name`, counting a JPEG or a label file as taken.
+fn next_free_label_name(dir: &Path, base: &str) -> String {
+    let base = if base.is_empty() || is_reserved(base) {
+        DEFAULT_BASE
+    } else {
+        base
+    };
+    if !label_stem_taken(dir, base) {
+        return base.to_string();
+    }
+    for index in 2..10_000 {
+        let name = format!("{base} ({index})");
+        if !label_stem_taken(dir, &name) {
+            return name;
+        }
+    }
+    format!("{base} (10000)")
+}
+
+fn label_stem_taken(dir: &Path, stem: &str) -> bool {
+    dir.join(format!("{stem}.jpg")).exists() || dir.join(format!("{stem}.txt")).exists()
 }
 
 /// Smallest free name in `dir`. The plain base is used when `{base}.jpg` is absent.
@@ -609,5 +734,67 @@ mod tests {
 
         let err = resolve_snapshot_bytes(None, None).unwrap_err();
         assert!(err.contains("No snapshot frame"));
+    }
+
+    #[test]
+    fn detect_labels_use_the_jpeg_stem_and_placeholder_class() {
+        let project = TempProject::new("labels");
+        let folder = project.root.join("shots");
+        point_at(&project.root, &folder, "bracket");
+        let day = "20-10-2026";
+        let boxes = [
+            [100.0, 50.0, 300.0, 250.0],
+            [10.0, 10.0, 10.0, 40.0],
+            [2000.0, 0.0, 2100.0, 10.0],
+            [900.0, 0.0, 1100.0, 100.0],
+        ];
+        let saved = write_detect_labels(&project.root, day, 1000, 500, &boxes).unwrap();
+        assert!(saved.saved);
+        assert_eq!(saved.name, "bracket");
+        let path = folder.join(day).join("bracket.txt");
+        assert_eq!(PathBuf::from(&saved.path), path);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "999999 0.200000 0.300000 0.200000 0.400000\n999999 0.950000 0.100000 0.100000 0.200000\n"
+        );
+        assert!(!folder.join(day).join("bracket.jpg").exists());
+        assert_eq!(
+            load_document(&project.root).unwrap()["trainingImageName"],
+            "bracket"
+        );
+        assert_eq!(suggest_in(&project.root, day).unwrap().name, "bracket");
+
+        let again = write_detect_labels(&project.root, day, 1000, 500, &[]).unwrap();
+        assert_eq!(again.name, "bracket (2)");
+        let empty = folder.join(day).join("bracket (2).txt");
+        assert_eq!(fs::read(&empty).unwrap(), b"");
+        assert_eq!(suggest_in(&project.root, day).unwrap().name, "bracket");
+        assert_eq!(
+            load_document(&project.root).unwrap()["trainingImageName"],
+            "bracket"
+        );
+
+        fs::write(folder.join(day).join("bracket.jpg"), b"jpeg").unwrap();
+        let after_jpeg =
+            write_detect_labels(&project.root, day, 100, 100, &[[0.0, 0.0, 50.0, 50.0]]).unwrap();
+        assert_eq!(after_jpeg.name, "bracket (3)");
+        assert_eq!(
+            fs::read_to_string(folder.join(day).join("bracket (3).txt")).unwrap(),
+            "999999 0.250000 0.250000 0.500000 0.500000\n"
+        );
+        assert_eq!(suggest_in(&project.root, day).unwrap().name, "bracket (2)");
+        let jpeg = save_jpeg(&project.root, "bracket", &tiny_jpeg(10), day).unwrap();
+        assert!(!jpeg.saved);
+        assert_eq!(jpeg.name, "bracket (2)");
+    }
+
+    #[test]
+    fn detect_labels_reject_an_empty_frame_without_a_file() {
+        let project = TempProject::new("labels-empty");
+        let folder = project.root.join("shots");
+        point_at(&project.root, &folder, "image");
+        let err = write_detect_labels(&project.root, "20-10-2026", 0, 100, &[]).unwrap_err();
+        assert!(err.contains("invalid dimensions"));
+        assert!(!folder.join("20-10-2026").exists());
     }
 }
