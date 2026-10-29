@@ -13,10 +13,12 @@ use serde_json::Value;
 use tauri::AppHandle;
 use tauri_plugin_dialog::DialogExt;
 
+use crate::frame::{FrameState, RawFrame};
 use crate::local_config::{self, load_document, save_document};
 
 const MAX_STEM: usize = 80;
 const DEFAULT_BASE: &str = "image";
+pub const TRAINING_JPEG_QUALITY: i32 = 95;
 
 #[derive(Debug, Serialize)]
 pub struct TrainingName {
@@ -81,9 +83,53 @@ pub fn suggest_training_filename() -> Result<TrainingName, String> {
     suggest_in(&root, &today_folder())
 }
 
+/// Compress an uncompressed RGB `RawFrame` into a high-quality JPEG.
+pub fn compress_frame_jpeg(raw: &RawFrame, quality: i32) -> Result<Vec<u8>, String> {
+    if raw.width == 0 || raw.height == 0 {
+        return Err("The snapshot has invalid dimensions.".to_string());
+    }
+    let expected = (raw.width as usize)
+        .saturating_mul(raw.height as usize)
+        .saturating_mul(3);
+    if raw.data.len() < expected {
+        return Err("The snapshot buffer is too small.".to_string());
+    }
+    let image = turbojpeg::Image {
+        pixels: &raw.data[..expected],
+        width: raw.width as usize,
+        pitch: (raw.width as usize).saturating_mul(3),
+        height: raw.height as usize,
+        format: turbojpeg::PixelFormat::RGB,
+    };
+    let jpeg = turbojpeg::compress(image, quality, turbojpeg::Subsamp::Sub2x2)
+        .map_err(|err| format!("Could not encode the snapshot JPEG: {err}"))?;
+    Ok(jpeg.as_ref().to_vec())
+}
+
+fn resolve_snapshot_bytes(
+    raw_frame: Option<RawFrame>,
+    image: Option<String>,
+) -> Result<Vec<u8>, String> {
+    if let Some(raw) = raw_frame {
+        compress_frame_jpeg(&raw, TRAINING_JPEG_QUALITY)
+    } else if let Some(image_str) = image {
+        jpeg_bytes(&image_str)
+    } else {
+        Err("No snapshot frame available to save.".to_string())
+    }
+}
+
 #[tauri::command]
-pub fn save_training_image(name: String, image: String) -> Result<TrainingSave, String> {
-    let bytes = jpeg_bytes(&image)?;
+pub fn save_training_image(
+    name: String,
+    image: Option<String>,
+    state: tauri::State<'_, FrameState>,
+) -> Result<TrainingSave, String> {
+    let raw_frame = {
+        let guard = state.latest.lock().unwrap_or_else(|err| err.into_inner());
+        guard.clone()
+    };
+    let bytes = resolve_snapshot_bytes(raw_frame, image)?;
     let root = local_config::project_root()?;
     save_jpeg(&root, &name, &bytes, &today_folder())
 }
@@ -500,5 +546,68 @@ mod tests {
             load_document(&project.root).unwrap()["trainingImageName"],
             "bracket"
         );
+    }
+
+    #[test]
+    fn compress_frame_jpeg_preserves_native_resolution_and_quality() {
+        use image::GenericImageView;
+
+        let width = 1920_u32;
+        let height = 1080_u32;
+        let data = vec![120_u8; (width * height * 3) as usize];
+        let raw = RawFrame {
+            width,
+            height,
+            channels: 3,
+            data,
+            timestamp_ms: 1000,
+        };
+
+        let bytes = compress_frame_jpeg(&raw, TRAINING_JPEG_QUALITY).unwrap();
+        assert!(bytes.len() >= 4);
+        assert_eq!(&bytes[..2], &[0xFF, 0xD8]);
+
+        let loaded = image::load_from_memory(&bytes).expect("valid jpeg");
+        assert_eq!(loaded.dimensions(), (width, height));
+    }
+
+    #[test]
+    fn resolve_snapshot_bytes_prefers_full_res_frame_over_preview_jpeg() {
+        use image::GenericImageView;
+
+        let native_w = 2560_u32;
+        let native_h = 1440_u32;
+        let raw = RawFrame {
+            width: native_w,
+            height: native_h,
+            channels: 3,
+            data: vec![200_u8; (native_w * native_h * 3) as usize],
+            timestamp_ms: 1234,
+        };
+
+        let preview_jpeg = tiny_jpeg(50);
+        let preview_b64 = format!("data:image/jpeg;base64,{}", STANDARD.encode(&preview_jpeg));
+
+        // When both raw_frame (native full-res) and preview image are present,
+        // it must choose the native full-res frame.
+        let bytes = resolve_snapshot_bytes(Some(raw), Some(preview_b64)).unwrap();
+        let loaded = image::load_from_memory(&bytes).expect("valid jpeg");
+        assert_eq!(loaded.dimensions(), (native_w, native_h));
+        assert_ne!(loaded.dimensions(), (1, 1));
+    }
+
+    #[test]
+    fn resolve_snapshot_bytes_falls_back_to_preview_when_frame_missing() {
+        use image::GenericImageView;
+
+        let preview_jpeg = tiny_jpeg(77);
+        let preview_b64 = format!("data:image/jpeg;base64,{}", STANDARD.encode(&preview_jpeg));
+
+        let bytes = resolve_snapshot_bytes(None, Some(preview_b64)).unwrap();
+        let loaded = image::load_from_memory(&bytes).expect("valid jpeg");
+        assert_eq!(loaded.dimensions(), (1, 1));
+
+        let err = resolve_snapshot_bytes(None, None).unwrap_err();
+        assert!(err.contains("No snapshot frame"));
     }
 }
