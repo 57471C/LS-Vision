@@ -10,6 +10,7 @@ import {
 	settingsForCamera,
 	type UvcSettings,
 } from "$lib/camera-settings";
+import { boxesFromDetect } from "$lib/detect-labels";
 // biome-ignore lint/correctness/noUnusedImports: the template uses this component
 import MeasureOverlay from "$lib/MeasureOverlay.svelte";
 import {
@@ -1317,7 +1318,24 @@ async function runDetect() {
 			height,
 		);
 		detectNote = "";
-		if (admin) void loadClassNames();
+		// Label file only. The Enter dialog still saves the JPEG.
+		const labelW = typeof snap.width === "number" ? Math.round(snap.width) : 0;
+		const labelH = typeof snap.height === "number" ? Math.round(snap.height) : 0;
+		if (labelW > 0 && labelH > 0) {
+			try {
+				await invoke("save_detect_labels", {
+					width: labelW,
+					height: labelH,
+					boxes: boxesFromDetect(body),
+				});
+			} catch (err: unknown) {
+				if (closed || gen !== detectGeneration) return;
+				detectNote = invokeMessage(err, "Could not save the label file.");
+			}
+		} else if (!closed && gen === detectGeneration) {
+			detectNote = "Could not save the label file.";
+		}
+		if (admin && gen === detectGeneration) void loadClassNames();
 	} catch (err: unknown) {
 		if (closed || gen !== detectGeneration) return;
 		detectImage = "";

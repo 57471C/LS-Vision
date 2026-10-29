@@ -61,6 +61,7 @@ pub fn run() {
             training::pick_training_folder,
             training::suggest_training_filename,
             training::save_training_image,
+            training::save_detect_labels,
             detect::detect_image,
             detect::benchmark_detect,
             detect::model_class_names,
