@@ -389,6 +389,13 @@ pub(crate) fn hold_frame(rgb: &[u8], width: u32, height: u32) {
     });
 }
 
+/// Copy of the RGB frame held for the latest preview detect.
+pub(crate) fn held_frame_rgb() -> Option<(Vec<u8>, u32, u32)> {
+    lock(&FRAME)
+        .as_ref()
+        .map(|frame| (frame.rgb.clone(), frame.width, frame.height))
+}
+
 /// Drop the held still and any marquee vector. Box embeddings are left as they are.
 pub(crate) fn clear_held_frame() {
     invalidate_marquee();
