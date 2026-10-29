@@ -69,6 +69,8 @@ pub fn run() {
             catalogue::import_catalogue,
             catalogue::list_catalogue,
             catalogue::delete_catalogue_part,
+            catalogue::preview_catalogue_crop,
+            catalogue::save_catalogue_crop,
             catalog::match_box_dino,
             dinov2::update_references,
             dinov2::list_references,

@@ -11,6 +11,10 @@ import {
 	type UvcSettings,
 } from "$lib/camera-settings";
 import { boxesFromDetect } from "$lib/detect-labels";
+import {
+	catalogueMiss,
+	readMatchThreshold,
+} from "$lib/catalogue-capture";
 // biome-ignore lint/correctness/noUnusedImports: the template uses this component
 import MeasureOverlay from "$lib/MeasureOverlay.svelte";
 import {
@@ -110,6 +114,8 @@ type DetectMark = {
 	color: string;
 	index: number;
 	embed: boolean;
+	sensor: [number, number, number, number];
+	catalogueMiss: boolean;
 };
 
 type Region = {
@@ -157,6 +163,14 @@ let saveMode: "append" | "replace" = "append";
 let saveBusy = false;
 let saveNote = "";
 let saveGeneration = 0;
+let matchThreshold = 0.7;
+let captureMark: DetectMark | null = null;
+let captureIc = "";
+let captureImage = "";
+let captureBusy = false;
+let captureNote = "";
+let captureGen = 0;
+let cataloguePress: DetectMark | null = null;
 let sourceW = 0;
 let sourceH = 0;
 let classNames: string[] = [];
@@ -626,6 +640,16 @@ function onKeyDown(event: KeyboardEvent) {
 		void saveMarquee();
 		return;
 	}
+	if (event.key === "Enter" && catalogueField(event)) {
+		event.preventDefault();
+		void saveCatalogueCrop();
+		return;
+	}
+	if (event.key === "Escape" && captureMark) {
+		event.preventDefault();
+		closeCatalogue();
+		return;
+	}
 	if (event.key === "Escape" && !snapshotOpen && detectImage) {
 		event.preventDefault();
 		clearDetect();
@@ -656,6 +680,11 @@ function onKeyUp(event: KeyboardEvent) {
 function marqueeField(event: KeyboardEvent): boolean {
 	const target = event.target;
 	return target instanceof HTMLInputElement && target.id === "marquee-ic";
+}
+
+function catalogueField(event: KeyboardEvent): boolean {
+	const target = event.target;
+	return target instanceof HTMLInputElement && target.id === "catalogue-ic";
 }
 
 function eventOnFrame(event: Event): boolean {
@@ -769,6 +798,17 @@ function cancelDraft() {
 	drawing = false;
 	marqueeDraft = null;
 	pressMark = null;
+	cataloguePress = null;
+}
+
+function closeCatalogue() {
+	captureGen += 1;
+	captureMark = null;
+	captureIc = "";
+	captureImage = "";
+	captureBusy = false;
+	captureNote = "";
+	cataloguePress = null;
 }
 
 function forgetMarquee(mode: "vector" | "frame" | "view") {
@@ -777,6 +817,7 @@ function forgetMarquee(mode: "vector" | "frame" | "view") {
 	marqueeDraft = null;
 	drawing = false;
 	pressMark = null;
+	cataloguePress = null;
 	marqueeReady = false;
 	marqueeBusy = false;
 	marqueeNote = "";
@@ -789,10 +830,19 @@ function forgetMarquee(mode: "vector" | "frame" | "view") {
 }
 
 function onPointerDown(event: PointerEvent) {
-	if (snapshotOpen || event.button !== 0) return;
+	if (snapshotOpen || captureMark || event.button !== 0) return;
 	if (spaceDown && zoom > 1) {
 		panning = true;
 		panOrigin = { x: event.clientX, y: event.clientY, panX, panY };
+		viewportEl?.setPointerCapture(event.pointerId);
+		return;
+	}
+	if (!marqueeHit && catalogueHit && eventOnFrame(event)) {
+		const point = previewPoint(event);
+		const mark = point ? topMarkAt(detectMarks, point.x, point.y) : null;
+		if (!mark?.catalogueMiss) return;
+		event.preventDefault();
+		cataloguePress = mark;
 		viewportEl?.setPointerCapture(event.pointerId);
 		return;
 	}
@@ -826,6 +876,12 @@ function onPointerUp(event: PointerEvent) {
 		panning = false;
 		return;
 	}
+	if (cataloguePress && !drawing) {
+		const mark = cataloguePress;
+		cataloguePress = null;
+		void openCatalogueCapture(mark);
+		return;
+	}
 	if (!drawing) return;
 	drawing = false;
 	const point = previewPoint(event);
@@ -839,6 +895,10 @@ function onPointerUp(event: PointerEvent) {
 		pressed,
 		MIN_MARQUEE,
 	);
+	if (pressed?.catalogueMiss && gesture.type !== "marquee") {
+		void openCatalogueCapture(pressed);
+		return;
+	}
 	if (gesture.type === "select") {
 		toggleMark(gesture.index);
 		return;
@@ -850,6 +910,7 @@ function onPointerCancel() {
 	drawing = false;
 	marqueeDraft = null;
 	pressMark = null;
+	cataloguePress = null;
 	panning = false;
 }
 
@@ -1116,7 +1177,17 @@ $: marqueeHit =
 	!spaceDown &&
 	!panning &&
 	!snapshotOpen &&
-	!scaleModal;
+	!scaleModal &&
+	!captureMark;
+$: catalogueHit =
+	!!detectImage &&
+	detectMarks.some((mark) => mark.catalogueMiss) &&
+	!lineActive &&
+	!spaceDown &&
+	!panning &&
+	!snapshotOpen &&
+	!scaleModal &&
+	!captureMark;
 
 function invokeMessage(err: unknown, fallback: string): string {
 	return typeof err === "string" && err.trim() ? err : fallback;
@@ -1164,6 +1235,7 @@ function readDetections(value: unknown): DetectMark[] {
 			confidence?: unknown;
 			bbox?: unknown;
 			embed?: unknown;
+			twoPass?: unknown;
 		};
 		const ic = typeof row.ic === "string" ? row.ic : "";
 		const confidence = typeof row.confidence === "number" ? row.confidence : 0;
@@ -1192,6 +1264,8 @@ function readDetections(value: unknown): DetectMark[] {
 			color: colorForIc(ic),
 			index: marks.length,
 			embed: row.embed === true,
+			sensor: [x1, y1, x2, y2],
+			catalogueMiss: catalogueMiss(row.twoPass, matchThreshold),
 		});
 	}
 	marks.sort((left, right) => left.confidence - right.confidence);
@@ -1228,6 +1302,7 @@ function clearDetect() {
 	sourceH = 0;
 	detectMarks = [];
 	detectNote = "";
+	closeCatalogue();
 	selected = [];
 	saveNote = "";
 	saveGeneration += 1;
@@ -1239,9 +1314,12 @@ async function refreshModel() {
 	const loadId = ++modelLoadId;
 	try {
 		const listed = await invoke<unknown>("list_vision_models");
-		const config = await invoke<{ model?: unknown }>("load_local_config");
+		const config = await invoke<{ model?: unknown; matchThreshold?: unknown }>(
+			"load_local_config",
+		);
 		if (closed || loadId !== modelLoadId) return;
 		modelReady = activeOnnx(config.model, readNames(listed)).length > 0;
+		matchThreshold = readMatchThreshold(config.matchThreshold);
 	} catch {
 		if (closed || loadId !== modelLoadId) return;
 		modelReady = false;
@@ -1263,6 +1341,7 @@ async function runDetect() {
 	const camera = index;
 	detectBusy = true;
 	detectNote = "";
+	closeCatalogue();
 	selected = [];
 	saveNote = "";
 	saveGeneration += 1;
@@ -1391,6 +1470,61 @@ function toggleMark(index: number) {
 	selected = selected.includes(index)
 		? selected.filter((item) => item !== index)
 		: [...selected, index];
+}
+
+async function openCatalogueCapture(mark: DetectMark) {
+	if (!mark.catalogueMiss) return;
+	const gen = ++captureGen;
+	captureMark = mark;
+	captureIc = "";
+	captureImage = "";
+	captureNote = "";
+	captureBusy = true;
+	if (classNames.length === 0) void loadClassNames();
+	try {
+		const body = await invoke<{ image?: unknown }>("preview_catalogue_crop", {
+			x1: mark.sensor[0],
+			y1: mark.sensor[1],
+			x2: mark.sensor[2],
+			y2: mark.sensor[3],
+		});
+		if (closed || gen !== captureGen) return;
+		captureImage = typeof body.image === "string" ? body.image : "";
+		if (!captureImage) captureNote = "Could not read that crop.";
+	} catch (err: unknown) {
+		if (closed || gen !== captureGen) return;
+		captureImage = "";
+		captureNote = invokeMessage(err, "Could not read that crop.");
+	} finally {
+		if (gen === captureGen) captureBusy = false;
+	}
+}
+
+async function saveCatalogueCrop() {
+	const mark = captureMark;
+	const ic = captureIc.trim();
+	if (!mark || captureBusy || ic.length === 0 || !captureImage) return;
+	const gen = captureGen;
+	captureBusy = true;
+	captureNote = "";
+	try {
+		const result = await invoke<{ message?: unknown }>("save_catalogue_crop", {
+			ic,
+			x1: mark.sensor[0],
+			y1: mark.sensor[1],
+			x2: mark.sensor[2],
+			y2: mark.sensor[3],
+		});
+		if (closed || gen !== captureGen) return;
+		const message = typeof result.message === "string" ? result.message.trim() : "";
+		closeCatalogue();
+		detectNote = message || "Saved to the catalogue.";
+	} catch (err: unknown) {
+		if (closed || gen !== captureGen) return;
+		captureNote = invokeMessage(err, "Could not save the crop.");
+	} finally {
+		if (gen === captureGen) captureBusy = false;
+	}
 }
 
 async function loadClassNames() {
@@ -1766,6 +1900,7 @@ onDestroy(() => {
 		bind:this={viewportEl}
 		class="relative min-h-0 flex-1 select-none overflow-hidden bg-black"
 		class:cursor-crosshair={marqueeHit}
+		class:cursor-pointer={catalogueHit && !marqueeHit}
 		class:cursor-grab={spaceDown && zoom > 1 && !panning}
 		class:cursor-grabbing={panning}
 		on:pointerdown={onPointerDown}
@@ -1808,8 +1943,9 @@ onDestroy(() => {
 			<div
 				bind:this={frameEl}
 				class="absolute z-[2] touch-none"
-				class:pointer-events-none={!marqueeHit}
+				class:pointer-events-none={!marqueeHit && !catalogueHit}
 				class:cursor-crosshair={marqueeHit}
+				class:cursor-pointer={catalogueHit && !marqueeHit}
 				style:left="{fitLeft}px"
 				style:top="{fitTop}px"
 				style:width="{fitW}px"
@@ -1818,6 +1954,7 @@ onDestroy(() => {
 				style:transform-origin="0 0"
 				data-preview-frame
 				data-marquee-hit={marqueeHit ? "true" : "false"}
+				data-catalogue-hit={catalogueHit ? "true" : "false"}
 			>
 				{#if overlayW > 0 && overlayH > 0 && (shownMarquee || (crosshairs && aim))}
 					<svg
@@ -1912,9 +2049,11 @@ onDestroy(() => {
 						fill="none"
 						stroke={mark.color}
 						stroke-width="2"
+						stroke-dasharray={mark.catalogueMiss ? "6 3" : "0"}
 						vector-effect="non-scaling-stroke"
 						pointer-events="none"
 						data-detection={mark.ic}
+						data-catalogue-miss={mark.catalogueMiss ? "true" : "false"}
 						data-selected={selected.includes(mark.index) ? "true" : "false"}
 					/>
 					<text
@@ -1959,6 +2098,15 @@ onDestroy(() => {
 										{mark.ic}
 										<span class="text-neutral-400">{mark.confidence.toFixed(2)}</span>
 									</p>
+								{/if}
+								{#if mark.catalogueMiss}
+									<button
+										type="button"
+										class="mt-0.5 px-1 text-left text-xs font-semibold text-amber-200"
+										on:click={() => openCatalogueCapture(mark)}
+									>
+										Save to catalogue
+									</button>
 								{/if}
 							</li>
 						{/each}
@@ -2067,6 +2215,71 @@ onDestroy(() => {
 					{/if}
 				</div>
 			{/if}
+		{/if}
+		{#if captureMark}
+			<div
+				class="absolute inset-0 z-[7] flex items-center justify-center bg-black/60 px-4"
+				role="dialog"
+				aria-label="Save catalogue crop"
+				on:pointerdown|stopPropagation
+			>
+				<div class="w-72 border border-neutral-700 bg-neutral-950 px-3 py-3">
+					<p class="text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+						Catalogue
+					</p>
+					<p class="mt-1 font-mono text-sm text-neutral-100">{captureMark.ic}</p>
+					{#if captureImage}
+						<img
+							src={captureImage}
+							alt="Crop"
+							class="mt-2 max-h-40 w-full border border-neutral-800 object-contain"
+						/>
+					{:else if captureBusy}
+						<p class="mt-2 text-xs text-neutral-300">Reading the crop...</p>
+					{/if}
+					<label
+						class="mt-2 flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400"
+						for="catalogue-ic"
+					>
+						IC
+						<input
+							id="catalogue-ic"
+							bind:value={captureIc}
+							list="catalogue-class-names"
+							class="border border-neutral-600 bg-neutral-950 px-2 py-1 font-mono text-sm font-medium normal-case tracking-normal text-neutral-100"
+							disabled={captureBusy}
+							autocomplete="off"
+							spellcheck="false"
+						/>
+					</label>
+					<datalist id="catalogue-class-names">
+						{#each classNames as name, nameIndex (nameIndex)}
+							<option value={name}></option>
+						{/each}
+					</datalist>
+					<div class="mt-2 flex items-center gap-2">
+						<button
+							type="button"
+							class="border border-blue-500 bg-blue-600 px-2 py-1 text-sm font-semibold text-white disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
+							disabled={captureBusy || captureIc.trim().length === 0 || !captureImage}
+							on:click={saveCatalogueCrop}
+						>
+							{captureBusy && captureImage ? "Saving..." : "Save"}
+						</button>
+						<button
+							type="button"
+							class="border border-neutral-600 bg-neutral-800 px-2 py-1 text-sm font-semibold text-neutral-100"
+							disabled={captureBusy}
+							on:click={closeCatalogue}
+						>
+							Cancel
+						</button>
+					</div>
+					{#if captureNote}
+						<p class="mt-1 text-xs text-amber-200">{captureNote}</p>
+					{/if}
+				</div>
+			</div>
 		{/if}
 		{#if failed || !painted}
 			<p class="absolute inset-0 flex items-center justify-center px-6 text-center text-sm text-neutral-300">
