@@ -11,12 +11,14 @@
 //! thresholds it (Otsu or a fixed cutoff), keeps the largest external contour,
 //! and fits a min-area rectangle. The long side is the length and the short
 //! side is the diameter. Pixels become millimetres with the camera scale,
-//! adjusted by the frame width the same way Measure does.
+//! adjusted by the frame width the same way Measure does. The same rectangle's
+//! two axes are stored as `spans` so the overlay can draw them. The contour,
+//! the thresholds, and the millimetre comparison are unchanged.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use opencv::core::{Mat, Point, RotatedRect, Vec3b, Vector};
+use opencv::core::{Mat, Point, Point2f, RotatedRect, Vec3b, Vector};
 
 const DEFAULT_MARGIN: f64 = 5.0;
 const DEFAULT_FIXED: u8 = 128;
@@ -65,6 +67,18 @@ pub enum MetrologyStatus {
     DimensionMismatch,
 }
 
+/// One measured side of the min-area rectangle, in full-frame pixels.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetrologySpan {
+    pub kind: String,
+    pub text: String,
+    pub x1: f64,
+    pub y1: f64,
+    pub x2: f64,
+    pub y2: f64,
+}
+
 /// Measured length and diameter for one matched box.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -78,9 +92,12 @@ pub struct MetrologyResult {
     pub expected_diameter_mm: Option<f64>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub expected_label: String,
-    /// Empty on a pass, so the overlay adds nothing.
+    /// Empty on a pass, so the mismatch badge is omitted.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub note: String,
+    /// Endpoints of the measured sides. Empty when the rectangle could not be read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spans: Vec<MetrologySpan>,
 }
 
 #[derive(Clone, Debug)]
@@ -387,6 +404,7 @@ fn judge(
         expected_diameter_mm: expected.diameter_mm,
         expected_label: label,
         note,
+        spans: Vec::new(),
     }
 }
 
@@ -509,21 +527,29 @@ pub(crate) fn measure_rgb(
     }
     let (x1, y1, x2, y2) = expanded_box(bbox, settings.margin_percent, width, height)?;
     let (crop, crop_w, crop_h) = crop_rgb(rgb, width, height, x1, y1, x2, y2)?;
-    let (length_px, diameter_px) = caliper(&crop, crop_w, crop_h, settings)
+    let hit = caliper(&crop, crop_w, crop_h, settings)
         .map_err(|err| eprintln!("metrology: {err}"))
         .ok()?;
-    let length_mm = length_px * mm_per_px;
-    let diameter_mm = diameter_px * mm_per_px;
+    let length_mm = hit.length_px * mm_per_px;
+    let diameter_mm = hit.diameter_px * mm_per_px;
     if !length_mm.is_finite() || !diameter_mm.is_finite() {
         return None;
     }
-    Some(judge(
+    let mut result = judge(
         length_mm,
         diameter_mm,
         expected,
         settings.length_tolerance_mm,
         settings.diameter_tolerance_mm,
-    ))
+    );
+    result.spans = spans_from_rect(
+        hit.rect,
+        f64::from(x1),
+        f64::from(y1),
+        result.length_mm,
+        result.diameter_mm,
+    );
+    Some(result)
 }
 
 fn expanded_box(
@@ -586,12 +612,18 @@ fn crop_rgb(
     Some((out, crop_w, crop_h))
 }
 
+struct CaliperHit {
+    length_px: f64,
+    diameter_px: f64,
+    rect: RotatedRect,
+}
+
 fn caliper(
     rgb: &[u8],
     width: i32,
     height: i32,
     settings: &MetrologySettings,
-) -> Result<(f64, f64), String> {
+) -> Result<CaliperHit, String> {
     let color = Mat::new_rows_cols_with_bytes::<Vec3b>(height, width, rgb)
         .map_err(|err| err.to_string())?;
     let mut gray = Mat::default();
@@ -639,7 +671,11 @@ fn caliper(
     if side_a < 1.0 || side_b < 1.0 {
         return Err("contour is too small".to_string());
     }
-    Ok((side_a.max(side_b), side_a.min(side_b)))
+    Ok(CaliperHit {
+        length_px: side_a.max(side_b),
+        diameter_px: side_a.min(side_b),
+        rect,
+    })
 }
 
 fn threshold_flags(mode: ThresholdMode, invert: bool) -> i32 {
@@ -662,6 +698,94 @@ fn rect_sides(rect: &RotatedRect) -> Result<(f64, f64), String> {
         return Err("min-area rect is empty".to_string());
     }
     Ok((width, height))
+}
+
+/// The two centre-lines of the min-area rectangle, shifted into the full frame.
+/// Length is the longer side. Diameter is the shorter side. This does not
+/// change which side was measured.
+fn spans_from_rect(
+    rect: RotatedRect,
+    origin_x: f64,
+    origin_y: f64,
+    length_mm: f64,
+    diameter_mm: f64,
+) -> Vec<MetrologySpan> {
+    let mut corners = [Point2f::new(0.0, 0.0); 4];
+    if rect.points(&mut corners).is_err() {
+        return Vec::new();
+    }
+    let width_line = midline(corners[0], corners[1], corners[2], corners[3]);
+    let height_line = midline(corners[1], corners[2], corners[3], corners[0]);
+    let width = f64::from(rect.size.width);
+    let height = f64::from(rect.size.height);
+    if !width.is_finite() || !height.is_finite() {
+        return Vec::new();
+    }
+    let (length_line, diameter_line) = if width >= height {
+        (width_line, height_line)
+    } else {
+        (height_line, width_line)
+    };
+    let mut spans = Vec::new();
+    if let Some(span) = make_span(
+        "length",
+        &format!("{} mm", one_decimal(length_mm)),
+        length_line,
+        origin_x,
+        origin_y,
+    ) {
+        spans.push(span);
+    }
+    if let Some(span) = make_span(
+        "diameter",
+        &format!("Ø {} mm", one_decimal(diameter_mm)),
+        diameter_line,
+        origin_x,
+        origin_y,
+    ) {
+        spans.push(span);
+    }
+    spans
+}
+
+fn midline(a: Point2f, b: Point2f, c: Point2f, d: Point2f) -> (f64, f64, f64, f64) {
+    (
+        (f64::from(a.x) + f64::from(b.x)) * 0.5,
+        (f64::from(a.y) + f64::from(b.y)) * 0.5,
+        (f64::from(c.x) + f64::from(d.x)) * 0.5,
+        (f64::from(c.y) + f64::from(d.y)) * 0.5,
+    )
+}
+
+fn make_span(
+    kind: &str,
+    text: &str,
+    line: (f64, f64, f64, f64),
+    origin_x: f64,
+    origin_y: f64,
+) -> Option<MetrologySpan> {
+    let (x1, y1, x2, y2) = line;
+    let points = [x1 + origin_x, y1 + origin_y, x2 + origin_x, y2 + origin_y];
+    if points.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    let dx = points[2] - points[0];
+    let dy = points[3] - points[1];
+    if dx * dx + dy * dy < 1.0 {
+        return None;
+    }
+    Some(MetrologySpan {
+        kind: kind.to_string(),
+        text: text.to_string(),
+        x1: round2(points[0]),
+        y1: round2(points[1]),
+        x2: round2(points[2]),
+        y2: round2(points[3]),
+    })
+}
+
+fn round2(value: f64) -> f64 {
+    (value * 100.0).round() / 100.0
 }
 
 fn opencv_ready() -> bool {
@@ -800,7 +924,10 @@ mod tests {
         let pass = judge(40.1, 6.2, &expected, 1.5, 0.8);
         assert_eq!(pass.status, MetrologyStatus::Pass);
         assert!(pass.note.is_empty());
-        assert!(serde_json::to_value(&pass).unwrap().get("note").is_none());
+        assert!(pass.spans.is_empty());
+        let value = serde_json::to_value(&pass).unwrap();
+        assert!(value.get("note").is_none());
+        assert!(value.get("spans").is_none());
     }
 
     #[test]
@@ -884,6 +1011,41 @@ mod tests {
             "{}",
             result.diameter_mm
         );
+        let length_span = result
+            .spans
+            .iter()
+            .find(|span| span.kind == "length")
+            .expect("length span");
+        let diameter_span = result
+            .spans
+            .iter()
+            .find(|span| span.kind == "diameter")
+            .expect("diameter span");
+        assert_eq!(
+            length_span.text,
+            format!("{} mm", one_decimal(result.length_mm))
+        );
+        assert!(diameter_span.text.starts_with("Ø "));
+        assert!(diameter_span.text.ends_with(" mm"));
+        let length_dx = length_span.x2 - length_span.x1;
+        let length_dy = length_span.y2 - length_span.y1;
+        let diameter_dx = diameter_span.x2 - diameter_span.x1;
+        let diameter_dy = diameter_span.y2 - diameter_span.y1;
+        assert!(
+            length_dx.abs() > 80.0 && length_dy.abs() < 5.0,
+            "length line {length_dx},{length_dy}"
+        );
+        assert!(
+            diameter_dy.abs() > 20.0 && diameter_dx.abs() < 5.0,
+            "diameter line {diameter_dx},{diameter_dy}"
+        );
+        let dot = length_dx * diameter_dx + length_dy * diameter_dy;
+        let lengths = (length_dx * length_dx + length_dy * length_dy).sqrt()
+            * (diameter_dx * diameter_dx + diameter_dy * diameter_dy).sqrt();
+        assert!((dot / lengths).abs() < 0.15, "axes are not perpendicular");
+        let mid_x = (length_span.x1 + length_span.x2) / 2.0;
+        let mid_y = (length_span.y1 + length_span.y2) / 2.0;
+        assert!((mid_x - 90.0).abs() < 8.0 && (mid_y - 65.0).abs() < 8.0);
 
         let fixed = measure_rgb(
             &rgb,
@@ -924,6 +1086,13 @@ mod tests {
             result.note
         );
         assert!(result.note.contains("mm"));
+        assert_eq!(result.spans.len(), 2);
+        assert!(
+            result
+                .spans
+                .iter()
+                .any(|span| span.kind == "diameter" && span.text.starts_with("Ø "))
+        );
     }
 
     #[test]

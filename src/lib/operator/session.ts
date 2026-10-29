@@ -24,7 +24,7 @@ import {
 	withAllSlotsDisabled,
 	withSlotEnabled,
 } from "$lib/detect-rois";
-import { readMetrologyResult } from "$lib/metrology";
+import { readMetrologyResult, scaleMetrology } from "$lib/metrology";
 import {
 	appendConsoleLine,
 	consoleStamp,
@@ -469,6 +469,7 @@ function attachSession(
 			return {
 				...item,
 				bbox: [x1 * sx, y1 * sy, x2 * sx, y2 * sy],
+				metrology: scaleMetrology(item.metrology, sx, sy),
 			};
 		});
 	}

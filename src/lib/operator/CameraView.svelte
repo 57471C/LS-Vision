@@ -10,6 +10,8 @@ import {
 	overlayLabel,
 	type TwoPassMatch,
 } from "$lib/catalog-match";
+// biome-ignore lint/correctness/noUnusedImports: the template uses this component
+import DimensionMarks from "$lib/DimensionMarks.svelte";
 import { type DetectRoi, overlayDetections, slotColor } from "$lib/detect-rois";
 // biome-ignore lint/correctness/noUnusedImports: the template uses this component
 import MeasureOverlay from "$lib/MeasureOverlay.svelte";
@@ -22,7 +24,13 @@ import {
 	measureFrameBox,
 	measureReadout,
 } from "$lib/measure";
-import { mismatchNote } from "$lib/metrology";
+import {
+	type DimensionMark,
+	layoutDimensions,
+	metrologySpans,
+	mismatchNote,
+	readMetrologyResult,
+} from "$lib/metrology";
 import {
 	detectionCounts,
 	extraPartCount,
@@ -88,6 +96,7 @@ type DetectionMark = {
 	noteY: number;
 	noteW: number;
 	noteH: number;
+	dimensions: DimensionMark[];
 };
 
 // OpenCV stored these as BGR.
@@ -204,6 +213,34 @@ function detectionMarks(
 			noteY = Math.max(originY, y - noteH);
 		if (note && noteX + noteW > imageRight)
 			noteX = Math.max(originX, imageRight - noteW);
+		const avoids = [
+			{
+				x: item.consumed ? x : labelX,
+				y: item.consumed ? y : labelY,
+				w: labelW,
+				h: labelH,
+			},
+		];
+		if (note) avoids.push({ x: noteX, y: noteY, w: noteW, h: noteH });
+		if (item.slot) avoids.push({ x, y, w: 14, h: 14 });
+		const dimensions = layoutDimensions(
+			metrologySpans(item.metrology).map((span) => ({
+				...span,
+				x1: originX + span.x1 * scale,
+				y1: originY + span.y1 * scale,
+				x2: originX + span.x2 * scale,
+				y2: originY + span.y2 * scale,
+			})),
+			readMetrologyResult(item.metrology)?.status === "DIMENSION_MISMATCH",
+			avoids,
+			{
+				x: originX,
+				y: originY,
+				w: paneWidth * scale,
+				h: paneHeight * scale,
+			},
+			1,
+		);
 		const tint = item.slot ? slotColor(item.slot).stroke : "";
 		marks.push({
 			key: `${item.slot ?? 0}:${index}:${item.ic}:${x1}:${y1}`,
@@ -233,6 +270,7 @@ function detectionMarks(
 			noteY,
 			noteW,
 			noteH,
+			dimensions,
 		});
 	}
 	return marks;
@@ -662,6 +700,7 @@ $: bannerCount = (wrongParts ? 1 : 0) + (extraParts > 0 ? 1 : 0);
 										</text>
 									{/if}
 								{/if}
+								<DimensionMarks marks={mark.dimensions} />
 								{#if mark.slot}
 									<rect
 										x={mark.x}
