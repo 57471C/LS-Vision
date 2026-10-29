@@ -422,6 +422,40 @@ check(
 		labelled.detections[0]?.catalogMatch?.label === "FAST-00124 (94%)",
 );
 
+const measured = applyPartRules(
+	[
+		{
+			...box("Hinge_Plate", [0, 0, 100, 80]),
+			metrology: {
+				status: "DIMENSION_MISMATCH",
+				lengthMm: 25.2,
+				diameterMm: 6,
+				note: "Expected M6x40, measured 25.2 mm",
+				spans: [
+					{
+						kind: "length",
+						text: "25.2 mm",
+						x1: 0,
+						y1: 40,
+						x2: 100,
+						y2: 40,
+					},
+				],
+			},
+		},
+		box("P02_Logo", [10, 10, 30, 30]),
+	],
+	[hingeRules[0]],
+);
+check(
+	"a metrology result stays on the box when a part rule renames it",
+	measured.detections[0]?.ic === "2QHP02" &&
+		measured.detections[0]?.metrology?.status === "DIMENSION_MISMATCH" &&
+		measured.detections[0]?.metrology?.note ===
+			"Expected M6x40, measured 25.2 mm" &&
+		measured.detections[0]?.metrology?.spans?.[0]?.text === "25.2 mm",
+);
+
 if (failed > 0) {
 	throw new Error(`${failed} part composition checks failed`);
 }

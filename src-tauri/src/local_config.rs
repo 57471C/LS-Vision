@@ -201,6 +201,15 @@ fn default_config() -> Value {
         "scanSeconds": 8,
         "testMode": false,
         "skipResultSave": true,
+        "metrology": {
+            "enabled": false,
+            "marginPercent": 5,
+            "thresholdMode": "otsu",
+            "fixedThreshold": 128,
+            "minContourAreaPx": 200,
+            "lengthToleranceMm": 1.5,
+            "diameterToleranceMm": 0.8
+        },
         "detectRoi": null,
         "detectRois": [null, null, null, null],
         "barcodeRoi": null,
@@ -826,6 +835,13 @@ mod tests {
         assert_eq!(document["partRules"], serde_json::json!([]));
         assert_eq!(document["inferenceEp"], "directml");
         assert_eq!(document["useOpenVino"], false);
+        assert_eq!(document["metrology"]["enabled"], false);
+        assert_eq!(document["metrology"]["thresholdMode"], "otsu");
+        assert_eq!(document["metrology"]["marginPercent"], 5);
+        assert_eq!(document["metrology"]["fixedThreshold"], 128);
+        assert_eq!(document["metrology"]["minContourAreaPx"], 200);
+        assert_eq!(document["metrology"]["lengthToleranceMm"], 1.5);
+        assert_eq!(document["metrology"]["diameterToleranceMm"], 0.8);
         assert_eq!(document["trainingDir"], "");
         assert_eq!(document["trainingImageName"], "");
         assert_eq!(document["scanSeconds"], 8);

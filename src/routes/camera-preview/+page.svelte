@@ -10,11 +10,10 @@ import {
 	settingsForCamera,
 	type UvcSettings,
 } from "$lib/camera-settings";
+import { catalogueMiss, readMatchThreshold } from "$lib/catalogue-capture";
+// biome-ignore lint/correctness/noUnusedImports: the template uses this component
+import DimensionMarks from "$lib/DimensionMarks.svelte";
 import { boxesFromDetect } from "$lib/detect-labels";
-import {
-	catalogueMiss,
-	readMatchThreshold,
-} from "$lib/catalogue-capture";
 // biome-ignore lint/correctness/noUnusedImports: the template uses this component
 import MeasureOverlay from "$lib/MeasureOverlay.svelte";
 import {
@@ -22,14 +21,22 @@ import {
 	formatPxMm,
 	formatReadout,
 	formatScale,
-	imagePoint,
 	type ImageLine,
+	imagePoint,
 	lineLength,
 	type MeasureDraw,
 	measureReadout,
 	parseMillimetres,
 	scaleFromLength,
 } from "$lib/measure";
+import {
+	layoutDimensions,
+	type MetrologySpan,
+	metrologySpans,
+	mismatchNote,
+	type OverlayBox,
+	readMetrologyResult,
+} from "$lib/metrology";
 import { marqueeGesture, topMarkAt } from "$lib/preview-marquee";
 
 const PREVIEW_CHANNEL = "ls-vision-camera-preview";
@@ -116,6 +123,9 @@ type DetectMark = {
 	embed: boolean;
 	sensor: [number, number, number, number];
 	catalogueMiss: boolean;
+	metrologyNote: string;
+	metrologyMismatch: boolean;
+	spans: MetrologySpan[];
 };
 
 type Region = {
@@ -1266,6 +1276,11 @@ function readDetections(value: unknown): DetectMark[] {
 			embed: row.embed === true,
 			sensor: [x1, y1, x2, y2],
 			catalogueMiss: catalogueMiss(row.twoPass, matchThreshold),
+			metrologyNote: mismatchNote((item as { metrology?: unknown }).metrology),
+			metrologyMismatch:
+				readMetrologyResult((item as { metrology?: unknown }).metrology)
+					?.status === "DIMENSION_MISMATCH",
+			spans: metrologySpans((item as { metrology?: unknown }).metrology),
 		});
 	}
 	marks.sort((left, right) => left.confidence - right.confidence);
@@ -1289,7 +1304,44 @@ function scaleMarks(
 		y: mark.y * sy,
 		w: mark.w * sx,
 		h: mark.h * sy,
+		spans: mark.spans.map((span) => ({
+			...span,
+			x1: span.x1 * sx,
+			y1: span.y1 * sy,
+			x2: span.x2 * sx,
+			y2: span.y2 * sy,
+		})),
 	}));
+}
+
+function previewAvoids(mark: DetectMark): OverlayBox[] {
+	const boxes: OverlayBox[] = [
+		{
+			x: mark.x,
+			y: mark.y,
+			w: Math.max(24, mark.ic.length * 10),
+			h: 20,
+		},
+	];
+	if (mark.metrologyNote) {
+		boxes.push({
+			x: mark.x,
+			y: mark.y + mark.h + 4,
+			w: Math.ceil(mark.metrologyNote.length * 9.6) + 12,
+			h: 22,
+		});
+	}
+	return boxes;
+}
+
+function dimensionMarks(mark: DetectMark) {
+	return layoutDimensions(
+		mark.spans,
+		mark.metrologyMismatch,
+		previewAvoids(mark),
+		{ x: 0, y: 0, w: detectW, h: detectH },
+		fitW > 0 && detectW > 0 ? detectW / fitW : 1,
+	);
 }
 
 function clearDetect() {
@@ -1399,7 +1451,8 @@ async function runDetect() {
 		detectNote = "";
 		// Label file only. The Enter dialog still saves the JPEG.
 		const labelW = typeof snap.width === "number" ? Math.round(snap.width) : 0;
-		const labelH = typeof snap.height === "number" ? Math.round(snap.height) : 0;
+		const labelH =
+			typeof snap.height === "number" ? Math.round(snap.height) : 0;
 		if (labelW > 0 && labelH > 0) {
 			try {
 				await invoke("save_detect_labels", {
@@ -1516,7 +1569,8 @@ async function saveCatalogueCrop() {
 			y2: mark.sensor[3],
 		});
 		if (closed || gen !== captureGen) return;
-		const message = typeof result.message === "string" ? result.message.trim() : "";
+		const message =
+			typeof result.message === "string" ? result.message.trim() : "";
 		closeCatalogue();
 		detectNote = message || "Saved to the catalogue.";
 	} catch (err: unknown) {
@@ -2028,6 +2082,7 @@ onDestroy(() => {
 				aria-hidden="true"
 			>
 				{#each detectMarks as mark, markIndex (`${markIndex}:${mark.ic}`)}
+					{@const dims = dimensionMarks(mark)}
 					{#if selected.includes(mark.index)}
 						<rect
 							x={mark.x}
@@ -2056,6 +2111,7 @@ onDestroy(() => {
 						data-catalogue-miss={mark.catalogueMiss ? "true" : "false"}
 						data-selected={selected.includes(mark.index) ? "true" : "false"}
 					/>
+					<DimensionMarks marks={dims} />
 					<text
 						x={mark.x}
 						y={mark.y + 16}
@@ -2067,6 +2123,26 @@ onDestroy(() => {
 					>
 						{mark.ic}
 					</text>
+					{#if mark.metrologyNote}
+						<rect
+							x={mark.x}
+							y={mark.y + mark.h + 4}
+							width={Math.ceil(mark.metrologyNote.length * 9.6) + 12}
+							height="22"
+							fill="#dc2626"
+							data-metrology="DIMENSION_MISMATCH"
+						/>
+						<text
+							x={mark.x + 6}
+							y={mark.y + mark.h + 20}
+							fill="#ffffff"
+							font-size="16"
+							font-family="ui-monospace, monospace"
+							font-weight="600"
+						>
+							{mark.metrologyNote}
+						</text>
+					{/if}
 				{/each}
 			</svg>
 			<div
@@ -2107,6 +2183,9 @@ onDestroy(() => {
 									>
 										Save to catalogue
 									</button>
+								{/if}
+								{#if mark.metrologyNote}
+									<p class="px-1 text-xs font-semibold text-red-200">{mark.metrologyNote}</p>
 								{/if}
 							</li>
 						{/each}

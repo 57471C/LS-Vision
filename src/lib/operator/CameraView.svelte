@@ -10,6 +10,8 @@ import {
 	overlayLabel,
 	type TwoPassMatch,
 } from "$lib/catalog-match";
+// biome-ignore lint/correctness/noUnusedImports: the template uses this component
+import DimensionMarks from "$lib/DimensionMarks.svelte";
 import { type DetectRoi, overlayDetections, slotColor } from "$lib/detect-rois";
 // biome-ignore lint/correctness/noUnusedImports: the template uses this component
 import MeasureOverlay from "$lib/MeasureOverlay.svelte";
@@ -22,6 +24,13 @@ import {
 	measureFrameBox,
 	measureReadout,
 } from "$lib/measure";
+import {
+	type DimensionMark,
+	layoutDimensions,
+	metrologySpans,
+	mismatchNote,
+	readMetrologyResult,
+} from "$lib/metrology";
 import {
 	detectionCounts,
 	extraPartCount,
@@ -61,6 +70,7 @@ type Detection = {
 	slot?: number;
 	catalogMatch?: CatalogMatch;
 	twoPass?: TwoPassMatch;
+	metrology?: unknown;
 };
 
 type DetectionMark = {
@@ -81,6 +91,12 @@ type DetectionMark = {
 	dashed: boolean;
 	labelInk: string;
 	slot?: number;
+	note: string;
+	noteX: number;
+	noteY: number;
+	noteW: number;
+	noteH: number;
+	dimensions: DimensionMark[];
 };
 
 // OpenCV stored these as BGR.
@@ -186,6 +202,45 @@ function detectionMarks(
 			labelX = Math.max(originX, imageRight - labelW);
 		if (labelY + labelH > imageBottom)
 			labelY = Math.max(originY, imageBottom - labelH);
+		const note = item.consumed ? "" : mismatchNote(item.metrology);
+		const noteW = note
+			? Math.ceil(note.length * LABEL_FONT * 0.62) + LABEL_PAD_X * 2
+			: 0;
+		const noteH = note ? LABEL_FONT + LABEL_PAD_Y * 2 : 0;
+		let noteX = x;
+		let noteY = y + h + 2;
+		if (note && noteY + noteH > imageBottom)
+			noteY = Math.max(originY, y - noteH);
+		if (note && noteX + noteW > imageRight)
+			noteX = Math.max(originX, imageRight - noteW);
+		const avoids = [
+			{
+				x: item.consumed ? x : labelX,
+				y: item.consumed ? y : labelY,
+				w: labelW,
+				h: labelH,
+			},
+		];
+		if (note) avoids.push({ x: noteX, y: noteY, w: noteW, h: noteH });
+		if (item.slot) avoids.push({ x, y, w: 14, h: 14 });
+		const dimensions = layoutDimensions(
+			metrologySpans(item.metrology).map((span) => ({
+				...span,
+				x1: originX + span.x1 * scale,
+				y1: originY + span.y1 * scale,
+				x2: originX + span.x2 * scale,
+				y2: originY + span.y2 * scale,
+			})),
+			readMetrologyResult(item.metrology)?.status === "DIMENSION_MISMATCH",
+			avoids,
+			{
+				x: originX,
+				y: originY,
+				w: paneWidth * scale,
+				h: paneHeight * scale,
+			},
+			1,
+		);
 		const tint = item.slot ? slotColor(item.slot).stroke : "";
 		marks.push({
 			key: `${item.slot ?? 0}:${index}:${item.ic}:${x1}:${y1}`,
@@ -210,6 +265,12 @@ function detectionMarks(
 			child: item.consumed === true,
 			dashed: style?.dashed === true,
 			labelInk: style?.labelInk ?? "#ffffff",
+			note,
+			noteX,
+			noteY,
+			noteW,
+			noteH,
+			dimensions,
 		});
 	}
 	return marks;
@@ -617,7 +678,29 @@ $: bannerCount = (wrongParts ? 1 : 0) + (extraParts > 0 ? 1 : 0);
 									>
 										{mark.label}
 									</text>
+									{#if mark.note}
+										<rect
+											x={mark.noteX}
+											y={mark.noteY}
+											width={mark.noteW}
+											height={mark.noteH}
+											fill="#dc2626"
+											data-metrology="DIMENSION_MISMATCH"
+										/>
+										<text
+											x={mark.noteX + LABEL_PAD_X}
+											y={mark.noteY + mark.noteH / 2}
+											fill="#ffffff"
+											font-size={LABEL_FONT}
+											font-family="ui-monospace, monospace"
+											font-weight="600"
+											dominant-baseline="central"
+										>
+											{mark.note}
+										</text>
+									{/if}
 								{/if}
+								<DimensionMarks marks={mark.dimensions} />
 								{#if mark.slot}
 									<rect
 										x={mark.x}

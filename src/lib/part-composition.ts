@@ -4,6 +4,7 @@
 // The first match renames that parent box. A result IC is not matched again.
 
 import type { CatalogMatch, TwoPassMatch } from "$lib/catalog-match";
+import type { MetrologyResult } from "$lib/metrology";
 
 export const PART_RULE_LIMIT = 40;
 export const PART_LABEL_LIMIT = 80;
@@ -29,6 +30,8 @@ export type PartBox = {
 	catalogMatch?: CatalogMatch;
 	// Kept from detection. A part rule rename does not clear it.
 	twoPass?: TwoPassMatch;
+	// Kept from detection. A part rule rename does not clear it.
+	metrology?: MetrologyResult;
 };
 
 export type PartComposition = {

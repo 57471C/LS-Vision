@@ -24,6 +24,7 @@ import {
 	withAllSlotsDisabled,
 	withSlotEnabled,
 } from "$lib/detect-rois";
+import { readMetrologyResult, scaleMetrology } from "$lib/metrology";
 import {
 	appendConsoleLine,
 	consoleStamp,
@@ -316,6 +317,9 @@ function attachSession(
 				(row as { catalogMatch?: unknown }).catalogMatch,
 			);
 			const twoPass = readTwoPass((row as { twoPass?: unknown }).twoPass);
+			const metrology = readMetrologyResult(
+				(row as { metrology?: unknown }).metrology,
+			);
 			found.push({
 				ic: row.ic,
 				confidence: typeof row.confidence === "number" ? row.confidence : 0,
@@ -323,6 +327,7 @@ function attachSession(
 				referenceMatch,
 				catalogMatch,
 				twoPass,
+				metrology,
 			});
 		}
 		return found;
@@ -464,6 +469,7 @@ function attachSession(
 			return {
 				...item,
 				bbox: [x1 * sx, y1 * sy, x2 * sx, y2 * sy],
+				metrology: scaleMetrology(item.metrology, sx, sy),
 			};
 		});
 	}

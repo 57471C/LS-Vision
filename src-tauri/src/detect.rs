@@ -75,6 +75,10 @@ struct Detection {
     /// Two-pass catalogue result. Absent only before matching runs.
     #[serde(default, rename = "twoPass", skip_serializing_if = "Option::is_none")]
     two_pass: Option<crate::catalog::TwoPassMatch>,
+    /// Length and diameter after a catalogue match. Absent when metrology is
+    /// off, the box is unrecognized, or the crop could not be measured.
+    #[serde(default, rename = "metrology", skip_serializing_if = "Option::is_none")]
+    metrology: Option<crate::metrology::MetrologyResult>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -962,6 +966,7 @@ fn detections_from_output(
             embed: None,
             catalog_match: None,
             two_pass: None,
+            metrology: None,
         });
         items.push(DetectedItem {
             ic,
@@ -1785,6 +1790,7 @@ fn detect_pixels(
                         cutoff,
                         include_candidates,
                     );
+                    apply_metrology(document.as_ref(), rgb, width, height, &mut found.detections);
                     Ok(detection_value(found, dinov2, catalog))
                 }
                 Err(message) => Ok(failure(&model_status_message(&message))),
@@ -1833,6 +1839,7 @@ fn detect_pixels(
                     cutoff,
                     include_candidates,
                 );
+                apply_metrology(document.as_ref(), rgb, width, height, &mut found.detections);
                 let mut row = detection_value(found, dinov2, catalog);
                 if let Some(object) = row.as_object_mut() {
                     object.insert("slot".to_string(), json!(slot));
@@ -1904,6 +1911,47 @@ fn log_dinov2_embeddings(
         held.resize_with(detections.len(), || None);
     }
     (embedded.lines, if hold { held } else { Vec::new() })
+}
+
+/// Measure catalogue matches when Settings > Capture has metrology on.
+/// Unrecognized boxes stay without a `metrology` field.
+fn apply_metrology(
+    document: Option<&Value>,
+    rgb: &[u8],
+    width: u32,
+    height: u32,
+    detections: &mut [Detection],
+) {
+    if detections.is_empty() {
+        return;
+    }
+    let boxes: Vec<crate::metrology::BoxMeasure> = detections
+        .iter()
+        .map(|item| {
+            let resolved = item.two_pass.as_ref().and_then(|pass| {
+                let catalogue_hit = matches!(
+                    pass.status,
+                    crate::catalog::MatchStatus::MatchedBom
+                        | crate::catalog::MatchStatus::WrongPart
+                );
+                let ic = pass.resolved_ic.as_deref().unwrap_or("").trim();
+                if catalogue_hit && !ic.is_empty() {
+                    Some(ic.to_string())
+                } else {
+                    None
+                }
+            });
+            crate::metrology::BoxMeasure {
+                bbox: item.bbox,
+                matched: resolved.is_some(),
+                ic: resolved.unwrap_or_default(),
+            }
+        })
+        .collect();
+    let measured = crate::metrology::measure_boxes(document, rgb, width, height, &boxes);
+    for (detection, result) in detections.iter_mut().zip(measured) {
+        detection.metrology = result;
+    }
 }
 
 /// Name each box from the imported catalogue. An empty catalogue is "No Match"
