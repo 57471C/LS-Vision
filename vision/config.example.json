@@ -36,6 +36,7 @@
 	"barcodeRoi": null,
 	"model": "best.pt",
 	"confidence": 0.45,
+	"detector": "auto",
 	"matchThreshold": 0.7,
 	"partRules": [],
 	"inferenceEp": "directml",

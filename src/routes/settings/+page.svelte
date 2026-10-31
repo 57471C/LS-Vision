@@ -144,6 +144,15 @@ let catalogDebug = false;
 let catalogDebugNotice = "";
 let catalogDebugGeneration = 0;
 let catalogDebugChain: Promise<void> = Promise.resolve();
+const DETECTOR_OPTIONS = [
+	{ value: "auto", label: "Auto" },
+	{ value: "yolo", label: "YOLO" },
+	{ value: "rf-detr", label: "RF-DETR" },
+] as const;
+let detector = "auto";
+let detectorNotice = "";
+let detectorGeneration = 0;
+let detectorChain: Promise<void> = Promise.resolve();
 let inferenceProviders: string[] = ["cpu"];
 let inferenceEp = "cpu";
 let inferenceActive = "cpu";
@@ -728,9 +737,44 @@ function queueMatchSave() {
 	}, 200);
 }
 
+function normalizeDetector(value: unknown): string {
+	if (value === "yolo" || value === "rf-detr") return value;
+	return "auto";
+}
+
+function detectorSaved(choice: string): string {
+	if (choice === "yolo") return "Saved. Decoder is YOLO.";
+	if (choice === "rf-detr") return "Saved. Decoder is RF-DETR.";
+	return "Saved. Decoder is Auto.";
+}
+
+function onDetectorChange() {
+	const choice = detector;
+	const generation = ++detectorGeneration;
+	detectorChain = detectorChain
+		.catch(() => undefined)
+		.then(() => persistDetector(choice, generation));
+}
+
+async function persistDetector(choice: string, generation: number) {
+	detectorNotice = "";
+	try {
+		const current = await loadDocument();
+		if (generation !== detectorGeneration) return;
+		current.detector = choice;
+		await storeDocument(current);
+		if (generation !== detectorGeneration) return;
+		detectorNotice = detectorSaved(choice);
+	} catch (err: unknown) {
+		if (generation !== detectorGeneration) return;
+		detectorNotice = invokeError(err, "Could not save the decoder");
+	}
+}
+
 async function loadMatchThreshold() {
 	const generation = matchGeneration;
 	const debugGeneration = catalogDebugGeneration;
+	const decoderGeneration = detectorGeneration;
 	try {
 		const data = await loadDocument();
 		if (generation !== matchGeneration) return;
@@ -741,6 +785,9 @@ async function loadMatchThreshold() {
 		);
 		if (debugGeneration === catalogDebugGeneration) {
 			catalogDebug = data.catalogDebug === true;
+		}
+		if (decoderGeneration === detectorGeneration) {
+			detector = normalizeDetector(data.detector);
 		}
 	} catch (err: unknown) {
 		if (generation !== matchGeneration) return;
@@ -3520,6 +3567,24 @@ onDestroy(() => {
 								<p class="text-sm text-neutral-400">
 									Models are stored in the app data models folder. Update model copies an .onnx file over the selected .onnx name, or over best.onnx. The next detection loads that file.
 								</p>
+								<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+									Decoder
+									<select
+										class="border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
+										bind:value={detector}
+										on:change={onDetectorChange}
+									>
+										{#each DETECTOR_OPTIONS as option (option.value)}
+											<option value={option.value}>{option.label}</option>
+										{/each}
+									</select>
+								</label>
+								<p class="text-sm text-neutral-400">
+									Auto reads the file name and the ONNX outputs. YOLO and RF-DETR force that decoder. The next detection uses the saved choice.
+								</p>
+								{#if detectorNotice}
+									<p class="text-sm text-neutral-200">{detectorNotice}</p>
+								{/if}
 								<div class="flex items-center gap-3">
 									<span class="w-28 shrink-0 text-sm font-medium normal-case tracking-normal text-neutral-100">
 										Confidence

@@ -9,6 +9,10 @@
 5. Export to ONNX (`best.onnx`). The desktop app does not run the Python training environment.
 6. In Settings > Training, use Update model to copy that `.onnx` file into the app data models folder, then select the model and the Inference EP. A `.pt` selection warns and does not detect.
 
+## Decoder
+
+Settings > Training > Decoder is Auto, YOLO, or RF-DETR. Auto is the default. It uses the file name (`yolo`, `rfdetr`, `rf-detr`, or `incomplete`) and the ONNX output layout. A clear layout wins when the name disagrees. An RF-DETR export (`dets` and `labels`) is stretched to the model size and ImageNet-normalised. The saved confidence applies to both decoders. An export without NMS uses the same class-aware NMS as YOLO. A YOLO graph stays on the letterbox decoder. A file with no class-name metadata labels each box with its class index.
+
 ## Compounding
 
 You can continue training from `best.pt` as new part ICs are added. Keep the same Label Studio project and update `data.yaml` names list. Obsolete parts can be removed from the names list and the model retrained, or left in place if they no longer appear in BoMs.

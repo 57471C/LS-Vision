@@ -30,6 +30,7 @@ use crate::vision::letterbox::{
     DetectedItem, DetectionResponse, LetterboxTransform, TensorNormalization,
     normalization_from_metadata, yolo_tensor,
 };
+use crate::vision::rfdetr::{self, DetectorChoice, DetectorKind, OutputPort};
 
 const DEFAULT_CONFIDENCE: f32 = 0.45;
 const MIN_CONFIDENCE: f32 = 0.15;
@@ -103,6 +104,19 @@ struct PreparedView {
     transform: LetterboxTransform,
     origin_x: i32,
     origin_y: i32,
+    image_size: usize,
+    kind: DetectorKind,
+    view_w: u32,
+    view_h: u32,
+    apply_nms: bool,
+}
+
+/// How one frame is resized and which decoder reads the session outputs.
+struct ViewPlan {
+    image_size: usize,
+    normalization: TensorNormalization,
+    kind: DetectorKind,
+    apply_nms: bool,
 }
 
 struct Decoded {
@@ -144,6 +158,10 @@ struct LoadedModel {
     requested: Provider,
     provider: Provider,
     openvino: bool,
+    /// Decoder chosen from the file name and the output layout. Cached with the session.
+    auto_kind: DetectorKind,
+    /// True when an output name already says the graph ran NMS.
+    nms_in_graph: bool,
     session: ort::session::Session,
 }
 
@@ -1340,6 +1358,14 @@ fn finish_model(
         (names, end_to_end, normalization)
     };
     let image_size = input_image_size(&session);
+    let output_ports = session_output_ports(&session);
+    let auto_kind = rfdetr::resolve_auto(&name, &output_ports);
+    let nms_in_graph = rfdetr::graph_has_nms(&output_ports);
+    eprintln!(
+        "Detector {name}: {} ({})",
+        auto_kind.as_str(),
+        rfdetr::describe_ports(&output_ports)
+    );
     let message = if provider == requested {
         String::new()
     } else {
@@ -1359,6 +1385,8 @@ fn finish_model(
         requested,
         provider,
         openvino,
+        auto_kind,
+        nms_in_graph,
         session,
     })
 }
@@ -1480,12 +1508,44 @@ pub(crate) fn reload_session() -> Result<(), String> {
     }
 }
 
+fn session_output_ports(session: &ort::session::Session) -> Vec<OutputPort> {
+    session
+        .outputs()
+        .iter()
+        .map(|outlet| OutputPort {
+            name: outlet.name().to_string(),
+            shape: outlet
+                .dtype()
+                .tensor_shape()
+                .map(|shape| shape.to_vec())
+                .unwrap_or_default(),
+        })
+        .collect()
+}
+
 /// Saved `tensorNormalization`. A missing or unknown value leaves the model metadata in charge.
 fn tensor_normalization_override(document: &Value) -> Option<TensorNormalization> {
     document
         .get("tensorNormalization")
         .and_then(Value::as_str)
         .and_then(TensorNormalization::parse)
+}
+
+fn view_rgb(
+    rgb: &[u8],
+    width: u32,
+    height: u32,
+    roi: Option<&Roi>,
+) -> (Vec<u8>, usize, usize, i32, i32) {
+    let width = width as usize;
+    let height = height as usize;
+    // The slot crop is the image the detector sees. Its origin is added after
+    // the boxes are mapped back, so the returned boxes are native sensor pixels.
+    if let Some(roi) = roi {
+        crop_rgb(rgb, width, height, roi)
+    } else {
+        (rgb.to_vec(), width, height, 0, 0)
+    }
 }
 
 fn detect_view(
@@ -1496,15 +1556,7 @@ fn detect_view(
     image_size: usize,
     normalization: TensorNormalization,
 ) -> Result<PreparedView, String> {
-    let width = width as usize;
-    let height = height as usize;
-    // The slot crop is the image YOLO sees. Its origin is stored here and added
-    // only after unpad, so the returned boxes are native sensor pixels.
-    let (view, view_w, view_h, origin_x, origin_y) = if let Some(roi) = roi {
-        crop_rgb(rgb, width, height, roi)
-    } else {
-        (rgb.to_vec(), width, height, 0, 0)
-    };
+    let (view, view_w, view_h, origin_x, origin_y) = view_rgb(rgb, width, height, roi);
     let (data, transform) = yolo_tensor(
         &view,
         view_w as u32,
@@ -1518,24 +1570,173 @@ fn detect_view(
         transform,
         origin_x,
         origin_y,
+        image_size,
+        kind: DetectorKind::Yolo,
+        view_w: view_w as u32,
+        view_h: view_h as u32,
+        apply_nms: false,
     })
+}
+
+/// Stretch the view to the model size and apply ImageNet normalisation.
+/// RF-DETR boxes are normalised to that stretched image, not to a gray letterbox.
+fn rfdetr_view(
+    rgb: &[u8],
+    width: u32,
+    height: u32,
+    roi: Option<&Roi>,
+    image_size: usize,
+    apply_nms: bool,
+) -> Result<PreparedView, String> {
+    if !(1..=4096).contains(&image_size) {
+        return Err("Detect failed: RF-DETR input size is invalid".to_string());
+    }
+    let (view, view_w, view_h, origin_x, origin_y) = view_rgb(rgb, width, height, roi);
+    let resized = resize_linear(&view, view_w, view_h, image_size, image_size);
+    let data = rfdetr::imagenet_tensor(&resized, image_size, image_size)?;
+    let transform = LetterboxTransform {
+        orig_w: view_w as f32,
+        orig_h: view_h as f32,
+        target_size: image_size as f32,
+        gain: 1.0,
+        pad_x: 0.0,
+        pad_y: 0.0,
+        scaled_w: view_w as f32,
+        scaled_h: view_h as f32,
+    };
+    Ok(PreparedView {
+        data,
+        transform,
+        origin_x,
+        origin_y,
+        image_size,
+        kind: DetectorKind::RfDetr,
+        view_w: view_w as u32,
+        view_h: view_h as u32,
+        apply_nms,
+    })
+}
+
+fn prepare_view(
+    rgb: &[u8],
+    width: u32,
+    height: u32,
+    roi: Option<&Roi>,
+    plan: &ViewPlan,
+) -> Result<PreparedView, String> {
+    match plan.kind {
+        DetectorKind::Yolo => {
+            detect_view(rgb, width, height, roi, plan.image_size, plan.normalization)
+        }
+        DetectorKind::RfDetr => {
+            rfdetr_view(rgb, width, height, roi, plan.image_size, plan.apply_nms)
+        }
+    }
+}
+
+fn candidate_from_rf(item: &rfdetr::RfBox) -> Candidate {
+    Candidate {
+        x1: item.x1,
+        y1: item.y1,
+        x2: item.x2,
+        y2: item.y2,
+        score: item.score,
+        class_id: item.class_id,
+    }
+}
+
+fn decoded_from_rfdetr(
+    boxes: Vec<rfdetr::RfBox>,
+    names: &[String],
+    origin_x: i32,
+    origin_y: i32,
+    apply_nms: bool,
+) -> Decoded {
+    let chosen: Vec<Candidate> = boxes.iter().map(candidate_from_rf).collect();
+    let chosen = if apply_nms { nms(chosen) } else { chosen };
+    let mut detections = Vec::with_capacity(chosen.len());
+    let mut items = Vec::with_capacity(chosen.len());
+    let ox = origin_x as f32;
+    let oy = origin_y as f32;
+    for item in chosen {
+        let sensor = [item.x1 + ox, item.y1 + oy, item.x2 + ox, item.y2 + oy];
+        let ic = class_name(names, item.class_id);
+        let confidence = round_places(f64::from(item.score), 4);
+        detections.push(Detection {
+            ic: ic.clone(),
+            confidence,
+            bbox: round_sensor_box(sensor),
+            reference_match: None,
+            embed: None,
+            catalog_match: None,
+            two_pass: None,
+            metrology: None,
+            class_id: item.class_id,
+        });
+        items.push(DetectedItem {
+            ic,
+            confidence,
+            bbox: sensor,
+            polygon: Vec::new(),
+        });
+    }
+    Decoded { detections, items }
+}
+
+fn rfdetr_from_outputs(
+    outputs: &ort::session::SessionOutputs<'_>,
+    prepared: &PreparedView,
+    names: &[String],
+    conf_threshold: f32,
+) -> Result<Decoded, String> {
+    let mut packed = Vec::new();
+    for (name, value) in outputs.iter() {
+        let (shape, values) = value
+            .try_extract_tensor::<f32>()
+            .map_err(|err| format!("Detect failed: {}", short_error(&err.to_string())))?;
+        if shape.len() > 3 {
+            continue;
+        }
+        packed.push(rfdetr::TensorOut {
+            name: name.to_string(),
+            shape: shape.to_vec(),
+            values: values.to_vec(),
+        });
+    }
+    let boxes = rfdetr::decode_tensors(
+        &packed,
+        names,
+        prepared.view_w as f32,
+        prepared.view_h as f32,
+        conf_threshold,
+    )?;
+    Ok(decoded_from_rfdetr(
+        boxes,
+        names,
+        prepared.origin_x,
+        prepared.origin_y,
+        prepared.apply_nms,
+    ))
 }
 
 fn infer_detections(
     model: &mut LoadedModel,
+    prepared: &PreparedView,
     data: Vec<f32>,
-    image_size: usize,
-    transform: LetterboxTransform,
-    origin_x: i32,
-    origin_y: i32,
     conf_threshold: f32,
 ) -> Result<Decoded, String> {
-    let tensor = ort::value::Tensor::from_array(([1usize, 3, image_size, image_size], data))
-        .map_err(|err| format!("Detect failed: {}", short_error(&err.to_string())))?;
+    let tensor = ort::value::Tensor::from_array((
+        [1usize, 3, prepared.image_size, prepared.image_size],
+        data,
+    ))
+    .map_err(|err| format!("Detect failed: {}", short_error(&err.to_string())))?;
     let outputs = model
         .session
         .run(ort::inputs![tensor])
         .map_err(|err| format!("Detect failed: {}", short_error(&err.to_string())))?;
+    if prepared.kind == DetectorKind::RfDetr {
+        return rfdetr_from_outputs(&outputs, prepared, &model.names, conf_threshold);
+    }
     let (shape, values) = outputs[0]
         .try_extract_tensor::<f32>()
         .map_err(|err| format!("Detect failed: {}", short_error(&err.to_string())))?;
@@ -1545,9 +1746,9 @@ fn infer_detections(
         &model.names,
         model.end_to_end,
         OutputFrame {
-            transform,
-            origin_x,
-            origin_y,
+            transform: prepared.transform,
+            origin_x: prepared.origin_x,
+            origin_y: prepared.origin_y,
         },
         conf_threshold,
     )
@@ -1575,45 +1776,38 @@ fn run_inference(
     conf_threshold: f32,
     document: Option<&Value>,
 ) -> Result<Inference, String> {
-    let (image_size, normalization) = with_model(path, |model| {
-        Ok((
-            model.image_size,
-            document
+    let choice = document
+        .map(rfdetr::choice_from_document)
+        .unwrap_or(DetectorChoice::Auto);
+    let plan = with_model(path, |model| {
+        let kind = choice.resolve(model.auto_kind);
+        Ok(ViewPlan {
+            image_size: model.image_size,
+            normalization: document
                 .and_then(tensor_normalization_override)
                 .unwrap_or(model.normalization),
-        ))
+            apply_nms: kind == DetectorKind::RfDetr && !model.nms_in_graph,
+            kind,
+        })
     })?;
-    let prepared = detect_view(rgb, width, height, roi, image_size, normalization)?;
-    infer_prepared(path, image_size, prepared, conf_threshold)
+    let prepared = prepare_view(rgb, width, height, roi, &plan)?;
+    infer_prepared(path, prepared, conf_threshold)
 }
 
 fn infer_prepared(
     path: &Path,
-    image_size: usize,
-    prepared: PreparedView,
+    mut prepared: PreparedView,
     conf_threshold: f32,
 ) -> Result<Inference, String> {
-    let PreparedView {
-        data,
-        transform,
-        origin_x,
-        origin_y,
-    } = prepared;
+    let transform = prepared.transform;
     with_model(path, |model| {
         let retry = if model.provider == Provider::Cpu {
             None
         } else {
-            Some(data.clone())
+            Some(prepared.data.clone())
         };
-        let found = match infer_detections(
-            model,
-            data,
-            image_size,
-            transform,
-            origin_x,
-            origin_y,
-            conf_threshold,
-        ) {
+        let data = std::mem::take(&mut prepared.data);
+        let found = match infer_detections(model, &prepared, data, conf_threshold) {
             Ok(found) => found,
             Err(message) => {
                 let Some(retry) = retry else {
@@ -1635,15 +1829,7 @@ fn infer_prepared(
                         failed.label()
                     ),
                 );
-                infer_detections(
-                    model,
-                    retry,
-                    image_size,
-                    transform,
-                    origin_x,
-                    origin_y,
-                    conf_threshold,
-                )?
+                infer_detections(model, &prepared, retry, conf_threshold)?
             }
         };
         // The same names this session used to label boxes. Empty gaps are dropped.
@@ -2120,7 +2306,12 @@ pub async fn benchmark_detect() -> Result<DetectBenchmark, String> {
 fn run_benchmark() -> Result<DetectBenchmark, String> {
     let root = local_config::project_root()?;
     let model_path = active_onnx_path(&root)?;
-    benchmark_files(&model_path, &benchmark_image(&root)?).map_err(|err| model_status_message(&err))
+    let choice = local_config::load_document(&root)
+        .ok()
+        .map(|document| rfdetr::choice_from_document(&document))
+        .unwrap_or(DetectorChoice::Auto);
+    benchmark_files(&model_path, &benchmark_image(&root)?, choice)
+        .map_err(|err| model_status_message(&err))
 }
 
 fn benchmark_image(root: &Path) -> Result<PathBuf, String> {
@@ -2199,20 +2390,33 @@ fn timed_session(model: &mut LoadedModel, data: &[f32], image_size: usize) -> Re
         .session
         .run(ort::inputs![tensor])
         .map_err(|err| format!("Detect failed: {}", short_error(&err.to_string())))?;
-    let _values = outputs[0]
-        .try_extract_tensor::<f32>()
-        .map_err(|err| format!("Detect failed: {}", short_error(&err.to_string())))?;
+    for index in 0..outputs.len() {
+        let _values = outputs[index]
+            .try_extract_tensor::<f32>()
+            .map_err(|err| format!("Detect failed: {}", short_error(&err.to_string())))?;
+    }
     Ok(started.elapsed().as_secs_f64() * 1000.0)
 }
 
-fn benchmark_files(model_path: &Path, image_path: &Path) -> Result<DetectBenchmark, String> {
+fn benchmark_files(
+    model_path: &Path,
+    image_path: &Path,
+    choice: DetectorChoice,
+) -> Result<DetectBenchmark, String> {
     let bytes = std::fs::read(image_path)
         .map_err(|_| format!("Could not read {}.", file_name(image_path)))?;
     let (rgb, width, height) = decode_rgb(&bytes)?;
-    let (image_size, normalization) = with_model(model_path, |model| {
-        Ok((model.image_size, model.normalization))
+    let plan = with_model(model_path, |model| {
+        let kind = choice.resolve(model.auto_kind);
+        Ok(ViewPlan {
+            image_size: model.image_size,
+            normalization: model.normalization,
+            apply_nms: kind == DetectorKind::RfDetr && !model.nms_in_graph,
+            kind,
+        })
     })?;
-    let prepared = detect_view(&rgb, width, height, None, image_size, normalization)?;
+    let prepared = prepare_view(&rgb, width, height, None, &plan)?;
+    let image_size = prepared.image_size;
     let data = prepared.data;
     let (provider, times) = with_model(model_path, |model| {
         let mut times = Vec::with_capacity(BENCHMARK_RUNS);
@@ -2341,6 +2545,43 @@ mod tests {
             Some(TensorNormalization::ZeroToOne)
         );
         assert!(tensor_normalization_override(&json!({"tensorNormalization": "nope"})).is_none());
+    }
+
+    #[test]
+    fn rfdetr_nms_collapses_one_class_and_keeps_the_crop_origin() {
+        let boxes = vec![
+            rfdetr::RfBox {
+                x1: 10.0,
+                y1: 20.0,
+                x2: 30.0,
+                y2: 40.0,
+                score: 0.9,
+                class_id: 0,
+            },
+            rfdetr::RfBox {
+                x1: 10.0,
+                y1: 20.0,
+                x2: 30.0,
+                y2: 40.0,
+                score: 0.8,
+                class_id: 0,
+            },
+            rfdetr::RfBox {
+                x1: 10.0,
+                y1: 20.0,
+                x2: 30.0,
+                y2: 40.0,
+                score: 0.7,
+                class_id: 1,
+            },
+        ];
+        let decoded =
+            decoded_from_rfdetr(boxes, &["bolt".to_string(), "nut".to_string()], 5, 7, true);
+        assert_eq!(decoded.detections.len(), 2);
+        assert_eq!(decoded.detections[0].ic, "bolt");
+        assert_eq!(decoded.detections[0].bbox, [15, 27, 35, 47]);
+        assert_eq!(decoded.detections[1].ic, "nut");
+        assert_eq!(decoded.detections[1].class_id, 1);
     }
 
     #[test]
@@ -2618,6 +2859,56 @@ mod tests {
         assert!(payload_bytes("data:image/jpeg;base64,@@@").is_err());
     }
 
+    fn rfdetr_model_path() -> Option<PathBuf> {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            let named = PathBuf::from(appdata)
+                .join("studio.lean.ls-vision")
+                .join("models")
+                .join("incomplete-21-10-26.onnx");
+            if named.is_file() {
+                return Some(named);
+            }
+        }
+        let trainer = PathBuf::from(r"C:\Scripts\LS-Trainer\runs\detect\RF-DETR-m\RF-D-m-2e.onnx");
+        if trainer.is_file() {
+            return Some(trainer);
+        }
+        None
+    }
+
+    #[test]
+    fn rfdetr_example3_returns_boxes() {
+        let Some(model) = rfdetr_model_path() else {
+            eprintln!("skip: no RF-DETR ONNX next to the app or the trainer run");
+            return;
+        };
+        let image = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("project root")
+            .join("vision")
+            .join("test-images")
+            .join("Example3.jpg");
+        if !image.is_file() {
+            eprintln!("skip: Example3.jpg is not in the checkout");
+            return;
+        }
+        let bytes = std::fs::read(&image).unwrap();
+        let payload = detect_on_model(&bytes, &model, None, 0.45).unwrap();
+        let got: Vec<Detection> = serde_json::from_value(payload["detections"].clone()).unwrap();
+        assert!(
+            !got.is_empty(),
+            "{} returned no boxes at 0.45",
+            model.display()
+        );
+        eprintln!(
+            "rf-detr {} boxes at 0.45 on Example3.jpg, first {} {:.3} {:?}",
+            got.len(),
+            got[0].ic,
+            got[0].confidence,
+            got[0].bbox
+        );
+    }
+
     #[test]
     fn example3_onnx_boxes_match_python() {
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -2800,7 +3091,7 @@ mod tests {
             eprintln!("skip: best.onnx or Example3.jpg is not in the checkout");
             return;
         }
-        let report = benchmark_files(&model, &image).unwrap();
+        let report = benchmark_files(&model, &image, DetectorChoice::Auto).unwrap();
         assert_eq!(report.image, "Example3.jpg");
         assert_eq!((report.width, report.height), (2016, 1512));
         assert!(report.min_ms <= report.average_ms && report.average_ms <= report.max_ms);
