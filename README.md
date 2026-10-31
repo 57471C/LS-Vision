@@ -39,6 +39,7 @@ Version 0.4.4 runs inference, the camera, barcode decode, and BoM lookup in the 
 
 Recent additions:
 
+- Settings > Training > Decoder is Auto, YOLO, or RF-DETR. Auto reads the file name and the ONNX outputs. An RF-DETR export is stretched and ImageNet-normalised. A YOLO graph keeps the letterbox decoder.
 - Settings > Camera > Preview, while admin is unlocked, draws a marquee on the detected still and saves that crop to the DINOv2 catalogue. A short press on a box still selects it. Crosshairs is optional, off by default, and shows the pointer in pixels and millimetres.
 - Set scale and Measure draw a straight line with a 1px tick at each end. Saving camera settings keeps a stored scale and the detect regions when that save does not mention them.
 - Settings > Training > Update model copies an `.onnx` file into `%APPDATA%\studio.lean.ls-vision\models`. Dev and the installed app share that folder. A file that is not ONNX is refused, and a missing model is reported on the operator page.
