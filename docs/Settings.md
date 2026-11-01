@@ -32,7 +32,13 @@ Training lists `.pt` and `.onnx` files in the app data models folder. Update mod
 
 ## Part rules
 
-Update references, above the part rules, opens a native file dialog that accepts `.tar`. The archive contains `catalogue.json` and JPEG crops under `crops/`, including `crops/<IC>/<file>.jpg`. Each crop is embedded with the DINOv2 model already loaded at startup. The IC, description, type, dimensions, crop paths, and embeddings are written to `vision/catalogue.json`, beside `vision/config.local.json`. The JPEGs are copied under `vision/catalogue-crops/`. The next start loads that file. Success says "Catalogue loaded N parts." Cancel says "No file selected." A bad archive, a missing DINOv2 model, or a write error leaves the saved catalogue in place and shows an error toast.
+Update references, above the part rules, opens a native file dialog that accepts `.tar`. The archive contains `catalogue.json` and JPEG crops under `crops/`, including `crops/<IC>/<file>.jpg`. Each crop is embedded with the DINOv2 model already loaded at startup. The IC, description, type, dimensions, crop paths, and embeddings are written to `vision/catalogue.json`, beside `vision/config.local.json`. The JPEGs are copied under `vision/catalogue-crops/`. The next start loads that file.
+
+The default import adds item codes from the tar and updates item codes that are already on this PC. Parts and crops that are only on this PC stay, including crops an admin added from the camera preview. Nothing that is missing from the tar is deleted. A non-empty description, type, or measurement method from the tar updates that field. An empty field leaves the saved value. Success says "Catalogue updated. N parts on this PC."
+
+Fully replace catalogue is a checkbox on that same block. It is not saved. When it is checked, Update references opens a warning first. The warning says the import will replace the entire catalogue, and that admin-added crops and any parts not in the tar will be permanently removed. Replace continues to the file dialog and then installs the tar as the whole catalogue. Cancel closes the warning and leaves the catalogue untouched. Cancelling the file dialog does the same. Success says "Catalogue loaded N parts."
+
+Cancel on the file dialog says "No file selected." A bad archive, a missing DINOv2 model, or a write error leaves the saved catalogue in place and shows an error toast. The same is true when a merge cannot read a crop that is already on this PC.
 
 View references lists every imported part. Each row shows the IC and description, the type and dimensions when they are present, and a thumbnail of the first crop, or a small gallery when there are several. Delete removes that part. The dialog does not edit the other fields. A missing or empty catalogue says "No references loaded."
 

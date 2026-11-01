@@ -5,6 +5,9 @@
 //! the DINOv2 session that startup already opened. The result is written to
 //! `vision/catalogue.json`, beside `vision/config.local.json`, and the JPEGs
 //! are copied under `vision/catalogue-crops/`. Startup loads that file.
+//! The default import updates item codes that are in the tar and adds new
+//! ones. Parts and crops that are only on this PC stay. Full replace, after
+//! the page confirms it, writes the tar as the whole catalogue.
 //! Detection and the camera preview keep using `vision/dinov2-references.json`.
 //!
 //! A catalogue entry looks like this:
@@ -151,17 +154,25 @@ pub struct CatalogueList {
     pub parts: Vec<CatalogueView>,
 }
 
-/// Native tar picker, then embed each crop and replace the saved catalogue.
+/// Native tar picker, then embed each crop.
+///
+/// `replace` false, the default, updates item codes that are in the tar and
+/// adds new ones. Parts and crops that are only on this PC stay.
+/// `replace` true writes the tar as the whole catalogue.
 /// Cancel leaves the saved file and the in-memory catalogue as they are.
 /// The dialog runs off the main thread. A panic becomes a status string.
 #[tauri::command]
-pub async fn import_catalogue(app: AppHandle) -> Result<CatalogueUpdate, String> {
+pub async fn import_catalogue(
+    app: AppHandle,
+    replace: Option<bool>,
+) -> Result<CatalogueUpdate, String> {
+    let replace = replace.unwrap_or(false);
     let vision = vision_directory()?;
     let path = catalogue_path(&vision);
     log_catalogue_path(&path);
     let joined = tauri::async_runtime::spawn_blocking(move || {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            install_picked_catalogue(app, vision)
+            install_picked_catalogue(app, vision, replace)
         }))
     })
     .await;
@@ -171,7 +182,11 @@ pub async fn import_catalogue(app: AppHandle) -> Result<CatalogueUpdate, String>
     }
 }
 
-fn install_picked_catalogue(app: AppHandle, vision: PathBuf) -> Result<CatalogueUpdate, String> {
+fn install_picked_catalogue(
+    app: AppHandle,
+    vision: PathBuf,
+    replace: bool,
+) -> Result<CatalogueUpdate, String> {
     let path = catalogue_path(&vision);
     let mut picker = app
         .dialog()
@@ -208,14 +223,20 @@ fn install_picked_catalogue(app: AppHandle, vision: PathBuf) -> Result<Catalogue
     }
     let bytes =
         fs::read(&source).map_err(|err| format!("Could not read the tar archive: {err}"))?;
-    let count = import_tar_bytes(&bytes, &vision, &mut embed_jpeg)?;
+    let count = import_tar_bytes(&bytes, &vision, replace, &mut embed_jpeg)?;
     eprintln!(
-        "DINOv2 catalogue loaded: {count} parts from {}",
+        "DINOv2 catalogue {}: {count} parts from {}",
+        if replace { "replaced" } else { "updated" },
         path.display()
     );
+    let message = if replace {
+        format!("Catalogue loaded {count} parts.")
+    } else {
+        format!("Catalogue updated. {count} parts on this PC.")
+    };
     Ok(CatalogueUpdate {
         parts: count,
-        message: format!("Catalogue loaded {count} parts."),
+        message,
         path: path.display().to_string(),
     })
 }
@@ -466,9 +487,15 @@ fn embed_jpeg(bytes: &[u8]) -> Result<Vec<f32>, String> {
 fn import_tar_bytes(
     bytes: &[u8],
     vision: &Path,
+    replace: bool,
     embed: &mut dyn FnMut(&[u8]) -> Result<Vec<f32>, String>,
 ) -> Result<usize, String> {
     let built = build_from_tar(bytes, embed)?;
+    let built = if replace {
+        built
+    } else {
+        merge_with_saved(vision, built)?
+    };
     let count = built.book.parts.len();
     commit_book(vision, &built)?;
     *lock(&CATALOGUE) = built.book;
@@ -1057,6 +1084,172 @@ fn stored_crop_name(key: &str, index: usize) -> String {
     format!("{index}-{clean}")
 }
 
+/// Update item codes that are in `incoming` and add the rest.
+/// Parts and crops that are only in the saved catalogue stay.
+/// A missing saved file installs `incoming` as it is.
+/// A read error returns before anything is written.
+fn merge_with_saved(vision: &Path, incoming: Built) -> Result<Built, String> {
+    let Some(existing) = load_book(vision)? else {
+        return Ok(incoming);
+    };
+    let mut incoming_files: HashMap<String, Vec<u8>> = incoming.files.into_iter().collect();
+    let mut indexes = HashMap::new();
+    for (index, part) in incoming.book.parts.iter().enumerate() {
+        indexes.insert(part.ic.clone(), index);
+    }
+    let mut consumed = HashSet::new();
+    let mut used = HashSet::new();
+    let mut parts = Vec::with_capacity(existing.parts.len() + incoming.book.parts.len());
+    let mut files = Vec::new();
+    for old in existing.parts {
+        if let Some(index) = indexes.get(&old.ic).copied() {
+            consumed.insert(index);
+            parts.push(fuse_part(
+                &old,
+                &incoming.book.parts[index],
+                vision,
+                &mut incoming_files,
+                &mut files,
+                &mut used,
+            )?);
+        } else {
+            keep_part_files(vision, &old, &mut files, &mut used)?;
+            parts.push(old);
+        }
+    }
+    for (index, part) in incoming.book.parts.into_iter().enumerate() {
+        if consumed.contains(&index) {
+            continue;
+        }
+        for crop in &part.crops {
+            let bytes = incoming_files
+                .remove(crop)
+                .ok_or_else(|| "Could not write the catalogue.".to_string())?;
+            push_crop_file(&mut files, &mut used, crop.clone(), bytes)?;
+        }
+        parts.push(part);
+    }
+    if parts.len() > MAX_PARTS {
+        return Err("The catalogue has too many parts.".to_string());
+    }
+    Ok(Built {
+        book: Book { parts },
+        files,
+    })
+}
+
+/// Tar crops replace a saved crop with the same original file name.
+/// Any other saved crop on that item code stays, including an admin crop.
+fn fuse_part(
+    old: &Part,
+    new_part: &Part,
+    vision: &Path,
+    incoming_files: &mut HashMap<String, Vec<u8>>,
+    files: &mut Vec<(String, Vec<u8>)>,
+    used: &mut HashSet<String>,
+) -> Result<Part, String> {
+    let incoming_keys: HashSet<String> = new_part
+        .crops
+        .iter()
+        .map(|crop| crop_match_key(crop))
+        .collect();
+    let mut crops = Vec::new();
+    let mut embeddings = Vec::new();
+    for (crop, embedding) in new_part.crops.iter().zip(&new_part.embeddings) {
+        let bytes = incoming_files
+            .remove(crop)
+            .ok_or_else(|| "Could not write the catalogue.".to_string())?;
+        crops.push(crop.clone());
+        embeddings.push(embedding.clone());
+        push_crop_file(files, used, crop.clone(), bytes)?;
+    }
+    for (crop, embedding) in old.crops.iter().zip(&old.embeddings) {
+        if incoming_keys.contains(&crop_match_key(crop)) {
+            continue;
+        }
+        let bytes = read_kept_crop(vision, crop)?;
+        crops.push(crop.clone());
+        embeddings.push(embedding.clone());
+        push_crop_file(files, used, crop.clone(), bytes)?;
+    }
+    if crops.len() > MAX_CROPS {
+        return Err(format!("Part {} has too many crops.", old.ic));
+    }
+    Ok(Part {
+        ic: old.ic.clone(),
+        description: prefer_text(&new_part.description, &old.description),
+        kind: prefer_text(&new_part.kind, &old.kind),
+        measurement_method: prefer_text(&new_part.measurement_method, &old.measurement_method),
+        dimensions: if new_part.dimensions.is_null() {
+            old.dimensions.clone()
+        } else {
+            new_part.dimensions.clone()
+        },
+        crops,
+        embeddings,
+    })
+}
+
+fn prefer_text(incoming: &str, saved: &str) -> String {
+    if incoming.is_empty() {
+        saved.to_string()
+    } else {
+        incoming.to_string()
+    }
+}
+
+/// `{index}-{original name}` is a crop written by a tar import.
+/// `crop-1.jpg` is an admin save and keeps its whole file name.
+fn crop_match_key(relative: &str) -> String {
+    let file = relative.rsplit(['/', '\\']).next().unwrap_or(relative);
+    match file.split_once('-') {
+        Some((index, rest))
+            if !index.is_empty()
+                && !rest.is_empty()
+                && index.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            rest.to_string()
+        }
+        _ => file.to_string(),
+    }
+}
+
+fn keep_part_files(
+    vision: &Path,
+    part: &Part,
+    files: &mut Vec<(String, Vec<u8>)>,
+    used: &mut HashSet<String>,
+) -> Result<(), String> {
+    for crop in &part.crops {
+        let bytes = read_kept_crop(vision, crop)?;
+        push_crop_file(files, used, crop.clone(), bytes)?;
+    }
+    Ok(())
+}
+
+fn read_kept_crop(vision: &Path, crop: &str) -> Result<Vec<u8>, String> {
+    let path =
+        crop_file(vision, crop).ok_or_else(|| "Could not read the catalogue.".to_string())?;
+    let bytes = fs::read(&path).map_err(|err| format!("Could not read the catalogue: {err}"))?;
+    if bytes.len() < 3 || bytes[0] != 0xff || bytes[1] != 0xd8 {
+        return Err("Could not read the catalogue.".to_string());
+    }
+    Ok(bytes)
+}
+
+fn push_crop_file(
+    files: &mut Vec<(String, Vec<u8>)>,
+    used: &mut HashSet<String>,
+    relative: String,
+    bytes: Vec<u8>,
+) -> Result<(), String> {
+    if !used.insert(relative.clone()) {
+        return Err("Could not write the catalogue.".to_string());
+    }
+    files.push((relative, bytes));
+    Ok(())
+}
+
 fn commit_book(vision: &Path, built: &Built) -> Result<(), String> {
     fs::create_dir_all(vision).map_err(|err| format!("Could not write the catalogue: {err}"))?;
     let incoming = vision.join(format!("{CROPS_DIR}.incoming"));
@@ -1498,7 +1691,7 @@ mod tests {
             ("readme.txt", b"ignore me"),
         ]);
         let dir = temp_dir("import");
-        let count = import_tar_bytes(&bytes, &dir, &mut stub_embed).unwrap();
+        let count = import_tar_bytes(&bytes, &dir, false, &mut stub_embed).unwrap();
         assert_eq!(count, 2);
         let book = load_book(&dir).unwrap().unwrap();
         assert_eq!(book.parts.len(), 2);
@@ -1543,7 +1736,7 @@ mod tests {
             ),
             ("crops/a.jpg", jpeg.as_slice()),
         ]);
-        import_tar_bytes(&first, &dir, &mut stub_embed).unwrap();
+        import_tar_bytes(&first, &dir, false, &mut stub_embed).unwrap();
         let before = fs::read(catalogue_path(&dir)).unwrap();
         let second = pack(&[
             (
@@ -1552,7 +1745,7 @@ mod tests {
             ),
             ("pack/crops/b.jpg", jpeg.as_slice()),
         ]);
-        let err = import_tar_bytes(&second, &dir, &mut |_| {
+        let err = import_tar_bytes(&second, &dir, false, &mut |_| {
             Err("DINOv2 model is not loaded.".to_string())
         })
         .unwrap_err();
@@ -1688,7 +1881,10 @@ mod tests {
         let embedding = vec![3.0_f32, 4.0];
         let ic = append_catalogue_crop(&dir, "FAST-1", &jpeg, &embedding).unwrap();
         assert_eq!(ic, "FAST-1");
-        let crop = dir.join("catalogue-crops").join("FAST-1").join("crop-1.jpg");
+        let crop = dir
+            .join("catalogue-crops")
+            .join("FAST-1")
+            .join("crop-1.jpg");
         assert_eq!(fs::read(&crop).unwrap(), jpeg);
         let book = load_book(&dir).unwrap().unwrap();
         assert_eq!(book.parts.len(), 1);
@@ -1697,21 +1893,18 @@ mod tests {
         assert_eq!(book.parts[0].crops.len(), 1);
         assert_eq!(book.parts[0].embeddings, vec![embedding.clone()]);
         assert!(!dir.join("dinov2-references.json").exists());
-        assert!(
-            fs::read_dir(&dir)
-                .unwrap()
-                .filter_map(Result::ok)
-                .all(|entry| entry.path().extension().and_then(|ext| ext.to_str()) != Some("txt"))
-        );
+        assert!(fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .all(|entry| entry.path().extension().and_then(|ext| ext.to_str()) != Some("txt")));
 
         let again = append_catalogue_crop(&dir, "FAST-1", &jpeg, &embedding).unwrap();
         assert_eq!(again, "FAST-1");
-        assert!(
-            dir.join("catalogue-crops")
-                .join("FAST-1")
-                .join("crop-2.jpg")
-                .is_file()
-        );
+        assert!(dir
+            .join("catalogue-crops")
+            .join("FAST-1")
+            .join("crop-2.jpg")
+            .is_file());
         assert_eq!(load_book(&dir).unwrap().unwrap().parts[0].crops.len(), 2);
 
         let entries = crate::catalog::read_catalogue(&dir.join("catalogue.json"));
@@ -1728,12 +1921,11 @@ mod tests {
         let fresh = append_catalogue_crop(&dir, "NEW-9", &jpeg, &embedding).unwrap();
         assert_eq!(fresh, "NEW-9");
         assert_eq!(load_book(&dir).unwrap().unwrap().parts.len(), 2);
-        assert!(
-            dir.join("catalogue-crops")
-                .join("NEW-9")
-                .join("crop-1.jpg")
-                .is_file()
-        );
+        assert!(dir
+            .join("catalogue-crops")
+            .join("NEW-9")
+            .join("crop-1.jpg")
+            .is_file());
 
         let err = append_catalogue_crop(&dir, "  ", &jpeg, &embedding).unwrap_err();
         assert!(err.to_ascii_lowercase().contains("ic"));
@@ -1840,6 +2032,227 @@ mod tests {
         assert!(plain_book.parts[0].measurement_method.is_empty());
         let plain_json: Value = serde_json::from_slice(&book_json(&plain_book).unwrap()).unwrap();
         assert!(plain_json["parts"][0].get("measurementMethod").is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_keeps_local_parts_and_updates_matching_codes() {
+        let dir = temp_dir("merge");
+        let jpeg = tiny_jpeg();
+        let mut updated = jpeg.clone();
+        updated.push(1);
+        let rules = br#"{"partRules":[{"parent":"nut"}]}"#;
+        let references = br#"{"version":1,"vectors":{}}"#;
+        fs::write(dir.join("config.local.json"), rules).unwrap();
+        fs::write(dir.join("dinov2-references.json"), references).unwrap();
+        let first = pack(&[
+            (
+                "catalogue.json",
+                br#"{
+                    "parts": [
+                        {"ic":"KEEP","description":"Local only","crops":["crops/keep.jpg"]},
+                        {
+                            "ic":"BOTH",
+                            "description":"Old text",
+                            "type":"nut",
+                            "dimensions": { "acrossFlats": 13 },
+                            "crops":["crops/both.jpg"]
+                        },
+                        {"ic":"SPARSE","description":"Keep me","crops":["crops/sparse.jpg"]}
+                    ]
+                }"#,
+            ),
+            ("crops/keep.jpg", jpeg.as_slice()),
+            ("crops/both.jpg", jpeg.as_slice()),
+            ("crops/sparse.jpg", jpeg.as_slice()),
+        ]);
+        import_tar_bytes(&first, &dir, true, &mut stub_embed).unwrap();
+        append_catalogue_crop(&dir, "BOTH", &jpeg, &[9.0, 0.0]).unwrap();
+        append_catalogue_crop(&dir, "ADMIN", &jpeg, &[8.0, 0.0]).unwrap();
+
+        let second = pack(&[
+            (
+                "catalogue.json",
+                br#"{
+                    "parts": [
+                        {"ic":"BOTH","description":"New text","crops":["crops/both.jpg"]},
+                        {"ic":"SPARSE","description":"","crops":["crops/sparse.jpg"]},
+                        {"ic":"NEW","description":"Added","crops":["crops/new.jpg"]}
+                    ]
+                }"#,
+            ),
+            ("crops/both.jpg", updated.as_slice()),
+            ("crops/sparse.jpg", jpeg.as_slice()),
+            ("crops/new.jpg", jpeg.as_slice()),
+        ]);
+        let count = import_tar_bytes(&second, &dir, false, &mut stub_embed).unwrap();
+        assert_eq!(count, 5);
+        let book = load_book(&dir).unwrap().unwrap();
+        let ics: Vec<_> = book.parts.iter().map(|part| part.ic.as_str()).collect();
+        assert_eq!(ics, vec!["KEEP", "BOTH", "SPARSE", "ADMIN", "NEW"]);
+        assert_eq!(book.parts[0].description, "Local only");
+        assert!(dir.join(&book.parts[0].crops[0]).is_file());
+
+        let both = &book.parts[1];
+        assert_eq!(both.description, "New text");
+        assert_eq!(both.kind, "nut");
+        assert_eq!(both.dimensions["acrossFlats"], serde_json::json!(13));
+        assert_eq!(both.crops.len(), 2);
+        assert!(both.crops[0].ends_with("both.jpg"));
+        assert!(both.crops[1].ends_with("crop-1.jpg"));
+        assert_eq!(both.embeddings[0][3], updated.len() as f32);
+        assert_eq!(both.embeddings[1], vec![9.0, 0.0]);
+        assert!(dir.join(&both.crops[0]).is_file());
+        assert!(dir.join(&both.crops[1]).is_file());
+        assert_eq!(book.parts[2].description, "Keep me");
+        assert_eq!(book.parts[3].ic, "ADMIN");
+        assert_eq!(book.parts[3].embeddings, vec![vec![8.0, 0.0]]);
+        assert!(dir.join(&book.parts[3].crops[0]).is_file());
+        assert_eq!(book.parts[4].description, "Added");
+
+        let again = import_tar_bytes(&second, &dir, false, &mut stub_embed).unwrap();
+        assert_eq!(again, 5);
+        let both_again = &load_book(&dir).unwrap().unwrap().parts[1];
+        assert_eq!(both_again.crops.len(), 2);
+        assert_eq!(both_again.embeddings[1], vec![9.0, 0.0]);
+        assert_eq!(fs::read(dir.join("config.local.json")).unwrap(), rules);
+        assert_eq!(
+            fs::read(dir.join("dinov2-references.json")).unwrap(),
+            references
+        );
+        assert!(!dir.join("catalogue-crops.incoming").exists());
+        assert!(!dir.join("catalogue-crops.previous").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replace_removes_parts_missing_from_the_tar() {
+        let dir = temp_dir("replace");
+        let jpeg = tiny_jpeg();
+        let first = pack(&[
+            (
+                "catalogue.json",
+                br#"{
+                    "parts": [
+                        {"ic":"KEEP","description":"Local","crops":["crops/keep.jpg"]},
+                        {"ic":"BOTH","description":"Stay","crops":["crops/both.jpg"]}
+                    ]
+                }"#,
+            ),
+            ("crops/keep.jpg", jpeg.as_slice()),
+            ("crops/both.jpg", jpeg.as_slice()),
+        ]);
+        import_tar_bytes(&first, &dir, true, &mut stub_embed).unwrap();
+        append_catalogue_crop(&dir, "ADMIN", &jpeg, &[8.0, 0.0]).unwrap();
+        let saved = load_book(&dir).unwrap().unwrap();
+        let keep_crop = dir.join(&saved.parts[0].crops[0]);
+        let admin_crop = dir.join(&saved.parts[2].crops[0]);
+        assert!(keep_crop.is_file());
+        assert!(admin_crop.is_file());
+
+        let second = pack(&[
+            (
+                "catalogue.json",
+                br#"{"parts":[{"ic":"BOTH","description":"Only","crops":["crops/both.jpg"]}]}"#,
+            ),
+            ("crops/both.jpg", jpeg.as_slice()),
+        ]);
+        let count = import_tar_bytes(&second, &dir, true, &mut stub_embed).unwrap();
+        assert_eq!(count, 1);
+        let book = load_book(&dir).unwrap().unwrap();
+        assert_eq!(book.parts.len(), 1);
+        assert_eq!(book.parts[0].ic, "BOTH");
+        assert_eq!(book.parts[0].description, "Only");
+        assert!(!keep_crop.is_file());
+        assert!(!admin_crop.is_file());
+        assert!(!dir.join("dinov2-references.json").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_local_crop_leaves_the_saved_catalogue() {
+        let dir = temp_dir("missing-crop");
+        let jpeg = tiny_jpeg();
+        let first = pack(&[
+            (
+                "catalogue.json",
+                br#"{"parts":[{"ic":"KEEP","description":"Stay","crops":["crops/keep.jpg"]}]}"#,
+            ),
+            ("crops/keep.jpg", jpeg.as_slice()),
+        ]);
+        import_tar_bytes(&first, &dir, true, &mut stub_embed).unwrap();
+        let before = fs::read(catalogue_path(&dir)).unwrap();
+        let crop = dir.join(&load_book(&dir).unwrap().unwrap().parts[0].crops[0]);
+        fs::remove_file(&crop).unwrap();
+        let second = pack(&[
+            (
+                "catalogue.json",
+                br#"{"parts":[{"ic":"NEW","crops":["crops/new.jpg"]}]}"#,
+            ),
+            ("crops/new.jpg", jpeg.as_slice()),
+        ]);
+        let err = import_tar_bytes(&second, &dir, false, &mut stub_embed).unwrap_err();
+        assert!(err.contains("Could not read the catalogue"), "{err}");
+        assert_eq!(fs::read(catalogue_path(&dir)).unwrap(), before);
+        assert!(!dir.join("catalogue-crops.incoming").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_refuses_too_many_crops_and_leaves_the_catalogue() {
+        let dir = temp_dir("merge-full");
+        let jpeg = tiny_jpeg();
+        for _ in 0..MAX_CROPS {
+            append_catalogue_crop(&dir, "FAST-1", &jpeg, &[1.0, 0.0]).unwrap();
+        }
+        let before = fs::read(catalogue_path(&dir)).unwrap();
+        let packed = pack(&[
+            (
+                "catalogue.json",
+                br#"{"parts":[{"ic":"FAST-1","description":"Bolt","crops":["crops/extra.jpg"]}]}"#,
+            ),
+            ("crops/extra.jpg", jpeg.as_slice()),
+        ]);
+        let err = import_tar_bytes(&packed, &dir, false, &mut stub_embed).unwrap_err();
+        assert!(err.contains("too many crops"), "{err}");
+        assert_eq!(fs::read(catalogue_path(&dir)).unwrap(), before);
+        assert_eq!(
+            load_book(&dir).unwrap().unwrap().parts[0].crops.len(),
+            MAX_CROPS
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_refuses_too_many_parts_and_leaves_the_catalogue() {
+        let dir = temp_dir("merge-parts");
+        let mut parts = Vec::new();
+        for index in 0..MAX_PARTS {
+            parts.push(serde_json::json!({
+                "ic": format!("P{index}"),
+                "description": "Saved",
+                "crops": [],
+                "embeddings": []
+            }));
+        }
+        let stored = serde_json::json!({ "version": 1, "parts": parts });
+        fs::write(
+            dir.join("catalogue.json"),
+            serde_json::to_vec(&stored).unwrap(),
+        )
+        .unwrap();
+        let before = fs::read(catalogue_path(&dir)).unwrap();
+        let jpeg = tiny_jpeg();
+        let packed = pack(&[
+            (
+                "catalogue.json",
+                br#"{"parts":[{"ic":"NEW","crops":["crops/new.jpg"]}]}"#,
+            ),
+            ("crops/new.jpg", jpeg.as_slice()),
+        ]);
+        let err = import_tar_bytes(&packed, &dir, false, &mut stub_embed).unwrap_err();
+        assert!(err.contains("too many parts"), "{err}");
+        assert_eq!(fs::read(catalogue_path(&dir)).unwrap(), before);
         let _ = fs::remove_dir_all(&dir);
     }
 }

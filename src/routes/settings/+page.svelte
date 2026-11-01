@@ -117,6 +117,9 @@ let catalogueLoading = false;
 let catalogueNotice = "";
 let catalogueParts: CataloguePart[] = [];
 let cataloguePath = "";
+let replaceCatalogue = false;
+let replaceWarningOpen = false;
+let replaceCancel: HTMLButtonElement | null = null;
 let deletingCatalogueIc = "";
 let catalogueGeneration = 0;
 let catalogueClose: HTMLButtonElement | null = null;
@@ -1169,13 +1172,34 @@ function toastClass(kind: "ok" | "neutral" | "error"): string {
 }
 
 async function updateReferences() {
+	if (updatingReferences || replaceWarningOpen) return;
+	if (replaceCatalogue) {
+		replaceWarningOpen = true;
+		await tick();
+		replaceCancel?.focus();
+		return;
+	}
+	await runCatalogueImport(false);
+}
+
+function cancelReplaceCatalogue() {
+	replaceWarningOpen = false;
+}
+
+async function confirmReplaceCatalogue() {
+	if (updatingReferences) return;
+	replaceWarningOpen = false;
+	await runCatalogueImport(true);
+}
+
+async function runCatalogueImport(replace: boolean) {
 	updatingReferences = true;
 	try {
 		const data = await invokeRust<{
 			parts?: unknown;
 			message?: unknown;
 			path?: unknown;
-		}>("import_catalogue");
+		}>("import_catalogue", { replace });
 		if (!data || typeof data !== "object") {
 			showToast("Could not update the catalogue", "error");
 			return;
@@ -1185,7 +1209,10 @@ async function updateReferences() {
 			typeof data.message === "string" && data.message
 				? data.message
 				: "Could not update the catalogue";
-		if (message.startsWith("Catalogue loaded ")) {
+		if (
+			message.startsWith("Catalogue loaded ") ||
+			message.startsWith("Catalogue updated.")
+		) {
 			showToast(message, "ok");
 			if (catalogueOpen) void openReferences();
 		} else if (message === "No file selected.") {
@@ -1197,6 +1224,7 @@ async function updateReferences() {
 		showToast(invokeError(err, "Could not update the catalogue"), "error");
 	} finally {
 		updatingReferences = false;
+		replaceCatalogue = false;
 	}
 }
 
@@ -1280,7 +1308,13 @@ function closeReferences() {
 }
 
 function onReferencesKey(event: KeyboardEvent) {
-	if (!catalogueOpen || event.key !== "Escape") return;
+	if (event.key !== "Escape") return;
+	if (replaceWarningOpen) {
+		event.preventDefault();
+		cancelReplaceCatalogue();
+		return;
+	}
+	if (!catalogueOpen) return;
 	event.preventDefault();
 	closeReferences();
 }
@@ -3814,6 +3848,15 @@ onDestroy(() => {
 							>
 								{updatingReferences ? "Updating..." : "Update references"}
 							</button>
+							<label class="flex items-center gap-3 text-sm font-medium text-neutral-100">
+								<input
+									type="checkbox"
+									class="h-5 w-5 accent-blue-500"
+									bind:checked={replaceCatalogue}
+									disabled={updatingReferences}
+								/>
+								Fully replace catalogue
+							</label>
 							<button
 								type="button"
 								class="inline-flex min-h-11 w-fit items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100 disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
@@ -3823,7 +3866,7 @@ onDestroy(() => {
 								View references
 							</button>
 							<p class="text-sm text-neutral-400">
-								Opens a .tar catalogue. Each JPEG in crops/ is embedded with DINOv2 and saved on this PC. The next start loads the same catalogue.
+								Opens a .tar catalogue. Each JPEG in crops/ is embedded with DINOv2 and saved on this PC. Item codes in the tar are added or updated. Parts and crops already on this PC are kept, including ones an admin added. Fully replace catalogue removes anything that is not in the tar, after a confirmation. The checkbox applies to the next import only and is not saved.
 							</p>
 						</div>
 						<h3 class="text-base font-semibold tracking-tight xl:col-span-2">Part rules</h3>
@@ -4295,6 +4338,45 @@ onDestroy(() => {
 					on:click={closeReferences}
 				>
 					Close
+				</button>
+			</div>
+		</div>
+	</div>
+{/if}
+
+{#if replaceWarningOpen}
+	<div
+		class="fixed inset-0 z-[70] flex items-center justify-center bg-black/70 p-4"
+		on:click={cancelReplaceCatalogue}
+	>
+		<div
+			class="flex w-full max-w-lg flex-col border border-neutral-700 bg-neutral-900 p-4"
+			role="dialog"
+			aria-modal="true"
+			aria-labelledby="replace-catalogue-title"
+			on:click|stopPropagation
+		>
+			<h2 id="replace-catalogue-title" class="text-lg font-semibold tracking-tight">
+				Fully replace catalogue
+			</h2>
+			<p class="mt-3 text-sm text-neutral-200">
+				This will replace the entire catalogue. All admin-added crops and any parts not in this tar will be permanently removed. Continue?
+			</p>
+			<div class="mt-4 flex justify-end gap-2">
+				<button
+					type="button"
+					bind:this={replaceCancel}
+					class="inline-flex min-h-11 items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100"
+					on:click={cancelReplaceCatalogue}
+				>
+					Cancel
+				</button>
+				<button
+					type="button"
+					class="inline-flex min-h-11 items-center border border-red-800 bg-red-950 px-4 text-sm font-semibold text-red-100"
+					on:click={confirmReplaceCatalogue}
+				>
+					Replace
 				</button>
 			</div>
 		</div>
