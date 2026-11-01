@@ -89,7 +89,9 @@ onDestroy(() => stop());
 					: $camerasMissing
 						? "No cameras found"
 						: $operator.feedOn && $cameraFeedOn
-							? `Streaming · ${$operator.streamLeft}s`
+							? $operator.barcodeScanDisabled
+								? "Streaming"
+								: `Streaming · ${$operator.streamLeft}s`
 							: "Stream paused"}
 			</p>
 			{#if $operator.admin}

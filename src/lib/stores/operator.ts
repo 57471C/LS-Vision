@@ -122,6 +122,7 @@ export type OperatorState = {
 	paneHeight: number;
 	frameWidth: number;
 	frameHeight: number;
+	barcodeScanDisabled: boolean;
 	streamLeft: number;
 	liveMessage: string;
 	livePainted: boolean;
@@ -177,6 +178,7 @@ export function initialOperator(): OperatorState {
 		paneHeight: 0,
 		frameWidth: 0,
 		frameHeight: 0,
+		barcodeScanDisabled: false,
 		streamLeft: DEFAULT_SCAN_SECONDS,
 		liveMessage: "",
 		livePainted: false,
@@ -258,6 +260,7 @@ export type OperatorRefs = {
 	liveCanvas: HTMLCanvasElement | undefined;
 	imagePicker: HTMLInputElement | null;
 	erpCloseButton: HTMLButtonElement | null;
+	barcodeInput: HTMLInputElement | null;
 };
 
 // Handlers the page and the three panels call. The session module fills them in.
@@ -332,7 +335,9 @@ export function createOperatorViews(operator: Writable<OperatorState>) {
 		),
 	);
 	const barcodeOverlay = derived(operator, (state) =>
-		pixelBarcodeRoi(state.barcodeRoi, state.paneWidth, state.paneHeight),
+		state.barcodeScanDisabled
+			? null
+			: pixelBarcodeRoi(state.barcodeRoi, state.paneWidth, state.paneHeight),
 	);
 	return { camerasMissing, cameraFeedOn, zoom, barcodeOverlay };
 }

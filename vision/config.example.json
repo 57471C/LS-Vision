@@ -20,6 +20,7 @@
 		"url": ""
 	},
 	"scanSeconds": 8,
+	"barcodeScanDisabled": false,
 	"testMode": false,
 	"skipResultSave": true,
 	"metrology": {

@@ -12,6 +12,7 @@ const {
 	decodeAndInspect,
 	openErp,
 	operator,
+	refs,
 	runInspect,
 	saveCameraIndex,
 	setDetectSlot,
@@ -38,8 +39,10 @@ function cameraChanged(event: Event) {
 	<label class="flex min-w-56 flex-1 flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
 		{$operator.bomSource === "api" ? "Job card number" : "Barcode"}
 		<input
+			id="job-card-number"
 			class="w-full border border-neutral-600 bg-neutral-950 px-3 py-2 font-mono text-lg font-medium normal-case tracking-normal text-neutral-100"
 			inputmode={$operator.bomSource === "api" ? "numeric" : undefined}
+			bind:this={refs.barcodeInput}
 			bind:value={$operator.barcode}
 		/>
 	</label>
@@ -67,7 +70,8 @@ function cameraChanged(event: Event) {
 		type="button"
 		class="inline-flex min-h-11 items-center border border-blue-500 bg-blue-600 px-4 text-sm font-semibold text-white disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
 		on:click={decodeAndInspect}
-		disabled={$operator.loading}
+		disabled={$operator.loading ||
+			(!$operator.testMode && $operator.barcodeScanDisabled)}
 	>
 		{$operator.testMode ? "Use typed code" : "Decode QR / Barcode"}
 	</button>

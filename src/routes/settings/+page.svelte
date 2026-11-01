@@ -66,6 +66,7 @@ let erpUrl = "";
 let erpNotice = "";
 let savingErp = false;
 let scanSeconds = 8;
+let barcodeScanDisabled = false;
 let scanNotice = "";
 let savingScan = false;
 let testMode = false;
@@ -1304,6 +1305,7 @@ async function loadScan() {
 		const data = await loadDocument();
 		const seconds = Number(data.scanSeconds);
 		if (Number.isInteger(seconds)) scanSeconds = seconds;
+		barcodeScanDisabled = data.barcodeScanDisabled === true;
 	} catch (err: unknown) {
 		scanNotice = invokeError(err, "Could not load the scan interval");
 	}
@@ -1449,12 +1451,15 @@ async function saveScan() {
 		savingScan = false;
 		return;
 	}
+	const disabled = barcodeScanDisabled;
 	try {
 		const current = await loadDocument();
 		current.scanSeconds = seconds;
+		current.barcodeScanDisabled = disabled;
 		const saved = await storeDocument(current);
 		const stored = Number(saved.scanSeconds);
 		if (Number.isInteger(stored)) scanSeconds = stored;
+		barcodeScanDisabled = saved.barcodeScanDisabled === true;
 		scanNotice = "Saved";
 	} catch (err: unknown) {
 		scanNotice = invokeError(err, "Could not save the scan interval");
@@ -3185,8 +3190,18 @@ onDestroy(() => {
 										required
 									/>
 								</label>
+								<label class="flex items-center gap-3 text-sm font-medium text-neutral-100">
+									<input
+										type="checkbox"
+										class="h-5 w-5 accent-blue-500"
+										bind:checked={barcodeScanDisabled}
+										disabled={savingScan}
+									/>
+									Disable
+								</label>
 								<p class="text-sm text-neutral-400">
 									How often the live feed checks for a barcode. The default is 8 seconds.
+									Disable stops the camera barcode read. The operator page then focuses the job card field so a code can be typed.
 								</p>
 							</fieldset>
 							<button

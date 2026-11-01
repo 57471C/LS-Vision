@@ -12,7 +12,7 @@ The main screen used on the bench.
 
 ## Barcode and snapshot
 
-- With Test mode off, the countdown reads a full-resolution raw frame (`capture_snapshot`) when it reaches 0. That still is a separate camera handle, so the preview canvas keeps drawing through the capture.
+- With Test mode off, the countdown reads a full-resolution raw frame (`capture_snapshot`) when it reaches 0. That still is a separate camera handle, so the preview canvas keeps drawing through the capture. When Settings > Capture > Barcode scan > Disable is on, that countdown does not read the camera, the barcode ROI outline is hidden, and the code field is focused. Enter looks up the typed code. Turning Disable off resumes the camera read and the outline.
 - Rust crops that frame to the saved barcode ROI when one is set. The page first tries the native detector and ZXing on the preview JPEG, then Rust (`decode_barcode`, QR and Code 39). A crop whose long edge is over 1920 pixels is halved until it fits, and that smaller image is read first. One trailing slash is removed.
 - A code that matches the BoM holds the current preview JPEG over the canvas and runs detection on the raw frame. Boxes and IC labels are drawn on top of that preview. When more than one detect slot returned boxes, every slot is drawn, coloured and tagged with that slot number. One slot keeps the usual part colours. The preview slot was not cleared by the snapshot.
 - Clear ROI removes the selected slot and packs the remaining regions to the front. The slot outlines and the result panels use that numbering at once. With no slots left, detection uses the full frame.

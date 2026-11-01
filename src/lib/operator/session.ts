@@ -69,6 +69,7 @@ function attachSession(
 		liveCanvas: undefined,
 		imagePicker: null,
 		erpCloseButton: null,
+		barcodeInput: null,
 	};
 	// A field write publishes the same object, the same way a Svelte $store write does.
 	const op: OperatorState = new Proxy({} as OperatorState, {
@@ -206,11 +207,21 @@ function attachSession(
 	}
 
 	function startWatch() {
-		if (op.snapshot || get(camerasMissing) || !op.feedOn) return;
+		if (
+			op.barcodeScanDisabled ||
+			op.snapshot ||
+			get(camerasMissing) ||
+			!op.feedOn
+		)
+			return;
 		stopWatch();
 		op.streamLeft = streamMs / 1000;
 		void watchFeed();
 		streamTimer = setInterval(() => {
+			if (op.barcodeScanDisabled) {
+				stopWatch();
+				return;
+			}
 			if (!op.feedOn || op.snapshot) return;
 			if (op.streamLeft <= 1) {
 				op.streamLeft = streamMs / 1000;
@@ -1136,12 +1147,20 @@ function attachSession(
 			op.feedOn &&
 			!op.snapshot &&
 			!op.testMode &&
+			!op.barcodeScanDisabled &&
 			index === op.cameraIndex
 		);
 	}
 
 	async function watchFeed() {
-		if (!op.feedOn || op.snapshot || watchInFlight || op.loading) return;
+		if (
+			op.barcodeScanDisabled ||
+			!op.feedOn ||
+			op.snapshot ||
+			watchInFlight ||
+			op.loading
+		)
+			return;
 		// Wait for the camera list so the first open uses the saved index.
 		if (!get(cameraFeedOn)) return;
 		watchInFlight = true;
@@ -1156,6 +1175,7 @@ function attachSession(
 				!op.feedOn ||
 				op.snapshot ||
 				op.loading ||
+				op.barcodeScanDisabled ||
 				index !== op.cameraIndex
 			) {
 				return;
@@ -1192,6 +1212,7 @@ function attachSession(
 	type LocalConfig = {
 		source?: unknown;
 		scanSeconds?: unknown;
+		barcodeScanDisabled?: unknown;
 		testMode?: unknown;
 		skipResultSave?: unknown;
 		detectRoi?: unknown;
@@ -1206,14 +1227,28 @@ function attachSession(
 		return await invoke<LocalConfig>("load_local_config");
 	}
 
+	async function focusJobCard() {
+		await tick();
+		if (!pageAlive || !op.barcodeScanDisabled || op.erpOpen) return;
+		const input = refs.barcodeInput;
+		if (!input || document.activeElement === input) return;
+		input.focus();
+	}
+
 	async function loadScan() {
 		try {
 			const data = await readConfig();
 			const seconds = Number(data.scanSeconds);
-			if (!Number.isInteger(seconds) || seconds < 1 || seconds > 60) return;
-			streamMs = seconds * 1000;
-			if (op.feedOn && !op.snapshot) op.streamLeft = seconds;
-			else if (op.streamLeft > seconds) op.streamLeft = seconds;
+			if (Number.isInteger(seconds) && seconds >= 1 && seconds <= 60) {
+				streamMs = seconds * 1000;
+				if (op.feedOn && !op.snapshot) op.streamLeft = seconds;
+				else if (op.streamLeft > seconds) op.streamLeft = seconds;
+			}
+			op.barcodeScanDisabled = data.barcodeScanDisabled === true;
+			if (op.barcodeScanDisabled) {
+				stopWatch();
+				void focusJobCard();
+			}
 		} catch {
 			// A missed read keeps the current interval.
 		}
@@ -1321,13 +1356,14 @@ function attachSession(
 		if (!pageAlive) return;
 		void invoke("inference_status").catch(() => undefined);
 		void loadErp();
-		void loadScan();
+		const scanReady = loadScan();
 		void loadTestMode();
 		void loadDetectRoi();
 		void loadBarcodeRoi();
 		void loadBomSource();
 		void loadModel();
 		await loadCamera();
+		await scanReady;
 		if (pageAlive) await connectCameras();
 	}
 
@@ -1445,6 +1481,7 @@ function attachSession(
 		void loadTestMode();
 		void loadModel();
 		void applySavedCamera();
+		if (op.barcodeScanDisabled) void focusJobCard();
 	}
 
 	function matchModelName(name: string, files: string[]): string {
@@ -1992,6 +2029,7 @@ function attachSession(
 
 	function closeErp() {
 		op.erpOpen = false;
+		if (op.barcodeScanDisabled) void focusJobCard();
 	}
 
 	function onErpKey(event: KeyboardEvent) {
@@ -2338,6 +2376,8 @@ function attachSession(
 			await runInspect();
 			return;
 		}
+		// Disable turns off every camera barcode read. Enter still looks up the field.
+		if (op.barcodeScanDisabled) return;
 		op.loading = true;
 		try {
 			const frame = await readFrame(op.cameraIndex);

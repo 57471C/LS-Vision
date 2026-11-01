@@ -2,7 +2,7 @@
 
 ## Barcode
 
-- The kit label is read from `barcodeRoi` when that region is saved. Otherwise the full frame is used.
+- The kit label is read from `barcodeRoi` when that region is saved. Otherwise the full frame is used. Settings > Capture > Barcode scan > Disable (`barcodeScanDisabled` in `vision/config.local.json`) stops that camera read and hides the ROI outline. The operator code field is focused so the job card can be typed. Enter still looks up that field. Unchecking Disable resumes the camera read and the outline.
 - Settings > Capture edits the region as fractions of the frame (left, top, width, height). The operator page can draw the same region on the live feed.
 - Decode order: native QR detector, then ZXing (QR), both on the preview JPEG, then Rust `decode_barcode` on the raw frame (QR and Code 39). When that crop's long edge is over 1920 pixels, Rust halves it until it fits and reads the smaller image first. A 4K symbol is missed at full size.
 - One trailing slash is removed, so `6PBBK001/` matches `6PBBK001`.

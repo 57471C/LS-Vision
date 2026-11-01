@@ -417,9 +417,13 @@ function slotVerdict(panel: SlotDetections): "pass" | "fail" | "incomplete" {
 					? $operator.bomSource === "api"
 						? "Type a job card number, then choose an image."
 						: "Type a barcode, then choose an image."
-					: $operator.bomSource === "api"
-						? "A decoded barcode is used as the job card number."
-						: "Decode a barcode or press Enter."}
+					: $operator.barcodeScanDisabled
+						? $operator.bomSource === "api"
+							? "Type a job card number, then press Enter."
+							: "Type a barcode, then press Enter."
+						: $operator.bomSource === "api"
+							? "A decoded barcode is used as the job card number."
+							: "Decode a barcode or press Enter."}
 			</p>
 		</div>
 	{/if}

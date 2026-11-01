@@ -199,6 +199,7 @@ fn default_config() -> Value {
             "url": ""
         },
         "scanSeconds": 8,
+        "barcodeScanDisabled": false,
         "testMode": false,
         "skipResultSave": true,
         "metrology": {
@@ -847,6 +848,7 @@ mod tests {
         assert_eq!(document["trainingDir"], "");
         assert_eq!(document["trainingImageName"], "");
         assert_eq!(document["scanSeconds"], 8);
+        assert_eq!(document["barcodeScanDisabled"], false);
         assert!(!config_file(project.root()).exists());
     }
 
