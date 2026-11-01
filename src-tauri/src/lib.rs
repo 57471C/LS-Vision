@@ -42,6 +42,8 @@ pub fn run() {
             local_config::load_local_config,
             local_config::save_local_config,
             local_config::list_vision_models,
+            local_config::models_folder,
+            local_config::open_models_folder,
             local_config::set_active_model,
             local_config::update_model,
             bom::load_bom_json,

@@ -28,7 +28,7 @@ Settings are stored in `vision/config.local.json` (gitignored). The unlock passw
 
 ## Models
 
-Training lists `.pt` and `.onnx` files in the app data models folder. Update model copies an `.onnx` file over the selected `.onnx` name, or over `best.onnx`. The selected basename is `model` in `vision/config.local.json`. Detection runs only for `.onnx`, and the next run loads the copied file.
+Training lists `.pt` and `.onnx` files in the app data models folder. The path beside Update model opens that folder. Update model copies an `.onnx` file over the selected `.onnx` name, or over `best.onnx`. The selected basename is `model` in `vision/config.local.json`. Detection runs only for `.onnx`, and the next run loads the copied file.
 
 ## Part rules
 

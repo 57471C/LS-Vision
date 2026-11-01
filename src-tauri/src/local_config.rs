@@ -12,6 +12,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tauri::AppHandle;
 use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_opener::OpenerExt;
 
 const CONFIG_FILE: &str = "config.local.json";
 const LEGACY_FILE: &str = "bom-source.json";
@@ -679,6 +680,21 @@ pub fn save_local_config(config: Value) -> Result<Value, String> {
 #[tauri::command]
 pub fn list_vision_models() -> Result<Vec<String>, String> {
     list_model_files(&app_models_dir()?)
+}
+
+/// The app data models folder. The directory is created when it is missing.
+#[tauri::command]
+pub fn models_folder() -> Result<String, String> {
+    Ok(app_models_dir()?.display().to_string())
+}
+
+/// Open the app data models folder in the system file browser.
+#[tauri::command]
+pub fn open_models_folder(app: AppHandle) -> Result<(), String> {
+    let dir = app_models_dir()?;
+    app.opener()
+        .open_path(dir.display().to_string(), None::<&str>)
+        .map_err(|err| format!("Could not open the models folder: {err}"))
 }
 
 #[tauri::command]

@@ -104,6 +104,7 @@ let modelActive = "best.onnx";
 let modelNotice = "";
 let savingModel = false;
 let updatingModel = false;
+let modelsFolder = "";
 let updatingReferences = false;
 type CataloguePart = {
 	ic: string;
@@ -599,12 +600,33 @@ async function loadModelFromRust() {
 	modelNotice = "";
 }
 
+async function loadModelsFolder() {
+	try {
+		const folder = await invokeRust<string>("models_folder");
+		modelsFolder = folder.trim();
+	} catch (err: unknown) {
+		modelsFolder = "";
+		if (!modelNotice) {
+			modelNotice = invokeError(err, "Could not find the models folder");
+		}
+	}
+}
+
+async function openModelsFolder() {
+	try {
+		await invokeRust("open_models_folder");
+	} catch (err: unknown) {
+		modelNotice = invokeError(err, "Could not open the models folder");
+	}
+}
+
 async function loadModel() {
 	try {
 		await loadModelFromRust();
 	} catch (err: unknown) {
 		modelNotice = invokeError(err, "Could not load the model list");
 	}
+	await loadModelsFolder();
 	await loadConfidence();
 	await loadMatchThreshold();
 }
@@ -3752,7 +3774,7 @@ onDestroy(() => {
 									<p class="text-sm text-neutral-200">{catalogDebugNotice}</p>
 								{/if}
 							</fieldset>
-							<div class="flex flex-wrap gap-2">
+							<div class="flex flex-wrap items-center gap-2">
 								<button
 									type="submit"
 									class="inline-flex min-h-11 w-fit items-center border border-blue-500 bg-blue-600 px-4 text-sm font-semibold text-white disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
@@ -3771,6 +3793,16 @@ onDestroy(() => {
 								>
 									{updatingModel ? "Updating..." : "Update model"}
 								</button>
+								{#if modelsFolder}
+									<button
+										type="button"
+										class="inline-flex min-h-11 min-w-0 max-w-full items-center break-all text-left font-mono text-sm text-blue-300 underline decoration-blue-400 underline-offset-2 hover:text-white"
+										aria-label="Open the models folder"
+										on:click={openModelsFolder}
+									>
+										{modelsFolder}
+									</button>
+								{/if}
 							</div>
 							{#if modelNotice}
 								<p class="break-all text-sm {modelNoticeClass(modelNotice)}">{modelNotice}</p>
