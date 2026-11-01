@@ -36,6 +36,7 @@ import {
 	extraPartCount,
 	hasUnexpected,
 } from "$lib/operator/verdict";
+import DetectingOverlay from "$lib/DetectingOverlay.svelte";
 import { useOperator } from "$lib/stores/operator";
 
 const PREVIEW_CHANNEL = "ls-vision-camera-preview";
@@ -759,11 +760,6 @@ $: bannerCount = (wrongParts ? 1 : 0) + (extraParts > 0 ? 1 : 0);
 					Taken {$operator.snapshot.takenAt}
 				</p>
 			</div>
-			{#if $operator.detectState === "running"}
-				<p class="pointer-events-none absolute bottom-3 left-3 z-40 bg-neutral-950/80 px-3 py-2 text-sm font-semibold text-amber-200">
-					Detecting parts...
-				</p>
-			{/if}
 			{#if bannerCount > 0}
 				<div class="pointer-events-none absolute inset-x-0 bottom-0 z-30 flex flex-col">
 					{#if wrongParts}
@@ -806,6 +802,15 @@ $: bannerCount = (wrongParts ? 1 : 0) + (extraParts > 0 ? 1 : 0);
 			{#if $operator.draftMark}
 				<div class="pointer-events-none absolute z-50" style={draftStyle}></div>
 			{/if}
+		{/if}
+		{#if $operator.detectState === "running"}
+			<div
+				class="pointer-events-none absolute inset-0 z-[15] bg-neutral-950/55"
+				aria-hidden="true"
+			></div>
+			<div class="pointer-events-none absolute inset-0 z-[35] flex items-center justify-center">
+				<DetectingOverlay />
+			</div>
 		{/if}
 		{#if measureOn && measureBox}
 			<div

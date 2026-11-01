@@ -128,15 +128,17 @@ function slotVerdict(panel: SlotDetections): "pass" | "fail" | "incomplete" {
 				<div class="flex flex-wrap gap-2">
 					<button
 						type="button"
-						class="inline-flex min-h-11 w-fit items-center border border-blue-500 bg-blue-600 px-4 text-sm font-semibold text-white"
+						class="inline-flex min-h-11 w-fit items-center border border-blue-500 bg-blue-600 px-4 text-sm font-semibold text-white disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
 						on:click={chooseAndDetect}
+						disabled={$operator.detectState === "running"}
 					>
 						Choose image
 					</button>
 					<button
 						type="button"
-						class="inline-flex min-h-11 w-fit items-center border border-neutral-500 bg-neutral-800 px-4 text-sm font-semibold text-white"
+						class="inline-flex min-h-11 w-fit items-center border border-neutral-500 bg-neutral-800 px-4 text-sm font-semibold text-white disabled:border-neutral-700 disabled:text-neutral-500"
 						on:click={chooseAndSaveReferences}
+						disabled={$operator.detectState === "running"}
 					>
 						Save references
 					</button>
@@ -287,15 +289,17 @@ function slotVerdict(panel: SlotDetections): "pass" | "fail" | "incomplete" {
 						<div class="flex flex-wrap gap-2">
 							<button
 								type="button"
-								class="inline-flex min-h-11 w-fit items-center border border-blue-500 bg-blue-600 px-4 text-sm font-semibold text-white"
+								class="inline-flex min-h-11 w-fit items-center border border-blue-500 bg-blue-600 px-4 text-sm font-semibold text-white disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
 								on:click={chooseAndDetect}
+								disabled={$operator.detectState === "running"}
 							>
 								Choose image
 							</button>
 							<button
 								type="button"
-								class="inline-flex min-h-11 w-fit items-center border border-neutral-500 bg-neutral-800 px-4 text-sm font-semibold text-white"
+								class="inline-flex min-h-11 w-fit items-center border border-neutral-500 bg-neutral-800 px-4 text-sm font-semibold text-white disabled:border-neutral-700 disabled:text-neutral-500"
 								on:click={chooseAndSaveReferences}
+								disabled={$operator.detectState === "running"}
 							>
 								Save references
 							</button>

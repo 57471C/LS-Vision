@@ -1158,7 +1158,8 @@ function attachSession(
 			!op.feedOn ||
 			op.snapshot ||
 			watchInFlight ||
-			op.loading
+			op.loading ||
+			op.detectState === "running"
 		)
 			return;
 		// Wait for the camera list so the first open uses the saved index.
@@ -1988,7 +1989,7 @@ function attachSession(
 	}
 
 	async function chooseImageAndDetect(captureReferences: boolean) {
-		if (!op.bom || !op.testMode) return;
+		if (!op.bom || !op.testMode || op.detectState === "running") return;
 		const kitCode = op.bom.kitCode;
 		const file = await chooseImageFile();
 		if (!file || !pageAlive || !op.bom || op.bom.kitCode !== kitCode) return;
@@ -2338,7 +2339,7 @@ function attachSession(
 	}
 
 	async function runInspect() {
-		if (op.loading) return;
+		if (op.loading || op.detectState === "running") return;
 		await ensureBomSource();
 		if (!pageAlive || op.loading) return;
 		if (op.bomSource === "api") {
@@ -2366,7 +2367,7 @@ function attachSession(
 	}
 
 	async function decodeAndInspect() {
-		if (op.loading) return;
+		if (op.loading || op.detectState === "running") return;
 		await ensureBomSource();
 		await loadTestMode();
 		if (!pageAlive) return;

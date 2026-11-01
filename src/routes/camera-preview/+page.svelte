@@ -12,6 +12,8 @@ import {
 } from "$lib/camera-settings";
 import { catalogueMiss, readMatchThreshold } from "$lib/catalogue-capture";
 // biome-ignore lint/correctness/noUnusedImports: the template uses this component
+import DetectingOverlay from "$lib/DetectingOverlay.svelte";
+// biome-ignore lint/correctness/noUnusedImports: the template uses this component
 import DimensionMarks from "$lib/DimensionMarks.svelte";
 import { boxesFromDetect } from "$lib/detect-labels";
 // biome-ignore lint/correctness/noUnusedImports: the template uses this component
@@ -2380,6 +2382,13 @@ onDestroy(() => {
 					h {formatPxMm(marqueeDraft.h, overlayW, scale)}
 				{/if}
 			</p>
+		{/if}
+		{#if detectBusy}
+			<div
+				class="pointer-events-none absolute inset-0 z-[3] flex items-center justify-center bg-neutral-950/55 pb-24"
+			>
+				<DetectingOverlay />
+			</div>
 		{/if}
 		<div
 			class="absolute inset-x-0 bottom-0 z-[4] flex flex-col gap-2 bg-neutral-950/80 px-4 py-2"

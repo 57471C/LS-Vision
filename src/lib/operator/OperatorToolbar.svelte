@@ -71,6 +71,7 @@ function cameraChanged(event: Event) {
 		class="inline-flex min-h-11 items-center border border-blue-500 bg-blue-600 px-4 text-sm font-semibold text-white disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
 		on:click={decodeAndInspect}
 		disabled={$operator.loading ||
+			$operator.detectState === "running" ||
 			(!$operator.testMode && $operator.barcodeScanDisabled)}
 	>
 		{$operator.testMode ? "Use typed code" : "Decode QR / Barcode"}
