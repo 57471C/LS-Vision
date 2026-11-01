@@ -9,6 +9,7 @@ The main screen used on the bench.
 - The header shows the capture size and the canvas rate.
 - **Start feed** and **Stop feed** turn that preview on and off. Extra clicks are ignored for 1.52 seconds. While locked, the button reads Please wait, is disabled, and draws at half opacity.
 - **Measure**, beside Camera, draws a straight line on the live preview or the held snapshot. Each end is a 1px tick perpendicular to the line. The line shows its pixel length. When that camera has a scale from Settings > Camera > Preview, it also shows the length in millimetres. With no scale, it says "No scale set for this camera." Measure does not change the scale.
+- While detection is running, a green Detecting mark covers the camera pane. The results panel reads Detecting parts...
 
 ## Barcode and snapshot
 
@@ -27,6 +28,8 @@ When Test mode is on, the countdown does not read the camera. The button reads *
 ## Results
 
 The right-hand panel shows pass or fail, the kit, and the parts table (expected quantity against what detection saw).
+
+A matched catalogue part is a green badge, `{IC} - {percent}%`, and it counts toward the quantity seen. A part that matches a different catalogue item is an orange `WRONG PART` badge and does not count. A part the catalogue does not recognise is a yellow dashed `UNKNOWN {part type}` badge. When metrology is on, a measured part shows a thin arrowed line and a small label. A mismatch tints the line amber. The line does not change the pass or fail banner.
 
 Part rules, when Settings has any, run after the model returns boxes and before those counts and the boxes on the still. A matching parent class is shown as the result IC. A child box used by that match is left out of the BoM count and the pass check, so it does not show as a missing or extra part. The operator overlay hides that child. With admin unlocked, it is a thin grey outline. The result IC keeps its normal box. A rule whose parent or named child is not in that model's class list is skipped. The other rules still run, and the pass or fail result stays on screen. The page then shows a dismissible notice: "Some part rules could not be applied (missing classes). Check Settings." The operator console lists each rule that matched and each rule that was skipped. With no rules, the classes on screen are the ones the model returned.
 

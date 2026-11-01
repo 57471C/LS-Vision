@@ -11,11 +11,11 @@
 
 ## Modes
 
-Camera modes come from the device (Media Foundation). A newly attached camera lists the modes that device reports. Focus, brightness, and contrast are stored by Settings. This camera path does not apply those levels to the device.
+Camera modes come from the device (Media Foundation). A newly attached camera lists the modes that device reports. Settings stores focus, brightness, and contrast. Brightness and contrast are saved with the camera and are not sent to it. The preview sets UVC exposure, gain, and focus on the open camera. Auto on the focus bar returns the camera to autofocus and clears the saved manual value.
 
 ## Settings preview
 
-Settings can open a separate preview window for the selected camera. It uses the same paced `capture_preview` path and the same Display FPS.
+Settings can open a separate preview window for the selected camera. It uses the same paced `capture_preview` path and the same Display FPS. The window sets exposure, gain, and focus on that camera. Ctrl+wheel zooms and Space with a left drag pans. While Detect is running, a green Detecting mark covers the image and the button reads Detecting...
 
 Set scale sits in the preview header, next to the camera label, and only while admin is unlocked. The admin draws one straight line on the preview image. Each end is a 1px tick perpendicular to the line. A dialog then asks for that length in millimetres. Set scale and Measure take the drag while they are on. The factor is stored on that camera as `scale.mmPerPx`, with the width and height of the image, in `vision/config.local.json`. The header shows the current scale. Measure uses the same line. It shows the pixel length and the real length. With no scale stored, it shows the pixels and "No scale set for this camera." Locking admin hides Set scale and leaves Measure available.
 

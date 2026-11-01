@@ -19,7 +19,7 @@ The source is selected in Settings:
 
 Settings > Database has an optional description endpoint. It uses the same API base URL and `X-Api-Key`. It does not change the BoM lookup. The default path is `/VisionAppApi/ListInventoryDescription`. A blank path turns the lookup off.
 
-When detection finds a code that is not on the loaded BoM, the app posts `{ "icList": ["..."] }` to that path. `Des` from the response is shown beside the code on the Not in BoM list, and it is stored with the saved result. If the path is blank, the base URL or key is missing, or the call fails, the list shows the code only.
+The Not in BoM list shows the description stored on the matching catalogue part. A catalogue item code with no description there, and not on the loaded BoM, is posted as `{ "icList": ["..."] }` to that path. `Des` from the response fills that gap and is stored with the saved result. An unrecognized box is shown as `Unknown {part type}` and is not posted. If the path is blank, the base URL or key is missing, or the call fails, the list shows the code only.
 - **MSSQL**: two parameterised queries from `vision/bom_queries.sql`, or `vision/bom_queries.example.sql` when the local file is absent. Windows Authentication is the default. SQL Server authentication stores the username and password in `vision/config.local.json`.
 
 The usual query shape is the kit name from `IR` where `ic = @kitIC`, then parts from `bm` joined to `IR`, excluding labour (`3%`) and packaging (`2P%`).

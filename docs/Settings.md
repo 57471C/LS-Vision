@@ -7,7 +7,7 @@ Settings are stored in `vision/config.local.json` (gitignored). The unlock passw
 - Select the camera and its mode.
 - **Display FPS**: 15, 20, 25, or 30. This is how often the preview canvas asks for a new JPEG. Capture stays at the camera's selected mode.
 - Preview JPEGs fit in 1280×720. Snapshots used for barcode decode and detection stay full resolution.
-- Focus, brightness, and contrast are stored as 0–100. Reset and Cancel restore the last loaded values. Save writes the camera block.
+- Focus, brightness, and contrast are stored as 0–100. Reset and Cancel restore the last loaded values. Save writes the camera block. Brightness and contrast are saved with the camera and are not sent to it. The preview Focus slider sets focus on the open camera and saves it here. Auto on that slider clears the saved value. The same preview sets exposure and gain.
 - Preview opens a window for the selected camera.
 
 ## Capture
@@ -16,7 +16,7 @@ Settings are stored in `vision/config.local.json` (gitignored). The unlock passw
 - **Barcode scan**: whole seconds from 1 to 60. The default is 8. This is the operator countdown. **Disable** (`barcodeScanDisabled`, default false) stops the camera barcode read, hides the barcode ROI on the operator camera, and focuses the code field. Save writes the interval and the checkbox together.
 - **Part detection**: up to four regions (`detectRois`, each `x`, `y`, `w`, `h` as fractions from 0 to 1, plus `enabled`). The Slot dropdown chooses which region the fields edit. Blank leaves the fields idle. An empty slot is skipped. With no slots saved, detection uses the full image. `detectRoi` is slot 1. Save writes the selected slot. A new box starts enabled. Clear removes that slot and packs the rest to the front, so the saved list has no gap. The fields then show whatever region now sits in the selected slot. The four squares flip `enabled` and save it immediately. Grey has no box, green is on, and red is off. Detection skips a slot that is off.
 - **Barcode**: a region of the frame (`barcodeRoi`: `x`, `y`, `width`, `height` as fractions from 0 to 1). The operator crop uses the same object. With no region, decode uses the full frame. The operator page can also draw this region on the live feed when Settings is unlocked.
-- **Metrology**: off by default (`metrology.enabled`). When it is on, the margin, threshold mode (Otsu or fixed), fixed threshold, minimum contour area, and the length and diameter tolerances are shown. Save writes that object. Detection then measures each catalogue match on the full-resolution frame and can attach `pass` or `DIMENSION_MISMATCH`. The check needs a camera scale. It does not change pass or fail.
+- **Metrology**: off by default (`metrology.enabled`). When it is on, the margin, threshold mode (Otsu or fixed), fixed threshold, minimum contour area, and the length and diameter tolerances are shown. Save writes that object. Detection then measures each catalogue match on the full-resolution frame and can attach `pass` or `DIMENSION_MISMATCH`. The check needs a camera scale. The catalogue measurement method chooses the sizes. A bolt reports length under the head and thread diameter, a nut reports across flats, a washer reports outer diameter, inner diameter, and thickness, a cable tie reports total length and strap width, and a spring reports free height and outer coil diameter. A missing method keeps length and diameter. The operator camera and the preview draw a thin arrowed line and a label for each span. A mismatch tints the line amber. Thickness does not decide the flag. The inspection pass or fail stays as it was.
 
 ## Inference EP
 
@@ -53,7 +53,7 @@ Example: parent `Hinge_Plate`, child `P02_Logo`, condition `contains`, result `2
 ## Database
 
 - BoM source: JSON (`vision/sample-bom.json`), API (base URL, path, and API key; the barcode is the job card number), or MSSQL (Windows Authentication by default, SQL authentication optional).
-- **Description endpoint**: optional path stored as `api.descriptionPath`. The default is `/VisionAppApi/ListInventoryDescription`. Leave it blank to show an unexpected code by itself. A value is posted, with the API base URL and API key, when a detected code is not on the loaded BoM. The returned description is shown on the Not in BoM list.
+- **Description endpoint**: optional path stored as `api.descriptionPath`. The default is `/VisionAppApi/ListInventoryDescription`. Leave it blank to show an unexpected code by itself. The Not in BoM list uses the description stored on the matching catalogue part. A catalogue item code with no description there, and not on the loaded BoM, is posted with the API base URL and API key. The returned description is shown on that list. An unrecognized box is shown as its part type and is not posted.
 - Results endpoint, optional and blank by default. Example: `/VisionAppApi/SubmitResult`. A saved inspection is posted to the API base URL plus this path, with the API key. Leave it blank to keep the result on this PC only. Test mode does not post.
 - ERP button name and URL. Empty name and URL hides the operator button.
 

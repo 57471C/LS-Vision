@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.0
+
+- The operator camera and the camera preview show a green Detecting mark while detection runs.
+- Settings > Training > Decoder runs YOLO or RF-DETR. Auto is the default and follows the file name and the ONNX outputs.
+- Settings > Capture > Barcode scan > Disable stops the camera barcode read, hides the barcode ROI, and leaves the code field ready for a typed job card.
+- A catalogue import merges with the parts already on this PC. Fully replace catalogue asks before it removes anything the archive does not contain.
+- The camera preview sets UVC exposure, gain, and focus. Brightness and contrast stay in Settings and are not sent to the camera.
+- Metrology follows the catalogue measurement method and draws a dimension line on each measured span. That result does not change the inspection pass or fail.
+
 ## 0.3.1
 
 - Settings > Training > Update model copies an `.onnx` file into the AppData models folder and refuses a file that is not ONNX. A missing model is reported on the operator page.

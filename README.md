@@ -2,7 +2,7 @@
 
 Desktop application for verifying fastener kits on the bench using computer vision.
 
-Built with Tauri 2, SvelteKit, TypeScript, and Rust. Version 0.4.4. Inference is ONNX Runtime in the Rust process. The camera, barcode decode, and BoM lookup run there too. The app does not start Python.
+Built with Tauri 2, SvelteKit, TypeScript, and Rust. Version 0.5.0. Inference is ONNX Runtime in the Rust process. The camera, barcode decode, and BoM lookup run there too. The app does not start Python.
 
 ## What it does
 
@@ -35,10 +35,11 @@ In Settings > Training, use Update model to copy an `.onnx` file into the app da
 
 ## Project status
 
-Version 0.4.4 runs inference, the camera, barcode decode, and BoM lookup in the Tauri process. There is no Python sidecar and no port 8008 client. A `.pt` model shows a warning instead of detecting.
+Version 0.5.0 runs inference, the camera, barcode decode, and BoM lookup in the Tauri process. There is no Python sidecar and no port 8008 client. A `.pt` model shows a warning instead of detecting.
 
 Recent additions:
 
+- While detection runs, the operator camera and the camera preview show a green Detecting mark.
 - Settings > Training > Decoder is Auto, YOLO, or RF-DETR. Auto reads the file name and the ONNX outputs. An RF-DETR export is stretched and ImageNet-normalised. A YOLO graph keeps the letterbox decoder.
 - Settings > Camera > Preview, while admin is unlocked, draws a marquee on the detected still and saves that crop to the DINOv2 catalogue. A short press on a box still selects it. Crosshairs is optional, off by default, and shows the pointer in pixels and millimetres.
 - Set scale and Measure draw a straight line with a 1px tick at each end. Saving camera settings keeps a stored scale and the detect regions when that save does not mention them.
