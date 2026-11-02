@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.1
+
+- Preview Detect uses the lower of the saved confidence and 0.30, and it draws boxes from every saved detect slot.
+- A marquee tick in the camera preview appends that crop to the DINOv2 catalogue.
+
 ## 0.5.0
 
 - The operator camera and the camera preview show a green Detecting mark while detection runs.
