@@ -1348,6 +1348,9 @@ function cropChoicesReady(): boolean {
 	);
 }
 
+// A call alone is not a dependency. Name the objects the function reads.
+$: choicesReady = (cropChoices, cropPrompt, cropChoicesReady());
+
 async function confirmCropLimits() {
 	if (!cropPrompt || cropBusy || !cropChoicesReady()) return;
 	cropBusy = true;
@@ -4664,7 +4667,7 @@ onDestroy(() => {
 					type="button"
 					class="inline-flex min-h-11 items-center border border-blue-500 bg-blue-600 px-4 text-sm font-semibold text-white disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
 					on:click={confirmCropLimits}
-					disabled={cropBusy || !cropChoicesReady()}
+					disabled={cropBusy || !choicesReady}
 				>
 					{cropBusy ? "Importing..." : "Continue"}
 				</button>
