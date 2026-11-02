@@ -281,6 +281,16 @@ fn confidence_value(document: &Value) -> f32 {
     (number as f32).clamp(MIN_CONFIDENCE, MAX_CONFIDENCE)
 }
 
+/// Preview Detect may ask for a lower cutoff. Use the lower of that request
+/// and the saved value, still inside 0.15 to 0.80. A missing request keeps
+/// the saved value, which is what the operator barcode path does.
+fn chosen_confidence(saved: f32, requested: Option<f32>) -> f32 {
+    let Some(requested) = requested.filter(|value| value.is_finite()) else {
+        return saved;
+    };
+    requested.clamp(MIN_CONFIDENCE, MAX_CONFIDENCE).min(saved)
+}
+
 /// Saved `matchThreshold` in vision/config.local.json. Missing or invalid values use 0.70.
 fn match_threshold(document: &Value) -> f32 {
     let Some(number) = document
@@ -1920,6 +1930,7 @@ fn detect_pixels(
     capture_references: bool,
     hold_references: bool,
     active_bom_ics: Option<Vec<String>>,
+    confidence_override: Option<f32>,
 ) -> Result<Value, String> {
     let root = match local_config::project_root() {
         Ok(root) => root,
@@ -1930,10 +1941,14 @@ fn detect_pixels(
         Err(message) => return Ok(failure(&model_status_message(&message))),
     };
     let document = local_config::load_document(&root).ok();
-    let confidence = document
+    let saved_confidence = document
         .as_ref()
         .map(confidence_value)
         .unwrap_or(DEFAULT_CONFIDENCE);
+    let confidence = chosen_confidence(saved_confidence, confidence_override);
+    if confidence_override.is_some() {
+        eprintln!("preview detect confidence {confidence:.2} frame {width}x{height}");
+    }
     let cutoff = document
         .as_ref()
         .map(match_threshold)
@@ -2205,6 +2220,7 @@ fn detect_raw(
     capture_references: bool,
     hold_references: bool,
     active_bom_ics: Option<Vec<String>>,
+    confidence_override: Option<f32>,
 ) -> Result<Value, String> {
     let Some(frame) = frame else {
         return Ok(failure("No frame"));
@@ -2220,6 +2236,7 @@ fn detect_raw(
         capture_references,
         hold_references,
         active_bom_ics,
+        confidence_override,
     )
 }
 
@@ -2228,6 +2245,7 @@ fn detect_encoded(
     capture_references: bool,
     hold_references: bool,
     active_bom_ics: Option<Vec<String>>,
+    confidence_override: Option<f32>,
 ) -> Result<Value, String> {
     let bytes = match payload_bytes(text) {
         Ok(bytes) => bytes,
@@ -2244,6 +2262,7 @@ fn detect_encoded(
         capture_references,
         hold_references,
         active_bom_ics,
+        confidence_override,
     )
 }
 
@@ -2254,17 +2273,32 @@ pub async fn detect_image(
     capture_references: Option<bool>,
     hold_references: Option<bool>,
     active_bom_ics: Option<Vec<String>>,
+    confidence: Option<f64>,
 ) -> Result<Value, String> {
     // Test mode passes the chosen file. A live detect leaves this empty and
     // uses the raw frame stored by capture_snapshot. Saving references stores
     // each surviving box's embedding under its IC. It does not change the result.
     // The preview asks to hold those vectors, then saves only the selected boxes.
     // The same call keeps this RGB frame so a marquee can embed one crop without YOLO.
+    // An optional confidence is the preview cutoff. The operator call omits it.
     let capture_references = capture_references.unwrap_or(false);
     let hold_references = hold_references.unwrap_or(false);
+    let confidence = confidence.and_then(|value| {
+        if value.is_finite() {
+            Some(value as f32)
+        } else {
+            None
+        }
+    });
     if let Some(text) = image.filter(|value| !value.trim().is_empty()) {
         return tauri::async_runtime::spawn_blocking(move || {
-            detect_encoded(&text, capture_references, hold_references, active_bom_ics)
+            detect_encoded(
+                &text,
+                capture_references,
+                hold_references,
+                active_bom_ics,
+                confidence,
+            )
         })
         .await
         .map_err(|_| "Detect failed".to_string())?;
@@ -2274,7 +2308,13 @@ pub async fn detect_image(
         guard.clone()
     };
     tauri::async_runtime::spawn_blocking(move || {
-        detect_raw(frame, capture_references, hold_references, active_bom_ics)
+        detect_raw(
+            frame,
+            capture_references,
+            hold_references,
+            active_bom_ics,
+            confidence,
+        )
     })
     .await
     .map_err(|_| "Detect failed".to_string())?
@@ -2637,6 +2677,11 @@ mod tests {
         assert!((confidence_value(&json!({"confidence": 0.10})) - 0.15).abs() < 0.0001);
         assert!((confidence_value(&json!({"confidence": 0.99})) - 0.80).abs() < 0.0001);
         assert!((confidence_value(&json!({"confidence": "nope"})) - 0.45).abs() < 0.0001);
+        assert!((chosen_confidence(0.40, Some(0.30)) - 0.30).abs() < 0.0001);
+        assert!((chosen_confidence(0.20, Some(0.30)) - 0.20).abs() < 0.0001);
+        assert!((chosen_confidence(0.40, None) - 0.40).abs() < 0.0001);
+        assert!((chosen_confidence(0.40, Some(0.05)) - 0.15).abs() < 0.0001);
+        assert!((chosen_confidence(0.40, Some(f32::NAN)) - 0.40).abs() < 0.0001);
         assert!((match_threshold(&Value::Null) - 0.70).abs() < 0.0001);
         assert!((match_threshold(&json!({"matchThreshold": 0.80})) - 0.80).abs() < 0.0001);
         assert!((match_threshold(&json!({"matchThreshold": 0.10})) - 0.50).abs() < 0.0001);

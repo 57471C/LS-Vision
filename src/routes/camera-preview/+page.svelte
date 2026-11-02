@@ -39,6 +39,12 @@ import {
 	type OverlayBox,
 	readMetrologyResult,
 } from "$lib/metrology";
+import {
+	detectFailure,
+	detectionsFromBody,
+	multiSlot,
+	type PreviewBox,
+} from "$lib/preview-detect";
 import { marqueeGesture, topMarkAt } from "$lib/preview-marquee";
 
 const PREVIEW_CHANNEL = "ls-vision-camera-preview";
@@ -108,11 +114,6 @@ let snapshotDay = "";
 let snapshotMessage = "";
 let snapshotSaved = "";
 
-type DetectBody = {
-	detections?: unknown;
-	message?: unknown;
-};
-
 type DetectMark = {
 	ic: string;
 	confidence: number;
@@ -145,6 +146,9 @@ type Aim = {
 };
 
 const MIN_MARQUEE = 8;
+// Lower than a typical saved cutoff so this window can show boxes the
+// operator pass drops. Rust still keeps the saved value when that is lower.
+const PREVIEW_CONFIDENCE = 0.3;
 
 const DETECT_COLORS = [
 	"rgb(60, 180, 0)",
@@ -187,6 +191,7 @@ let sourceW = 0;
 let sourceH = 0;
 let classNames: string[] = [];
 let marquee: Region | null = null;
+let marqueeSource: Region | null = null;
 let marqueeDraft: Region | null = null;
 let marqueeIc = "";
 let marqueeBusy = false;
@@ -826,6 +831,7 @@ function closeCatalogue() {
 function forgetMarquee(mode: "vector" | "frame" | "view") {
 	marqueeGen += 1;
 	marquee = null;
+	marqueeSource = null;
 	marqueeDraft = null;
 	drawing = false;
 	pressMark = null;
@@ -1237,52 +1243,29 @@ function colorForIc(ic: string): string {
 	return DETECT_COLORS[total % DETECT_COLORS.length];
 }
 
-function readDetections(value: unknown): DetectMark[] {
-	if (!Array.isArray(value)) return [];
+function readDetections(rows: PreviewBox[]): DetectMark[] {
+	const prefix = multiSlot(rows);
 	const marks: DetectMark[] = [];
-	for (const item of value) {
-		if (!item || typeof item !== "object") continue;
-		const row = item as {
-			ic?: unknown;
-			confidence?: unknown;
-			bbox?: unknown;
-			embed?: unknown;
-			twoPass?: unknown;
-		};
-		const ic = typeof row.ic === "string" ? row.ic : "";
-		const confidence = typeof row.confidence === "number" ? row.confidence : 0;
-		const bbox = Array.isArray(row.bbox) ? row.bbox : [];
-		if (bbox.length < 4) continue;
-		const [rawX1, rawY1, rawX2, rawY2] = bbox;
-		if (
-			![rawX1, rawY1, rawX2, rawY2].every(
-				(value) => typeof value === "number" && Number.isFinite(value),
-			)
-		) {
-			continue;
-		}
-		const x1 = Math.min(rawX1, rawX2);
-		const y1 = Math.min(rawY1, rawY2);
-		const x2 = Math.max(rawX1, rawX2);
-		const y2 = Math.max(rawY1, rawY2);
-		if (x2 <= x1 || y2 <= y1) continue;
+	for (const row of rows) {
+		const [x1, y1, x2, y2] = row.bbox;
+		const ic =
+			prefix && row.slot !== null ? `${row.slot} ${row.ic}` : row.ic;
 		marks.push({
 			ic,
-			confidence,
+			confidence: row.confidence,
 			x: x1,
 			y: y1,
 			w: x2 - x1,
 			h: y2 - y1,
-			color: colorForIc(ic),
-			index: marks.length,
-			embed: row.embed === true,
+			color: colorForIc(row.ic),
+			index: row.index,
+			embed: row.embed,
 			sensor: [x1, y1, x2, y2],
 			catalogueMiss: catalogueMiss(row.twoPass, matchThreshold),
-			metrologyNote: mismatchNote((item as { metrology?: unknown }).metrology),
+			metrologyNote: mismatchNote(row.metrology),
 			metrologyMismatch:
-				readMetrologyResult((item as { metrology?: unknown }).metrology)
-					?.status === "DIMENSION_MISMATCH",
-			spans: metrologySpans((item as { metrology?: unknown }).metrology),
+				readMetrologyResult(row.metrology)?.status === "DIMENSION_MISMATCH",
+			spans: metrologySpans(row.metrology),
 		});
 	}
 	marks.sort((left, right) => left.confidence - right.confidence);
@@ -1414,11 +1397,12 @@ async function runDetect() {
 			forgetMarquee("frame");
 			return;
 		}
-		const body = await invoke<DetectBody>("detect_image", {
+		const body = await invoke<unknown>("detect_image", {
 			holdReferences: true,
+			confidence: PREVIEW_CONFIDENCE,
 		});
 		if (closed || gen !== detectGeneration || camera !== index) return;
-		const message = typeof body.message === "string" ? body.message.trim() : "";
+		const message = detectFailure(body);
 		if (message) {
 			detectImage = "";
 			sourceW = 0;
@@ -1444,7 +1428,7 @@ async function runDetect() {
 		detectW = width;
 		detectH = height;
 		detectMarks = scaleMarks(
-			readDetections(body.detections),
+			readDetections(detectionsFromBody(body)),
 			fullW,
 			fullH,
 			width,
@@ -1602,10 +1586,12 @@ async function commitMarquee(region: Region) {
 	const source = toSource(region);
 	const gen = ++marqueeGen;
 	marquee = region;
+	marqueeSource = source;
 	marqueeDraft = null;
 	marqueeReady = false;
 	marqueeNote = "";
 	if (!source || source.w < 1 || source.h < 1) {
+		marqueeSource = null;
 		marqueeNote = "Draw a larger region.";
 		return;
 	}
@@ -1630,24 +1616,34 @@ async function commitMarquee(region: Region) {
 
 async function saveMarquee() {
 	const ic = marqueeIc.trim();
-	if (!admin || marqueeBusy || !marqueeReady || !marquee || ic.length === 0)
+	const source = marqueeSource;
+	if (!admin || marqueeBusy || !marqueeReady || !source || ic.length === 0) {
 		return;
+	}
 	const gen = marqueeGen;
-	const replace = saveMode === "replace";
 	marqueeBusy = true;
 	marqueeNote = "";
 	try {
-		const message = await invoke<string>("save_marquee_reference", {
+		const result = await invoke<{ message?: unknown }>("save_catalogue_crop", {
 			ic,
-			replace,
+			x1: source.x,
+			y1: source.y,
+			x2: source.x + source.w,
+			y2: source.y + source.h,
 		});
 		if (closed || gen !== marqueeGen) return;
 		marquee = null;
+		marqueeSource = null;
 		marqueeReady = false;
-		marqueeNote = message.trim() || "Saved.";
+		const message =
+			typeof result.message === "string" ? result.message.trim() : "";
+		marqueeNote = message || "Saved to the catalogue.";
+		void invoke("clear_marquee_reference").catch(() => {
+			// The catalogue crop is already stored. The letterbox vector can stay.
+		});
 	} catch (err: unknown) {
 		if (closed || gen !== marqueeGen) return;
-		marqueeNote = invokeMessage(err, "Could not save the reference.");
+		marqueeNote = invokeMessage(err, "Could not save the crop.");
 	} finally {
 		if (gen === marqueeGen) marqueeBusy = false;
 	}
@@ -2261,16 +2257,6 @@ onDestroy(() => {
 						{/each}
 					</datalist>
 					<div class="mt-2 flex items-center gap-2">
-						<select
-							bind:value={saveMode}
-							class="min-w-0 flex-1 border border-neutral-600 bg-neutral-950 px-1 py-1 text-xs font-medium text-neutral-100"
-							disabled={marqueeBusy}
-							title="Append adds this crop to the class. Replace keeps only this crop for that class."
-							aria-label="For this IC"
-						>
-							<option value="append">Append</option>
-							<option value="replace">Replace</option>
-						</select>
 						<button
 							type="button"
 							class="border border-blue-500 bg-blue-600 px-2 py-1 text-sm font-semibold text-white disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
