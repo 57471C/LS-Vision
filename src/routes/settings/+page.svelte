@@ -121,6 +121,19 @@ let cataloguePath = "";
 let replaceCatalogue = false;
 let replaceWarningOpen = false;
 let replaceCancel: HTMLButtonElement | null = null;
+type CropLimitAction = "truncate" | "override";
+type CropClassPrompt = {
+	ic: string;
+	count: number;
+	limit: number;
+	dropped: number;
+	recent: boolean;
+	thumbs: string[];
+};
+let cropPrompt: { token: number; classes: CropClassPrompt[] } | null = null;
+let cropChoices: Record<string, CropLimitAction> = {};
+let cropBusy = false;
+let cropCancel: HTMLButtonElement | null = null;
 let deletingCatalogueIc = "";
 let catalogueGeneration = 0;
 let catalogueClose: HTMLButtonElement | null = null;
@@ -1179,7 +1192,12 @@ function showToast(message: string, kind: "ok" | "neutral" | "error") {
 	toastText = message;
 	toastKind = kind;
 	if (toastTimer) clearTimeout(toastTimer);
-	const wait = kind === "error" ? 7000 : 4500;
+	const wait =
+		kind === "error"
+			? 7000
+			: message.includes("Truncated ") || message.includes("Kept all crops")
+				? 9000
+				: 4500;
 	toastTimer = setTimeout(() => {
 		toastText = "";
 		toastTimer = null;
@@ -1194,7 +1212,7 @@ function toastClass(kind: "ok" | "neutral" | "error"): string {
 }
 
 async function updateReferences() {
-	if (updatingReferences || replaceWarningOpen) return;
+	if (updatingReferences || replaceWarningOpen || cropPrompt) return;
 	if (replaceCatalogue) {
 		replaceWarningOpen = true;
 		await tick();
@@ -1214,39 +1232,160 @@ async function confirmReplaceCatalogue() {
 	await runCatalogueImport(true);
 }
 
+function readCropClass(value: unknown): CropClassPrompt | null {
+	if (!value || typeof value !== "object") return null;
+	const record = value as Record<string, unknown>;
+	const ic = typeof record.ic === "string" ? record.ic.trim() : "";
+	const count = record.count;
+	const limit = record.limit;
+	const dropped = record.dropped;
+	if (!ic) return null;
+	if (
+		typeof count !== "number" ||
+		typeof limit !== "number" ||
+		typeof dropped !== "number" ||
+		!Number.isInteger(count) ||
+		!Number.isInteger(limit) ||
+		!Number.isInteger(dropped) ||
+		count < 0 ||
+		limit < 0 ||
+		dropped < 0
+	) {
+		return null;
+	}
+	const thumbs = Array.isArray(record.thumbs)
+		? record.thumbs.filter(
+				(item): item is string =>
+					typeof item === "string" && item.startsWith("data:image/"),
+			)
+		: [];
+	return {
+		ic,
+		count,
+		limit,
+		dropped,
+		recent: record.recent === true,
+		thumbs,
+	};
+}
+
+function readCropPrompt(
+	data: Record<string, unknown>,
+): { token: number; classes: CropClassPrompt[] } | null {
+	const token = data.token;
+	if (typeof token !== "number" || !Number.isInteger(token) || token <= 0) return null;
+	if (!Array.isArray(data.classes) || data.classes.length === 0) return null;
+	const classes: CropClassPrompt[] = [];
+	for (const item of data.classes) {
+		const row = readCropClass(item);
+		if (!row) return null;
+		classes.push(row);
+	}
+	return { token, classes };
+}
+
+function applyCatalogueResult(data: Record<string, unknown>) {
+	if (typeof data.path === "string" && data.path) cataloguePath = data.path;
+	const message =
+		typeof data.message === "string" && data.message
+			? data.message
+			: "Could not update the catalogue";
+	if (
+		message.startsWith("Catalogue loaded ") ||
+		message.startsWith("Catalogue updated.")
+	) {
+		showToast(message, "ok");
+		if (catalogueOpen) void openReferences();
+	} else if (message === "No file selected.") {
+		showToast(message, "neutral");
+	} else {
+		showToast(message, "error");
+	}
+}
+
 async function runCatalogueImport(replace: boolean) {
 	updatingReferences = true;
 	try {
-		const data = await invokeRust<{
-			parts?: unknown;
-			message?: unknown;
-			path?: unknown;
-		}>("import_catalogue", { replace });
-		if (!data || typeof data !== "object") {
+		const data = await invokeRust<Record<string, unknown>>("import_catalogue", {
+			replace,
+		});
+		if (!data || typeof data !== "object" || Array.isArray(data)) {
 			showToast("Could not update the catalogue", "error");
 			return;
 		}
-		if (typeof data.path === "string" && data.path) cataloguePath = data.path;
-		const message =
-			typeof data.message === "string" && data.message
-				? data.message
-				: "Could not update the catalogue";
-		if (
-			message.startsWith("Catalogue loaded ") ||
-			message.startsWith("Catalogue updated.")
-		) {
-			showToast(message, "ok");
-			if (catalogueOpen) void openReferences();
-		} else if (message === "No file selected.") {
-			showToast(message, "neutral");
-		} else {
-			showToast(message, "error");
+		const prompt = readCropPrompt(data);
+		if (prompt) {
+			cropChoices = {};
+			cropPrompt = prompt;
+			await tick();
+			cropCancel?.focus();
+			return;
 		}
+		applyCatalogueResult(data);
 	} catch (err: unknown) {
 		showToast(invokeError(err, "Could not update the catalogue"), "error");
 	} finally {
 		updatingReferences = false;
-		replaceCatalogue = false;
+		if (!cropPrompt) replaceCatalogue = false;
+	}
+}
+
+function chooseCrop(ic: string, action: CropLimitAction) {
+	cropChoices = { ...cropChoices, [ic]: action };
+}
+
+function chooseAllCrops(action: CropLimitAction) {
+	if (!cropPrompt) return;
+	const next: Record<string, CropLimitAction> = {};
+	for (const row of cropPrompt.classes) next[row.ic] = action;
+	cropChoices = next;
+}
+
+function cropChoicesReady(): boolean {
+	if (!cropPrompt) return false;
+	return cropPrompt.classes.every(
+		(row) => cropChoices[row.ic] === "truncate" || cropChoices[row.ic] === "override",
+	);
+}
+
+async function confirmCropLimits() {
+	if (!cropPrompt || cropBusy || !cropChoicesReady()) return;
+	cropBusy = true;
+	const token = cropPrompt.token;
+	const choices = cropPrompt.classes.map((row) => ({
+		ic: row.ic,
+		action: cropChoices[row.ic],
+	}));
+	try {
+		const data = await invokeRust<Record<string, unknown>>("finish_catalogue_replace", {
+			token,
+			choices,
+		});
+		if (!data || typeof data !== "object" || Array.isArray(data)) {
+			showToast("Could not update the catalogue", "error");
+			return;
+		}
+		cropPrompt = null;
+		cropChoices = {};
+		applyCatalogueResult(data);
+	} catch (err: unknown) {
+		showToast(invokeError(err, "Could not update the catalogue"), "error");
+	} finally {
+		cropBusy = false;
+		if (!cropPrompt) replaceCatalogue = false;
+	}
+}
+
+async function cancelCropLimits() {
+	if (cropBusy || !cropPrompt) return;
+	const token = cropPrompt.token;
+	cropPrompt = null;
+	cropChoices = {};
+	replaceCatalogue = false;
+	try {
+		await invokeRust("cancel_catalogue_replace", { token });
+	} catch (err: unknown) {
+		showToast(invokeError(err, "Could not cancel the import"), "error");
 	}
 }
 
@@ -1331,6 +1470,11 @@ function closeReferences() {
 
 function onReferencesKey(event: KeyboardEvent) {
 	if (event.key !== "Escape") return;
+	if (cropPrompt) {
+		event.preventDefault();
+		void cancelCropLimits();
+		return;
+	}
 	if (replaceWarningOpen) {
 		event.preventDefault();
 		cancelReplaceCatalogue();
@@ -3898,7 +4042,7 @@ onDestroy(() => {
 								View references
 							</button>
 							<p class="text-sm text-neutral-400">
-								Opens a .tar catalogue. Each JPEG in crops/ is embedded with DINOv2 and saved on this PC. Item codes in the tar are added or updated. Parts and crops already on this PC are kept, including ones an admin added. Fully replace catalogue removes anything that is not in the tar, after a confirmation. The checkbox applies to the next import only and is not saved.
+								Opens a .tar catalogue. Each JPEG in crops/ is embedded with DINOv2 and saved on this PC. Item codes in the tar are added or updated. Parts and crops already on this PC are kept, including ones an admin added. Fully replace catalogue removes anything that is not in the tar, after a confirmation. If a class has more crops than its limit, that replace pauses so you can truncate the class or keep the higher count. The checkbox applies to the next import only and is not saved.
 							</p>
 						</div>
 						<h3 class="text-base font-semibold tracking-tight xl:col-span-2">Part rules</h3>
@@ -4409,6 +4553,120 @@ onDestroy(() => {
 					on:click={confirmReplaceCatalogue}
 				>
 					Replace
+				</button>
+			</div>
+		</div>
+	</div>
+{/if}
+
+{#if cropPrompt}
+	<div
+		class="fixed inset-0 z-[80] flex items-center justify-center bg-black/70 p-4"
+		role="presentation"
+		on:click={() => {
+			if (!cropBusy) void cancelCropLimits();
+		}}
+	>
+		<div
+			class="flex max-h-[85vh] w-full max-w-2xl flex-col border border-neutral-700 bg-neutral-900 p-4"
+			role="dialog"
+			aria-modal="true"
+			aria-labelledby="crop-limit-title"
+			on:click|stopPropagation
+		>
+			<h2 id="crop-limit-title" class="text-lg font-semibold tracking-tight">
+				Crops over the limit
+			</h2>
+			<p class="mt-2 text-sm text-neutral-200">
+				These classes have more crops than their limit. Truncate keeps the most recent crops, or a sample when the archive has no dates. Keep all raises the limit for that class. The catalogue stays as it is until you continue.
+			</p>
+			<div class="mt-3 flex flex-wrap gap-2">
+				<button
+					type="button"
+					class="inline-flex min-h-11 items-center border border-neutral-600 bg-neutral-800 px-3 text-sm font-semibold text-neutral-100 disabled:border-neutral-800 disabled:text-neutral-600"
+					on:click={() => chooseAllCrops("truncate")}
+					disabled={cropBusy}
+				>
+					Truncate all
+				</button>
+				<button
+					type="button"
+					class="inline-flex min-h-11 items-center border border-neutral-600 bg-neutral-800 px-3 text-sm font-semibold text-neutral-100 disabled:border-neutral-800 disabled:text-neutral-600"
+					on:click={() => chooseAllCrops("override")}
+					disabled={cropBusy}
+				>
+					Keep all
+				</button>
+			</div>
+			<div class="mt-3 min-h-0 flex-1 overflow-auto">
+				{#each cropPrompt.classes as row, index (row.ic)}
+					<fieldset class="border-t border-neutral-800 py-3">
+						<legend class="font-mono text-sm text-neutral-100">{row.ic}</legend>
+						<p class="mt-1 text-sm text-neutral-300">
+							{row.count} crops, limit {row.limit}. Truncating drops {row.dropped}.
+						</p>
+						<p class="text-sm text-neutral-400">
+							{row.recent
+								? `Truncate keeps the ${row.limit} most recent crops.`
+								: `This class has no dates. Truncate keeps ${row.limit} crops.`}
+						</p>
+						<div class="mt-2 flex flex-wrap gap-1">
+							{#if row.thumbs.length === 0}
+								<p class="text-sm text-neutral-500">No preview</p>
+							{:else}
+								{#each row.thumbs as src, thumbIndex (`${row.ic}-${thumbIndex}`)}
+									<img
+										src={src}
+										alt="{row.ic} crop {thumbIndex + 1}"
+										class="h-16 w-16 border border-neutral-800 bg-neutral-950 object-contain"
+									/>
+								{/each}
+							{/if}
+						</div>
+						<div class="mt-2 flex flex-wrap gap-4">
+							<label class="flex items-center gap-2 text-sm text-neutral-100">
+								<input
+									type="radio"
+									name={`crop-limit-${index}`}
+									class="h-4 w-4 accent-blue-500"
+									checked={cropChoices[row.ic] === "truncate"}
+									on:change={() => chooseCrop(row.ic, "truncate")}
+									disabled={cropBusy}
+								/>
+								Truncate to {row.limit}
+							</label>
+							<label class="flex items-center gap-2 text-sm text-neutral-100">
+								<input
+									type="radio"
+									name={`crop-limit-${index}`}
+									class="h-4 w-4 accent-blue-500"
+									checked={cropChoices[row.ic] === "override"}
+									on:change={() => chooseCrop(row.ic, "override")}
+									disabled={cropBusy}
+								/>
+								Keep all {row.count}
+							</label>
+						</div>
+					</fieldset>
+				{/each}
+			</div>
+			<div class="mt-4 flex justify-end gap-2">
+				<button
+					type="button"
+					bind:this={cropCancel}
+					class="inline-flex min-h-11 items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100 disabled:border-neutral-800 disabled:text-neutral-600"
+					on:click={cancelCropLimits}
+					disabled={cropBusy}
+				>
+					Cancel
+				</button>
+				<button
+					type="button"
+					class="inline-flex min-h-11 items-center border border-blue-500 bg-blue-600 px-4 text-sm font-semibold text-white disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
+					on:click={confirmCropLimits}
+					disabled={cropBusy || !cropChoicesReady()}
+				>
+					{cropBusy ? "Importing..." : "Continue"}
 				</button>
 			</div>
 		</div>

@@ -7,7 +7,9 @@
 //! are copied under `vision/catalogue-crops/`. Startup loads that file.
 //! The default import updates item codes that are in the tar and adds new
 //! ones. Parts and crops that are only on this PC stay. Full replace, after
-//! the page confirms it, writes the tar as the whole catalogue.
+//! the page confirms it, writes the tar as the whole catalogue. A class with
+//! more crops than its limit pauses that replace. The admin truncates it or
+//! keeps the higher count, which is then that class's limit.
 //! Detection and the camera preview keep using `vision/dinov2-references.json`.
 //!
 //! A catalogue entry looks like this:
@@ -39,6 +41,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 use base64::Engine;
@@ -54,6 +57,8 @@ const MAX_TAR_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_ENTRY_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_PARTS: usize = 2_000;
 const MAX_CROPS: usize = 24;
+const PROMPT_THUMBS: usize = 4;
+const CROP_LIMITS_FILE: &str = "catalogue-crop-limits.json";
 const MAX_PIXELS: usize = 40_000_000;
 const MAX_TEXT: usize = 500;
 const THUMB_EDGE: u32 = 160;
@@ -68,6 +73,8 @@ struct Part {
     dimensions: Value,
     crops: Vec<String>,
     embeddings: Vec<Vec<f32>>,
+    /// Set when this class may keep more than `MAX_CROPS` crops.
+    crop_limit: Option<usize>,
 }
 
 struct Book {
@@ -86,6 +93,8 @@ struct Built {
 }
 
 static CATALOGUE: LazyLock<Mutex<Book>> = LazyLock::new(|| Mutex::new(Book::empty()));
+static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
+static WAITING: LazyLock<Mutex<Option<WaitingReplace>>> = LazyLock::new(|| Mutex::new(None));
 
 fn lock(mutex: &Mutex<Book>) -> std::sync::MutexGuard<'_, Book> {
     mutex.lock().unwrap_or_else(|err| err.into_inner())
@@ -131,11 +140,59 @@ pub(crate) fn load_on_startup() {
     }
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct CropClassPrompt {
+    pub ic: String,
+    pub count: usize,
+    pub limit: usize,
+    pub dropped: usize,
+    /// Tar timestamps distinguish the crops, so truncate keeps the newest.
+    pub recent: bool,
+    pub thumbs: Vec<String>,
+}
+
 #[derive(Clone, Serialize)]
 pub struct CatalogueUpdate {
     pub parts: usize,
     pub message: String,
     pub path: String,
+    /// Non-zero while a full replace is waiting for crop-limit choices.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub token: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub classes: Vec<CropClassPrompt>,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+impl CatalogueUpdate {
+    fn done(parts: usize, message: impl Into<String>, path: &Path) -> Self {
+        Self {
+            parts,
+            message: message.into(),
+            path: path.display().to_string(),
+            token: 0,
+            classes: Vec::new(),
+        }
+    }
+
+    fn waiting(parts: usize, path: &Path, token: u64, classes: Vec<CropClassPrompt>) -> Self {
+        Self {
+            parts,
+            message: String::new(),
+            path: path.display().to_string(),
+            token,
+            classes,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct CropChoiceInput {
+    pub ic: String,
+    pub action: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -158,7 +215,9 @@ pub struct CatalogueList {
 ///
 /// `replace` false, the default, updates item codes that are in the tar and
 /// adds new ones. Parts and crops that are only on this PC stay.
-/// `replace` true writes the tar as the whole catalogue.
+/// `replace` true writes the tar as the whole catalogue. A class over its
+/// crop limit pauses that replace until the admin truncates it or keeps the
+/// higher count.
 /// Cancel leaves the saved file and the in-memory catalogue as they are.
 /// The dialog runs off the main thread. A panic becomes a status string.
 #[tauri::command]
@@ -200,11 +259,11 @@ fn install_picked_catalogue(
         picker = picker.set_directory(&vision);
     }
     let Some(picked) = picker.blocking_pick_file() else {
-        return Ok(CatalogueUpdate {
-            parts: lock(&CATALOGUE).parts.len(),
-            message: "No file selected.".to_string(),
-            path: path.display().to_string(),
-        });
+        return Ok(CatalogueUpdate::done(
+            lock(&CATALOGUE).parts.len(),
+            "No file selected.",
+            &path,
+        ));
     };
     let source = picked
         .into_path()
@@ -223,22 +282,93 @@ fn install_picked_catalogue(
     }
     let bytes =
         fs::read(&source).map_err(|err| format!("Could not read the tar archive: {err}"))?;
-    let count = import_tar_bytes(&bytes, &vision, replace, &mut embed_jpeg)?;
+    if !replace {
+        let count = import_tar_bytes(&bytes, &vision, false, &mut embed_jpeg)?;
+        eprintln!(
+            "DINOv2 catalogue updated: {count} parts from {}",
+            path.display()
+        );
+        return Ok(CatalogueUpdate::done(
+            count,
+            format!("Catalogue updated. {count} parts on this PC."),
+            &path,
+        ));
+    }
+    let draft = inspect_replace(&bytes, &vision)?;
+    if !draft.prompts.is_empty() {
+        let classes = draft.prompts.clone();
+        let token = store_waiting(vision, draft);
+        return Ok(CatalogueUpdate::waiting(
+            lock(&CATALOGUE).parts.len(),
+            &path,
+            token,
+            classes,
+        ));
+    }
+    clear_waiting();
+    let report = if draft
+        .parts
+        .iter()
+        .any(|part| part.crops.len() > MAX_CROPS)
+    {
+        commit_replace(&vision, &draft, &[], &mut embed_jpeg)?
+    } else {
+        let count = import_tar_bytes(&bytes, &vision, true, &mut embed_jpeg)?;
+        ImportReport {
+            parts: count,
+            message: format!("Catalogue loaded {count} parts."),
+        }
+    };
     eprintln!(
-        "DINOv2 catalogue {}: {count} parts from {}",
-        if replace { "replaced" } else { "updated" },
+        "DINOv2 catalogue replaced: {} parts from {}",
+        report.parts,
         path.display()
     );
-    let message = if replace {
-        format!("Catalogue loaded {count} parts.")
-    } else {
-        format!("Catalogue updated. {count} parts on this PC.")
-    };
-    Ok(CatalogueUpdate {
-        parts: count,
-        message,
-        path: path.display().to_string(),
+    Ok(CatalogueUpdate::done(report.parts, report.message, &path))
+}
+
+/// Apply the admin's truncate or keep-all choice and finish the waiting replace.
+/// A failed embed or write puts the choice back and leaves the saved catalogue.
+#[tauri::command]
+pub async fn finish_catalogue_replace(
+    token: u64,
+    choices: Vec<CropChoiceInput>,
+) -> Result<CatalogueUpdate, String> {
+    let parsed = parse_choices(&choices)?;
+    let waiting = take_waiting(token)?;
+    let path = catalogue_path(&waiting.vision);
+    let joined = tauri::async_runtime::spawn_blocking(move || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            match commit_replace(&waiting.vision, &waiting.draft, &parsed, &mut embed_jpeg) {
+                Ok(report) => Ok(report),
+                Err(err) => Err((err, waiting)),
+            }
+        }))
     })
+    .await;
+    match joined {
+        Ok(Ok(Ok(report))) => {
+            eprintln!(
+                "DINOv2 catalogue replaced: {} parts from {}",
+                report.parts,
+                path.display()
+            );
+            Ok(CatalogueUpdate::done(report.parts, report.message, &path))
+        }
+        Ok(Ok(Err((err, waiting)))) => {
+            restore_waiting(waiting);
+            Err(err)
+        }
+        Ok(Err(_)) | Err(_) => Err("Could not update the catalogue".to_string()),
+    }
+}
+
+/// Drop a waiting full replace. The saved catalogue stays as it is.
+#[tauri::command]
+pub fn cancel_catalogue_replace(token: u64) -> Result<(), String> {
+    let _ = take_waiting(token)?;
+    eprintln!("DINOv2 catalogue crop choice cancelled.");
+    Ok(())
 }
 
 /// Read the saved catalogue and return one view per part.
@@ -335,11 +465,11 @@ pub fn save_catalogue_crop(
     }
     crate::catalog::reload_installed();
     let path = catalogue_path(&vision);
-    Ok(CatalogueUpdate {
-        parts: lock(&CATALOGUE).parts.len(),
-        message: format!("Saved {saved_ic}."),
-        path: path.display().to_string(),
-    })
+    Ok(CatalogueUpdate::done(
+        lock(&CATALOGUE).parts.len(),
+        format!("Saved {saved_ic}."),
+        &path,
+    ))
 }
 
 fn held_crop(x1: f64, y1: f64, x2: f64, y2: f64) -> Result<(Vec<u8>, u32, u32), String> {
@@ -402,6 +532,7 @@ fn append_catalogue_crop(
             dimensions: Value::Null,
             crops: vec![relative.clone()],
             embeddings: vec![embedding.to_vec()],
+            crop_limit: None,
         });
     }
     let bytes = book_json(&book)?;
@@ -503,9 +634,15 @@ fn import_tar_bytes(
     Ok(count)
 }
 
+struct TarFile {
+    bytes: Vec<u8>,
+    /// Unix mtime from the tar header. Zero when the header has no time.
+    mtime: u64,
+}
+
 struct Archive {
     catalogue: String,
-    files: HashMap<String, Vec<u8>>,
+    files: HashMap<String, TarFile>,
 }
 
 fn read_tar(bytes: &[u8]) -> Result<Archive, String> {
@@ -539,6 +676,7 @@ fn read_tar(bytes: &[u8]) -> Result<Archive, String> {
                 .map_err(|err| format!("Could not read the tar archive: {err}"))?;
             continue;
         }
+        let mtime = entry.header().mtime().unwrap_or(0);
         let mut body = Vec::new();
         entry
             .take(MAX_ENTRY_BYTES + 1)
@@ -547,11 +685,22 @@ fn read_tar(bytes: &[u8]) -> Result<Archive, String> {
         if body.len() as u64 > MAX_ENTRY_BYTES {
             return Err("A file in the archive is too large.".to_string());
         }
-        files.insert(key, body);
+        files.insert(
+            key,
+            TarFile {
+                bytes: body,
+                mtime,
+            },
+        );
     }
     let (catalogue_key, prefix) = locate_catalogue(&files)?;
-    let catalogue = String::from_utf8(files.remove(&catalogue_key).unwrap_or_default())
-        .map_err(|_| "catalogue.json is not valid JSON.".to_string())?;
+    let catalogue = String::from_utf8(
+        files
+            .remove(&catalogue_key)
+            .map(|file| file.bytes)
+            .unwrap_or_default(),
+    )
+    .map_err(|_| "catalogue.json is not valid JSON.".to_string())?;
     let mut crops = HashMap::new();
     for (key, body) in files {
         if let Some(name) = crop_name(&key, &prefix) {
@@ -618,7 +767,7 @@ fn jpeg_crop_path(name: &str) -> bool {
     lower.ends_with(".jpg") || lower.ends_with(".jpeg")
 }
 
-fn locate_catalogue(files: &HashMap<String, Vec<u8>>) -> Result<(String, String), String> {
+fn locate_catalogue(files: &HashMap<String, TarFile>) -> Result<(String, String), String> {
     if files.contains_key("catalogue.json") {
         return Ok(("catalogue.json".to_string(), String::new()));
     }
@@ -652,7 +801,7 @@ struct SourcePart {
     crops: Vec<String>,
 }
 
-fn parse_source(text: &str) -> Result<Vec<SourcePart>, String> {
+fn parse_source(text: &str, enforce_crop_limit: bool) -> Result<Vec<SourcePart>, String> {
     let value: Value =
         serde_json::from_str(text).map_err(|_| "catalogue.json is not valid JSON.".to_string())?;
     let items = match value {
@@ -681,12 +830,15 @@ fn parse_source(text: &str) -> Result<Vec<SourcePart>, String> {
         let Value::Object(map) = item else {
             return Err("catalogue.json has a part that is not an object.".to_string());
         };
-        parts.push(source_part(&map)?);
+        parts.push(source_part(&map, enforce_crop_limit)?);
     }
-    Ok(merge_parts(parts)?)
+    Ok(merge_parts(parts, enforce_crop_limit)?)
 }
 
-fn source_part(map: &Map<String, Value>) -> Result<SourcePart, String> {
+fn source_part(
+    map: &Map<String, Value>,
+    enforce_crop_limit: bool,
+) -> Result<SourcePart, String> {
     let ic = clean_ic(&field_string(
         map,
         &["ic", "IC", "code", "inventoryCode", "inventory_code"],
@@ -713,7 +865,7 @@ fn source_part(map: &Map<String, Value>) -> Result<SourcePart, String> {
         map,
         &["measurementMethod", "measurement_method"],
     ));
-    let crops = crop_list(map, &ic)?;
+    let crops = crop_list(map, &ic, enforce_crop_limit)?;
     Ok(SourcePart {
         ic,
         description,
@@ -846,7 +998,11 @@ fn clean_ic(raw: &str) -> Result<String, String> {
     Ok(ic.to_string())
 }
 
-fn crop_list(map: &Map<String, Value>, ic: &str) -> Result<Vec<String>, String> {
+fn crop_list(
+    map: &Map<String, Value>,
+    ic: &str,
+    enforce_crop_limit: bool,
+) -> Result<Vec<String>, String> {
     let value = map
         .get("crops")
         .or_else(|| map.get("images"))
@@ -870,7 +1026,7 @@ fn crop_list(map: &Map<String, Value>, ic: &str) -> Result<Vec<String>, String> 
     if items.is_empty() {
         return Ok(Vec::new());
     }
-    if items.len() > MAX_CROPS {
+    if enforce_crop_limit && items.len() > MAX_CROPS {
         return Err(format!("Part {ic} has too many crops."));
     }
     let mut crops = Vec::with_capacity(items.len());
@@ -937,7 +1093,10 @@ fn log_resolved_crops(ic: &str, count: usize) {
     eprintln!("DINOv2 catalogue {ic}: {count} crops");
 }
 
-fn merge_parts(parts: Vec<SourcePart>) -> Result<Vec<SourcePart>, String> {
+fn merge_parts(
+    parts: Vec<SourcePart>,
+    enforce_crop_limit: bool,
+) -> Result<Vec<SourcePart>, String> {
     let mut merged: Vec<SourcePart> = Vec::new();
     for part in parts {
         if let Some(existing) = merged.iter_mut().find(|item| item.ic == part.ic) {
@@ -954,7 +1113,7 @@ fn merge_parts(parts: Vec<SourcePart>) -> Result<Vec<SourcePart>, String> {
                 existing.dimensions = part.dimensions;
             }
             existing.crops.extend(part.crops);
-            if existing.crops.len() > MAX_CROPS {
+            if enforce_crop_limit && existing.crops.len() > MAX_CROPS {
                 return Err(format!("Part {} has too many crops.", existing.ic));
             }
         } else {
@@ -968,50 +1127,409 @@ fn build_from_tar(
     bytes: &[u8],
     embed: &mut dyn FnMut(&[u8]) -> Result<Vec<f32>, String>,
 ) -> Result<Built, String> {
+    let parts = resolve_tar(bytes, true)?;
+    let mut kept = Vec::with_capacity(parts.len());
+    for part in parts {
+        if part.crops.len() > MAX_CROPS {
+            return Err(format!("Part {} has too many crops.", part.ic));
+        }
+        kept.push(KeptPart {
+            ic: part.ic,
+            description: part.description,
+            kind: part.kind,
+            measurement_method: part.measurement_method,
+            dimensions: part.dimensions,
+            crop_limit: None,
+            crops: part.crops,
+        });
+    }
+    embed_kept(kept, embed)
+}
+
+struct WaitingReplace {
+    token: u64,
+    vision: PathBuf,
+    draft: ReplaceDraft,
+}
+
+#[derive(Debug)]
+struct ReplaceDraft {
+    parts: Vec<ResolvedPart>,
+    prompts: Vec<CropClassPrompt>,
+    limits: HashMap<String, usize>,
+}
+
+#[derive(Debug)]
+struct ResolvedCrop {
+    key: String,
+    jpeg: Vec<u8>,
+    mtime: u64,
+}
+
+#[derive(Debug)]
+struct ResolvedPart {
+    ic: String,
+    description: String,
+    kind: String,
+    measurement_method: String,
+    dimensions: Value,
+    crops: Vec<ResolvedCrop>,
+}
+
+struct KeptPart {
+    ic: String,
+    description: String,
+    kind: String,
+    measurement_method: String,
+    dimensions: Value,
+    crop_limit: Option<usize>,
+    crops: Vec<ResolvedCrop>,
+}
+
+#[derive(Debug)]
+struct ImportReport {
+    parts: usize,
+    message: String,
+}
+
+struct Decision {
+    ic: String,
+    kept: usize,
+    dropped: usize,
+    overrode: bool,
+}
+
+#[derive(Clone, Copy)]
+enum CropAction {
+    Truncate,
+    Override,
+}
+
+fn store_waiting(vision: PathBuf, draft: ReplaceDraft) -> u64 {
+    let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+    let mut slot = WAITING.lock().unwrap_or_else(|err| err.into_inner());
+    if slot.is_some() {
+        eprintln!("DINOv2 catalogue crop choice replaced a waiting import.");
+    }
+    *slot = Some(WaitingReplace {
+        token,
+        vision,
+        draft,
+    });
+    token
+}
+
+fn take_waiting(token: u64) -> Result<WaitingReplace, String> {
+    let mut slot = WAITING.lock().unwrap_or_else(|err| err.into_inner());
+    match slot.as_ref() {
+        Some(waiting) if waiting.token == token => Ok(slot.take().expect("waiting token")),
+        _ => Err("That import is no longer waiting.".to_string()),
+    }
+}
+
+fn restore_waiting(waiting: WaitingReplace) {
+    let mut slot = WAITING.lock().unwrap_or_else(|err| err.into_inner());
+    if slot.is_some() {
+        eprintln!("DINOv2 catalogue left the newer crop choice in place.");
+        return;
+    }
+    *slot = Some(waiting);
+}
+
+fn clear_waiting() {
+    *WAITING.lock().unwrap_or_else(|err| err.into_inner()) = None;
+}
+
+fn parse_choices(choices: &[CropChoiceInput]) -> Result<Vec<(String, CropAction)>, String> {
+    let mut parsed = Vec::with_capacity(choices.len());
+    let mut seen = HashSet::new();
+    for choice in choices {
+        let ic = clean_ic(&choice.ic)?;
+        if !seen.insert(ic.clone()) {
+            return Err(format!("Choose one action for {ic}."));
+        }
+        let action = match choice.action.trim() {
+            "truncate" => CropAction::Truncate,
+            "override" => CropAction::Override,
+            _ => return Err("Choose truncate or keep all for each class.".to_string()),
+        };
+        parsed.push((ic, action));
+    }
+    Ok(parsed)
+}
+
+/// Read a full-replace tar without embedding. Classes over their limit are
+/// listed for the admin. Nothing is written.
+fn inspect_replace(bytes: &[u8], vision: &Path) -> Result<ReplaceDraft, String> {
+    let parts = resolve_tar(bytes, false)?;
+    let limits = known_limits(vision);
+    let mut prompts = Vec::new();
+    for part in &parts {
+        let limit = allowance(&limits, &part.ic);
+        if part.crops.len() > limit {
+            prompts.push(prompt_for(part, limit));
+        }
+    }
+    Ok(ReplaceDraft {
+        parts,
+        prompts,
+        limits,
+    })
+}
+
+fn prompt_for(part: &ResolvedPart, limit: usize) -> CropClassPrompt {
+    let count = part.crops.len();
+    let dropped = count.saturating_sub(limit);
+    let recent = mtimes_differ(&part.crops);
+    eprintln!(
+        "DINOv2 catalogue {}: {count} crops, limit {limit}, waiting for a choice",
+        part.ic
+    );
+    CropClassPrompt {
+        ic: part.ic.clone(),
+        count,
+        limit,
+        dropped,
+        recent,
+        thumbs: prompt_thumbs(part),
+    }
+}
+
+fn commit_replace(
+    vision: &Path,
+    draft: &ReplaceDraft,
+    choices: &[(String, CropAction)],
+    embed: &mut dyn FnMut(&[u8]) -> Result<Vec<f32>, String>,
+) -> Result<ImportReport, String> {
+    let mut chosen = HashMap::new();
+    for (ic, action) in choices {
+        if chosen.insert(ic.clone(), *action).is_some() {
+            return Err(format!("Choose one action for {ic}."));
+        }
+    }
+    for prompt in &draft.prompts {
+        if !chosen.contains_key(&prompt.ic) {
+            return Err(format!("Choose a crop limit for {}.", prompt.ic));
+        }
+    }
+    for ic in chosen.keys() {
+        if !draft.prompts.iter().any(|prompt| &prompt.ic == ic) {
+            return Err(format!("{ic} is already within its crop limit."));
+        }
+    }
+    let mut kept = Vec::with_capacity(draft.parts.len());
+    let mut notes = Vec::new();
+    let mut overrides = Vec::new();
+    for part in &draft.parts {
+        let limit = draft
+            .prompts
+            .iter()
+            .find(|prompt| prompt.ic == part.ic)
+            .map(|prompt| prompt.limit)
+            .unwrap_or_else(|| allowance(&draft.limits, &part.ic));
+        let (indexes, crop_limit, note) = match chosen.get(&part.ic).copied() {
+            None => {
+                if part.crops.len() > limit {
+                    return Err(format!("Choose a crop limit for {}.", part.ic));
+                }
+                if part.crops.len() > MAX_CROPS {
+                    eprintln!(
+                        "DINOv2 catalogue {}: kept {} crops, limit {limit}",
+                        part.ic,
+                        part.crops.len()
+                    );
+                }
+                (
+                    select_indexes(&part.crops, part.crops.len()),
+                    stored_allowance(part.crops.len(), limit),
+                    None,
+                )
+            }
+            Some(CropAction::Truncate) => {
+                let indexes = select_indexes(&part.crops, limit);
+                let kept_count = indexes.len();
+                let dropped = part.crops.len().saturating_sub(kept_count);
+                eprintln!(
+                    "DINOv2 catalogue {}: truncated to {kept_count}, dropped {dropped}",
+                    part.ic
+                );
+                let note = Decision {
+                    ic: part.ic.clone(),
+                    kept: kept_count,
+                    dropped,
+                    overrode: false,
+                };
+                (
+                    indexes,
+                    stored_allowance(kept_count, limit),
+                    Some(note),
+                )
+            }
+            Some(CropAction::Override) => {
+                let count = part.crops.len();
+                eprintln!(
+                    "DINOv2 catalogue {}: kept all {count} crops, limit is now {count}",
+                    part.ic
+                );
+                overrides.push((part.ic.clone(), count));
+                let note = Decision {
+                    ic: part.ic.clone(),
+                    kept: count,
+                    dropped: 0,
+                    overrode: true,
+                };
+                (select_indexes(&part.crops, count), Some(count), Some(note))
+            }
+        };
+        if let Some(note) = note {
+            notes.push(note);
+        }
+        let crops = indexes
+            .into_iter()
+            .map(|index| ResolvedCrop {
+                key: part.crops[index].key.clone(),
+                jpeg: part.crops[index].jpeg.clone(),
+                mtime: part.crops[index].mtime,
+            })
+            .collect();
+        kept.push(KeptPart {
+            ic: part.ic.clone(),
+            description: part.description.clone(),
+            kind: part.kind.clone(),
+            measurement_method: part.measurement_method.clone(),
+            dimensions: part.dimensions.clone(),
+            crop_limit,
+            crops,
+        });
+    }
+    let built = embed_kept(kept, embed)?;
+    let count = built.book.parts.len();
+    commit_book(vision, &built)?;
+    if let Err(err) = record_crop_limits(vision, &overrides) {
+        eprintln!("warning: DINOv2 crop limits were not saved: {err}");
+    }
+    *lock(&CATALOGUE) = built.book;
+    crate::catalog::reload_installed();
+    let summary = decision_summary(&notes);
+    let message = if summary.is_empty() {
+        format!("Catalogue loaded {count} parts.")
+    } else {
+        format!("Catalogue loaded {count} parts. {summary}")
+    };
+    Ok(ImportReport {
+        parts: count,
+        message,
+    })
+}
+
+fn stored_allowance(kept: usize, limit: usize) -> Option<usize> {
+    if kept > MAX_CROPS {
+        Some(limit.max(kept))
+    } else {
+        None
+    }
+}
+
+fn decision_summary(notes: &[Decision]) -> String {
+    if notes.is_empty() {
+        return String::new();
+    }
+    const SHOW: usize = 8;
+    let mut parts = Vec::new();
+    for note in notes.iter().take(SHOW) {
+        if note.overrode {
+            parts.push(format!("Kept all crops for {} ({})", note.ic, note.kept));
+        } else {
+            parts.push(format!(
+                "Truncated {} to {} (dropped {})",
+                note.ic, note.kept, note.dropped
+            ));
+        }
+    }
+    let mut text = parts.join(". ");
+    if notes.len() > SHOW {
+        text.push_str(&format!(
+            ". {} more classes were also updated",
+            notes.len() - SHOW
+        ));
+    }
+    text.push('.');
+    text
+}
+
+fn resolve_tar(bytes: &[u8], enforce_crop_limit: bool) -> Result<Vec<ResolvedPart>, String> {
     let archive = read_tar(bytes)?;
-    let sources = parse_source(&archive.catalogue)?;
+    let sources = parse_source(&archive.catalogue, enforce_crop_limit)?;
+    let parts = resolve_sources(&archive, sources);
+    if parts.is_empty() {
+        return Err("Catalogue has no parts.".to_string());
+    }
+    Ok(parts)
+}
+
+fn resolve_sources(archive: &Archive, sources: Vec<SourcePart>) -> Vec<ResolvedPart> {
     let mut grouped = group_crops(&sources);
-    let mut used = HashSet::new();
-    let mut parts = Vec::with_capacity(sources.len());
-    let mut files = Vec::new();
+    let mut parts = Vec::new();
     for source in sources {
         let keys = grouped.remove(&source.ic).unwrap_or_default();
-        let mut resolved = Vec::with_capacity(keys.len());
+        let mut crops = Vec::new();
         for key in keys {
-            if let Some(jpeg) = archive.files.get(&key) {
-                resolved.push((key, jpeg.clone()));
+            if let Some(file) = archive.files.get(&key) {
+                crops.push(ResolvedCrop {
+                    key,
+                    jpeg: file.bytes.clone(),
+                    mtime: file.mtime,
+                });
             }
         }
-        log_resolved_crops(&source.ic, resolved.len());
-        if resolved.is_empty() {
+        log_resolved_crops(&source.ic, crops.len());
+        if crops.is_empty() {
             continue;
         }
-        if resolved.len() > MAX_CROPS {
-            return Err(format!("Part {} has too many crops.", source.ic));
-        }
-        let folder = allocate_folder(&mut used, &source.ic);
-        let mut crops = Vec::with_capacity(resolved.len());
-        let mut embeddings = Vec::with_capacity(resolved.len());
-        for (index, (key, jpeg)) in resolved.iter().enumerate() {
-            let values =
-                embed(jpeg).map_err(|err| format!("Could not embed {}: {err}", source.ic))?;
-            if values.is_empty() || values.iter().any(|value| !value.is_finite()) {
-                return Err(format!("Could not embed {}.", source.ic));
-            }
-            let file_name = stored_crop_name(key, index);
-            let relative = format!("{CROPS_DIR}/{folder}/{file_name}");
-            crops.push(relative.clone());
-            files.push((relative, jpeg.clone()));
-            embeddings.push(values);
-        }
-        parts.push(Part {
+        parts.push(ResolvedPart {
             ic: source.ic,
             description: source.description,
             kind: source.kind,
             measurement_method: source.measurement_method,
             dimensions: source.dimensions,
             crops,
+        });
+    }
+    parts
+}
+
+fn embed_kept(
+    kept: Vec<KeptPart>,
+    embed: &mut dyn FnMut(&[u8]) -> Result<Vec<f32>, String>,
+) -> Result<Built, String> {
+    let mut used = HashSet::new();
+    let mut parts = Vec::with_capacity(kept.len());
+    let mut files = Vec::new();
+    for part in kept {
+        let folder = allocate_folder(&mut used, &part.ic);
+        let mut crops = Vec::with_capacity(part.crops.len());
+        let mut embeddings = Vec::with_capacity(part.crops.len());
+        for (index, crop) in part.crops.iter().enumerate() {
+            let values =
+                embed(&crop.jpeg).map_err(|err| format!("Could not embed {}: {err}", part.ic))?;
+            if values.is_empty() || values.iter().any(|value| !value.is_finite()) {
+                return Err(format!("Could not embed {}.", part.ic));
+            }
+            let file_name = stored_crop_name(&crop.key, index);
+            let relative = format!("{CROPS_DIR}/{folder}/{file_name}");
+            crops.push(relative.clone());
+            files.push((relative, crop.jpeg.clone()));
+            embeddings.push(values);
+        }
+        parts.push(Part {
+            ic: part.ic,
+            description: part.description,
+            kind: part.kind,
+            measurement_method: part.measurement_method,
+            dimensions: part.dimensions,
+            crops,
             embeddings,
+            crop_limit: part.crop_limit.filter(|limit| *limit > MAX_CROPS),
         });
     }
     if parts.is_empty() {
@@ -1021,6 +1539,205 @@ fn build_from_tar(
         book: Book { parts },
         files,
     })
+}
+
+fn allowance(limits: &HashMap<String, usize>, ic: &str) -> usize {
+    limits
+        .get(ic)
+        .copied()
+        .filter(|count| *count > MAX_CROPS)
+        .unwrap_or(MAX_CROPS)
+}
+
+fn known_limits(vision: &Path) -> HashMap<String, usize> {
+    let mut limits = read_limit_map(vision);
+    match load_book(vision) {
+        Ok(Some(book)) => {
+            for part in book.parts {
+                if let Some(count) = part.crop_limit.filter(|count| *count > MAX_CROPS) {
+                    let slot = limits.entry(part.ic).or_insert(0);
+                    if count > *slot {
+                        *slot = count;
+                    }
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(err) => {
+            eprintln!("warning: DINOv2 crop limits ignored the saved catalogue: {err}");
+        }
+    }
+    limits.retain(|_, count| *count > MAX_CROPS);
+    limits
+}
+
+fn read_limit_map(vision: &Path) -> HashMap<String, usize> {
+    let path = vision.join(CROP_LIMITS_FILE);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return HashMap::new(),
+        Err(err) => {
+            eprintln!("warning: DINOv2 crop limits were not read: {err}");
+            return HashMap::new();
+        }
+    };
+    let value: Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
+        Err(_) => {
+            eprintln!("warning: DINOv2 crop limits are not valid JSON.");
+            return HashMap::new();
+        }
+    };
+    let Some(map) = value.get("limits").and_then(|item| item.as_object()) else {
+        eprintln!("warning: DINOv2 crop limits are not a valid file.");
+        return HashMap::new();
+    };
+    let mut limits = HashMap::new();
+    for (ic, value) in map {
+        let Some(count) = value
+            .as_u64()
+            .and_then(|count| usize::try_from(count).ok())
+        else {
+            continue;
+        };
+        if count > MAX_CROPS {
+            limits.insert(ic.clone(), count);
+        }
+    }
+    limits
+}
+
+fn record_crop_limits(vision: &Path, updates: &[(String, usize)]) -> Result<(), String> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+    let mut limits = read_limit_map(vision);
+    for (ic, count) in updates {
+        if *count > MAX_CROPS {
+            limits.insert(ic.clone(), *count);
+        }
+    }
+    let mut map = Map::new();
+    let mut keys: Vec<&String> = limits.keys().collect();
+    keys.sort();
+    for key in keys {
+        map.insert(key.clone(), serde_json::json!(limits[key]));
+    }
+    let file = serde_json::json!({
+        "version": 1,
+        "limits": map,
+    });
+    let mut bytes = serde_json::to_vec_pretty(&file)
+        .map_err(|_| "Could not write the catalogue.".to_string())?;
+    bytes.push(b'\n');
+    replace_file_bytes(&vision.join(CROP_LIMITS_FILE), &bytes)
+}
+
+fn mtimes_differ(crops: &[ResolvedCrop]) -> bool {
+    let Some(first) = crops.first() else {
+        return false;
+    };
+    crops.iter().any(|crop| crop.mtime != first.mtime)
+}
+
+fn select_indexes(crops: &[ResolvedCrop], keep: usize) -> Vec<usize> {
+    if crops.len() <= keep {
+        return (0..crops.len()).collect();
+    }
+    if mtimes_differ(crops) {
+        newest_indexes(crops, keep)
+    } else {
+        sample_indexes(crops, keep)
+    }
+}
+
+fn newest_indexes(crops: &[ResolvedCrop], keep: usize) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..crops.len()).collect();
+    order.sort_by(|&left, &right| {
+        crops[right]
+            .mtime
+            .cmp(&crops[left].mtime)
+            .then(right.cmp(&left))
+    });
+    order.truncate(keep);
+    order.sort_unstable();
+    order
+}
+
+fn sample_indexes(crops: &[ResolvedCrop], keep: usize) -> Vec<usize> {
+    let mut indexes: Vec<usize> = (0..crops.len()).collect();
+    let mut state = sample_seed(crops);
+    for start in 0..keep {
+        let span = indexes.len() - start;
+        let offset = (state as usize) % span;
+        indexes.swap(start, start + offset);
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+    }
+    indexes.truncate(keep);
+    indexes.sort_unstable();
+    indexes
+}
+
+fn sample_seed(crops: &[ResolvedCrop]) -> u64 {
+    let mut state = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() as u64)
+        .unwrap_or(0x9E37_79B9_7F4A_7C15);
+    state ^= (std::process::id() as u64).wrapping_shl(32);
+    for crop in crops {
+        state = state.wrapping_mul(0x100_0000_01B3);
+        for byte in crop.key.bytes() {
+            state = state.wrapping_add(u64::from(byte));
+        }
+    }
+    if state == 0 {
+        0xA5A5_A5A5_A5A5_A5A5
+    } else {
+        state
+    }
+}
+
+fn prompt_thumbs(part: &ResolvedPart) -> Vec<String> {
+    let mut order: Vec<usize> = if mtimes_differ(&part.crops) {
+        let mut indexes = newest_indexes(&part.crops, part.crops.len());
+        indexes.sort_by(|&left, &right| {
+            part.crops[right]
+                .mtime
+                .cmp(&part.crops[left].mtime)
+                .then(right.cmp(&left))
+        });
+        indexes
+    } else {
+        (0..part.crops.len()).collect()
+    };
+    let mut thumbs = Vec::new();
+    for index in order.drain(..) {
+        if thumbs.len() == PROMPT_THUMBS {
+            break;
+        }
+        if let Some(url) = thumb_jpeg(&part.crops[index].jpeg) {
+            thumbs.push(url);
+        }
+    }
+    thumbs
+}
+
+fn thumb_jpeg(bytes: &[u8]) -> Option<String> {
+    let image = image::load_from_memory(bytes).ok()?;
+    let thumb = image.thumbnail(THUMB_EDGE, THUMB_EDGE);
+    let mut encoded = Vec::new();
+    thumb
+        .write_to(
+            &mut std::io::Cursor::new(&mut encoded),
+            image::ImageFormat::Jpeg,
+        )
+        .ok()?;
+    Some(format!(
+        "data:image/jpeg;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(encoded)
+    ))
 }
 
 fn allocate_folder(used: &mut HashSet<String>, ic: &str) -> String {
@@ -1175,6 +1892,9 @@ fn fuse_part(
     if crops.len() > MAX_CROPS {
         return Err(format!("Part {} has too many crops.", old.ic));
     }
+    let crop_limit = old
+        .crop_limit
+        .filter(|limit| *limit > MAX_CROPS && crops.len() <= *limit);
     Ok(Part {
         ic: old.ic.clone(),
         description: prefer_text(&new_part.description, &old.description),
@@ -1187,6 +1907,7 @@ fn fuse_part(
         },
         crops,
         embeddings,
+        crop_limit,
     })
 }
 
@@ -1314,6 +2035,7 @@ fn book_json(book: &Book) -> Result<Vec<u8>, String> {
                 dimensions: part.dimensions.clone(),
                 crops: part.crops.clone(),
                 embeddings: part.embeddings.clone(),
+                crop_limit: part.crop_limit.filter(|limit| *limit > MAX_CROPS),
             })
             .collect(),
     };
@@ -1362,6 +2084,12 @@ struct StoredPart {
     dimensions: Value,
     crops: Vec<String>,
     embeddings: Vec<Vec<f32>>,
+    #[serde(
+        default,
+        rename = "cropLimit",
+        skip_serializing_if = "Option::is_none"
+    )]
+    crop_limit: Option<usize>,
 }
 
 /// `Ok(None)` when the file is absent.
@@ -1398,7 +2126,9 @@ fn stored_part(part: StoredPart, path: &Path) -> Result<Part, String> {
         )
     };
     let ic = clean_ic(&part.ic).map_err(|_| invalid())?;
-    if part.crops.len() != part.embeddings.len() || part.crops.len() > MAX_CROPS {
+    let crop_limit = part.crop_limit.filter(|limit| *limit > MAX_CROPS);
+    let allowed = crop_limit.unwrap_or(MAX_CROPS);
+    if part.crops.len() != part.embeddings.len() || part.crops.len() > allowed {
         return Err(invalid());
     }
     for crop in &part.crops {
@@ -1419,6 +2149,7 @@ fn stored_part(part: StoredPart, path: &Path) -> Result<Part, String> {
         dimensions: part.dimensions,
         crops: part.crops,
         embeddings: part.embeddings,
+        crop_limit,
     })
 }
 
@@ -1537,19 +2268,7 @@ fn dimensions_text(value: &Value) -> String {
 fn thumb_url(vision: &Path, crop: &str) -> Option<String> {
     let path = crop_file(vision, crop)?;
     let bytes = fs::read(path).ok()?;
-    let image = image::load_from_memory(&bytes).ok()?;
-    let thumb = image.thumbnail(THUMB_EDGE, THUMB_EDGE);
-    let mut encoded = Vec::new();
-    thumb
-        .write_to(
-            &mut std::io::Cursor::new(&mut encoded),
-            image::ImageFormat::Jpeg,
-        )
-        .ok()?;
-    Some(format!(
-        "data:image/jpeg;base64,{}",
-        base64::engine::general_purpose::STANDARD.encode(encoded)
-    ))
+    thumb_jpeg(&bytes)
 }
 
 fn crop_file(vision: &Path, crop: &str) -> Option<PathBuf> {
@@ -1596,6 +2315,7 @@ fn decode_jpeg(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     fn temp_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -1636,6 +2356,56 @@ mod tests {
             builder.append(&header, *bytes).unwrap();
         }
         builder.into_inner().unwrap()
+    }
+
+    fn pack_owned(files: &[(String, Vec<u8>, u64)]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        for (name, bytes, mtime) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_path(name).unwrap();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_mtime(*mtime);
+            header.set_cksum();
+            builder.append(&header, bytes.as_slice()).unwrap();
+        }
+        builder.into_inner().unwrap()
+    }
+
+    /// One class with `count` crops, plus a single OK crop.
+    fn oversized_tar(ic: &str, count: usize, timed: bool, jpeg: &[u8]) -> Vec<u8> {
+        let mut names = Vec::new();
+        let mut files = Vec::new();
+        for index in 0..count {
+            let name = format!("crops/{ic}/c{index:02}.jpg");
+            names.push(name.clone());
+            files.push((
+                name,
+                jpeg.to_vec(),
+                if timed { (index as u64) + 1 } else { 0 },
+            ));
+        }
+        let ok = "crops/OK/ok.jpg".to_string();
+        files.push((ok.clone(), jpeg.to_vec(), 1));
+        let catalogue = serde_json::json!({
+            "parts": [
+                { "ic": ic, "description": "Hinge", "crops": names },
+                { "ic": "OK", "description": "Ok", "crops": [ok] }
+            ]
+        });
+        files.insert(
+            0,
+            (
+                "catalogue.json".to_string(),
+                serde_json::to_vec(&catalogue).unwrap(),
+                1,
+            ),
+        );
+        pack_owned(&files)
+    }
+
+    fn crop_names(part: &Part) -> HashSet<String> {
+        part.crops.iter().map(|crop| crop_match_key(crop)).collect()
     }
 
     fn stub_embed(bytes: &[u8]) -> Result<Vec<f32>, String> {
@@ -2253,6 +3023,270 @@ mod tests {
         let err = import_tar_bytes(&packed, &dir, false, &mut stub_embed).unwrap_err();
         assert!(err.contains("too many parts"), "{err}");
         assert_eq!(fs::read(catalogue_path(&dir)).unwrap(), before);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replace_prompts_then_truncates_to_the_newest_crops() {
+        let dir = temp_dir("replace-trim");
+        let jpeg = tiny_jpeg();
+        let rules = br#"{"partRules":[{"parent":"nut"}]}"#;
+        fs::write(dir.join("config.local.json"), rules).unwrap();
+        let first = pack(&[
+            (
+                "catalogue.json",
+                br#"{"parts":[{"ic":"KEEP","description":"Local","crops":["crops/keep.jpg"]}]}"#,
+            ),
+            ("crops/keep.jpg", jpeg.as_slice()),
+        ]);
+        import_tar_bytes(&first, &dir, true, &mut stub_embed).unwrap();
+        let before = fs::read(catalogue_path(&dir)).unwrap();
+        let count = MAX_CROPS + 6;
+        let bytes = oversized_tar("ACH01", count, true, &jpeg);
+        let draft = inspect_replace(&bytes, &dir).unwrap();
+        assert_eq!(fs::read(catalogue_path(&dir)).unwrap(), before);
+        assert!(!dir.join(CROP_LIMITS_FILE).exists());
+        assert_eq!(draft.prompts.len(), 1);
+        assert_eq!(draft.prompts[0].ic, "ACH01");
+        assert_eq!(draft.prompts[0].count, count);
+        assert_eq!(draft.prompts[0].limit, MAX_CROPS);
+        assert_eq!(draft.prompts[0].dropped, 6);
+        assert!(draft.prompts[0].recent);
+        assert!(!draft.prompts[0].thumbs.is_empty());
+        assert!(draft.prompts[0].thumbs.len() <= PROMPT_THUMBS);
+        let err = commit_replace(&dir, &draft, &[], &mut stub_embed).unwrap_err();
+        assert!(err.contains("Choose a crop limit"), "{err}");
+        assert_eq!(fs::read(catalogue_path(&dir)).unwrap(), before);
+
+        let report = commit_replace(
+            &dir,
+            &draft,
+            &[("ACH01".to_string(), CropAction::Truncate)],
+            &mut stub_embed,
+        )
+        .unwrap();
+        assert_eq!(report.parts, 2);
+        assert!(
+            report
+                .message
+                .starts_with("Catalogue loaded 2 parts. Truncated ACH01 to 24 (dropped 6)."),
+            "{}",
+            report.message
+        );
+        let book = load_book(&dir).unwrap().unwrap();
+        assert_eq!(book.parts.len(), 2);
+        assert!(book.parts.iter().all(|part| part.ic != "KEEP"));
+        let ach = book.parts.iter().find(|part| part.ic == "ACH01").unwrap();
+        let mut expected = HashSet::new();
+        for index in 6..count {
+            expected.insert(format!("c{index:02}.jpg"));
+        }
+        assert_eq!(crop_names(ach), expected);
+        assert!(ach.crop_limit.is_none());
+        let ok = book.parts.iter().find(|part| part.ic == "OK").unwrap();
+        assert_eq!(ok.crops.len(), 1);
+        assert!(!dir.join(CROP_LIMITS_FILE).exists());
+        assert_eq!(fs::read(dir.join("config.local.json")).unwrap(), rules);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replace_override_is_remembered_and_a_later_replace_uses_it() {
+        let dir = temp_dir("replace-override");
+        let jpeg = tiny_jpeg();
+        let first = pack(&[
+            (
+                "catalogue.json",
+                br#"{"parts":[{"ic":"KEEP","crops":["crops/keep.jpg"]}]}"#,
+            ),
+            ("crops/keep.jpg", jpeg.as_slice()),
+        ]);
+        import_tar_bytes(&first, &dir, true, &mut stub_embed).unwrap();
+        let before = fs::read(catalogue_path(&dir)).unwrap();
+        let wide = oversized_tar("ACH01", 30, true, &jpeg);
+        let draft = inspect_replace(&wide, &dir).unwrap();
+        let err = commit_replace(&dir, &draft, &[("ACH01".to_string(), CropAction::Override)], &mut |_| {
+            Err("DINOv2 model is not loaded.".to_string())
+        })
+        .unwrap_err();
+        assert!(err.contains("DINOv2 model is not loaded"), "{err}");
+        assert_eq!(fs::read(catalogue_path(&dir)).unwrap(), before);
+        assert!(!dir.join(CROP_LIMITS_FILE).exists());
+
+        let report = commit_replace(
+            &dir,
+            &draft,
+            &[("ACH01".to_string(), CropAction::Override)],
+            &mut stub_embed,
+        )
+        .unwrap();
+        assert!(
+            report.message.contains("Kept all crops for ACH01 (30)."),
+            "{}",
+            report.message
+        );
+        let book = load_book(&dir).unwrap().unwrap();
+        let ach = book.parts.iter().find(|part| part.ic == "ACH01").unwrap();
+        assert_eq!(ach.crops.len(), 30);
+        assert_eq!(ach.crop_limit, Some(30));
+        let limits: Value =
+            serde_json::from_slice(&fs::read(dir.join(CROP_LIMITS_FILE)).unwrap()).unwrap();
+        assert_eq!(limits["limits"]["ACH01"], serde_json::json!(30));
+
+        let within = oversized_tar("ACH01", 28, true, &jpeg);
+        let again = inspect_replace(&within, &dir).unwrap();
+        assert!(again.prompts.is_empty());
+        let kept = commit_replace(&dir, &again, &[], &mut stub_embed).unwrap();
+        assert_eq!(kept.message, "Catalogue loaded 2 parts.");
+        let book = load_book(&dir).unwrap().unwrap();
+        let ach = book.parts.iter().find(|part| part.ic == "ACH01").unwrap();
+        assert_eq!(ach.crops.len(), 28);
+        assert_eq!(ach.crop_limit, Some(30));
+        let limits: Value =
+            serde_json::from_slice(&fs::read(dir.join(CROP_LIMITS_FILE)).unwrap()).unwrap();
+        assert_eq!(limits["limits"]["ACH01"], serde_json::json!(30));
+
+        let larger = oversized_tar("ACH01", 40, true, &jpeg);
+        let prompt = inspect_replace(&larger, &dir).unwrap();
+        assert_eq!(prompt.prompts.len(), 1);
+        assert_eq!(prompt.prompts[0].limit, 30);
+        assert_eq!(prompt.prompts[0].dropped, 10);
+        commit_replace(
+            &dir,
+            &prompt,
+            &[("ACH01".to_string(), CropAction::Truncate)],
+            &mut stub_embed,
+        )
+        .unwrap();
+        let book = load_book(&dir).unwrap().unwrap();
+        let ach = book.parts.iter().find(|part| part.ic == "ACH01").unwrap();
+        assert_eq!(ach.crops.len(), 30);
+        assert_eq!(ach.crop_limit, Some(30));
+        let mut expected = HashSet::new();
+        for index in 10..40 {
+            expected.insert(format!("c{index:02}.jpg"));
+        }
+        assert_eq!(crop_names(ach), expected);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replace_samples_when_the_archive_has_no_crop_dates() {
+        let dir = temp_dir("replace-sample");
+        let jpeg = tiny_jpeg();
+        let bytes = oversized_tar("ACH01", MAX_CROPS + 6, false, &jpeg);
+        let draft = inspect_replace(&bytes, &dir).unwrap();
+        assert_eq!(draft.prompts.len(), 1);
+        assert!(!draft.prompts[0].recent);
+        let report = commit_replace(
+            &dir,
+            &draft,
+            &[("ACH01".to_string(), CropAction::Truncate)],
+            &mut stub_embed,
+        )
+        .unwrap();
+        assert!(report.message.contains("dropped 6"), "{}", report.message);
+        let book = load_book(&dir).unwrap().unwrap();
+        let ach = book.parts.iter().find(|part| part.ic == "ACH01").unwrap();
+        let names = crop_names(ach);
+        assert_eq!(names.len(), MAX_CROPS);
+        assert_eq!(ach.crops.len(), MAX_CROPS);
+        for name in &names {
+            assert!(name.starts_with('c') && name.ends_with(".jpg"), "{name}");
+        }
+        assert!(book.parts.iter().any(|part| part.ic == "OK"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_still_rejects_a_class_over_the_crop_limit() {
+        let dir = temp_dir("merge-over");
+        let jpeg = tiny_jpeg();
+        let first = pack(&[
+            (
+                "catalogue.json",
+                br#"{"parts":[{"ic":"KEEP","crops":["crops/keep.jpg"]}]}"#,
+            ),
+            ("crops/keep.jpg", jpeg.as_slice()),
+        ]);
+        import_tar_bytes(&first, &dir, true, &mut stub_embed).unwrap();
+        let before = fs::read(catalogue_path(&dir)).unwrap();
+        let bytes = oversized_tar("ACH01", MAX_CROPS + 1, false, &jpeg);
+        let err = import_tar_bytes(&bytes, &dir, false, &mut stub_embed).unwrap_err();
+        assert!(err.contains("too many crops"), "{err}");
+        assert_eq!(fs::read(catalogue_path(&dir)).unwrap(), before);
+        assert_eq!(load_book(&dir).unwrap().unwrap().parts[0].ic, "KEEP");
+        assert!(!dir.join(CROP_LIMITS_FILE).exists());
+
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        let mut files = vec![(
+            "catalogue.json".to_string(),
+            Vec::new(),
+            1_u64,
+        )];
+        for index in 0..13 {
+            let name = format!("crops/ACH01/a{index:02}.jpg");
+            left.push(name.clone());
+            files.push((name, jpeg.clone(), 0));
+        }
+        for index in 0..12 {
+            let name = format!("crops/ACH01/b{index:02}.jpg");
+            right.push(name.clone());
+            files.push((name, jpeg.clone(), 0));
+        }
+        let catalogue = serde_json::json!({
+            "parts": [
+                { "ic": "ACH01", "crops": left },
+                { "ic": "ACH01", "description": "Later", "crops": right }
+            ]
+        });
+        files[0].1 = serde_json::to_vec(&catalogue).unwrap();
+        let duplicate = pack_owned(&files);
+        let err = import_tar_bytes(&duplicate, &dir, false, &mut stub_embed).unwrap_err();
+        assert!(err.contains("too many crops"), "{err}");
+        assert_eq!(fs::read(catalogue_path(&dir)).unwrap(), before);
+        let draft = inspect_replace(&duplicate, &dir).unwrap();
+        assert_eq!(draft.prompts.len(), 1);
+        assert_eq!(draft.prompts[0].count, 25);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replace_still_rejects_corrupt_data_before_a_choice() {
+        let dir = temp_dir("replace-bad");
+        let jpeg = tiny_jpeg();
+        let first = pack(&[
+            (
+                "catalogue.json",
+                br#"{"parts":[{"ic":"KEEP","crops":["crops/keep.jpg"]}]}"#,
+            ),
+            ("crops/keep.jpg", jpeg.as_slice()),
+        ]);
+        import_tar_bytes(&first, &dir, true, &mut stub_embed).unwrap();
+        let before = fs::read(catalogue_path(&dir)).unwrap();
+        let bad = pack(&[("catalogue.json", b"{"), ("crops/a.jpg", jpeg.as_slice())]);
+        let err = inspect_replace(&bad, &dir).unwrap_err();
+        assert!(err.contains("not valid JSON"), "{err}");
+        let mut names = Vec::new();
+        let mut files = vec![("catalogue.json".to_string(), Vec::new(), 1_u64)];
+        for index in 0..(MAX_CROPS + 2) {
+            let name = format!("crops/ACH01/c{index:02}.jpg");
+            names.push(name.clone());
+            files.push((name, jpeg.clone(), (index as u64) + 1));
+        }
+        let catalogue = serde_json::json!({
+            "parts": [
+                { "ic": "ACH01", "crops": names },
+                { "ic": "BAD", "crops": ["../secret.jpg"] }
+            ]
+        });
+        files[0].1 = serde_json::to_vec(&catalogue).unwrap();
+        let outside = pack_owned(&files);
+        let err = inspect_replace(&outside, &dir).unwrap_err();
+        assert!(err.contains("outside crops"), "{err}");
+        assert_eq!(fs::read(catalogue_path(&dir)).unwrap(), before);
+        assert!(!dir.join(CROP_LIMITS_FILE).exists());
         let _ = fs::remove_dir_all(&dir);
     }
 }

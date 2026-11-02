@@ -70,6 +70,8 @@ pub fn run() {
             detect::model_class_names,
             dinov2::dinov2_status,
             catalogue::import_catalogue,
+            catalogue::finish_catalogue_replace,
+            catalogue::cancel_catalogue_replace,
             catalogue::list_catalogue,
             catalogue::delete_catalogue_part,
             catalogue::preview_catalogue_crop,
