@@ -20,6 +20,12 @@ import {
 	parseDetectRois,
 	withSlotEnabled,
 } from "$lib/detect-rois";
+import {
+	clampDinoTopN,
+	DINO_TOP_DEFAULT,
+	DINO_TOP_MAX,
+	DINO_TOP_MIN,
+} from "$lib/dino-feedback";
 import { metrologyDocument, readMetrology } from "$lib/metrology";
 import {
 	PART_LABEL_LIMIT,
@@ -162,6 +168,11 @@ let catalogDebug = false;
 let catalogDebugNotice = "";
 let catalogDebugGeneration = 0;
 let catalogDebugChain: Promise<void> = Promise.resolve();
+let dinoTopN = DINO_TOP_DEFAULT;
+let dinoTopText = String(DINO_TOP_DEFAULT);
+let dinoTopNotice = "";
+let dinoTopGeneration = 0;
+let dinoTopChain: Promise<void> = Promise.resolve();
 const DETECTOR_OPTIONS = [
 	{ value: "auto", label: "Auto" },
 	{ value: "yolo", label: "YOLO" },
@@ -814,6 +825,7 @@ async function loadMatchThreshold() {
 	const generation = matchGeneration;
 	const debugGeneration = catalogDebugGeneration;
 	const decoderGeneration = detectorGeneration;
+	const topGeneration = dinoTopGeneration;
 	try {
 		const data = await loadDocument();
 		if (generation !== matchGeneration) return;
@@ -825,12 +837,50 @@ async function loadMatchThreshold() {
 		if (debugGeneration === catalogDebugGeneration) {
 			catalogDebug = data.catalogDebug === true;
 		}
+		if (topGeneration === dinoTopGeneration) {
+			showDinoTop(clampDinoTopN(data.dinoTopN));
+		}
 		if (decoderGeneration === detectorGeneration) {
 			detector = normalizeDetector(data.detector);
 		}
 	} catch (err: unknown) {
 		if (generation !== matchGeneration) return;
 		matchNotice = invokeError(err, "Could not load the match threshold");
+	}
+}
+
+function showDinoTop(value: number) {
+	dinoTopN = value;
+	dinoTopText = String(value);
+}
+
+function commitDinoTop() {
+	const parsed = Number(dinoTopText);
+	if (!Number.isInteger(parsed)) {
+		dinoTopText = String(dinoTopN);
+		return;
+	}
+	const next = clampDinoTopN(parsed);
+	if (next === dinoTopN && dinoTopText === String(next)) return;
+	showDinoTop(next);
+	const generation = ++dinoTopGeneration;
+	dinoTopNotice = "";
+	dinoTopChain = dinoTopChain
+		.catch(() => undefined)
+		.then(() => persistDinoTop(next, generation));
+}
+
+async function persistDinoTop(next: number, generation: number) {
+	try {
+		const current = await loadDocument();
+		if (generation !== dinoTopGeneration || next !== dinoTopN) return;
+		current.dinoTopN = next;
+		await storeDocument(current);
+		if (generation !== dinoTopGeneration) return;
+		dinoTopNotice = `Saved. DINOv2 matches is ${next}.`;
+	} catch (err: unknown) {
+		if (generation !== dinoTopGeneration) return;
+		dinoTopNotice = invokeError(err, "Could not save the DINOv2 match count");
 	}
 }
 
@@ -1349,7 +1399,8 @@ function cropChoicesReady(): boolean {
 }
 
 // A call alone is not a dependency. Name the objects the function reads.
-$: choicesReady = (cropChoices, cropPrompt, cropChoicesReady());
+$: choicesReady =
+	(cropChoices !== undefined || cropPrompt !== undefined) && cropChoicesReady();
 
 async function confirmCropLimits() {
 	if (!cropPrompt || cropBusy || !cropChoicesReady()) return;
@@ -3919,6 +3970,33 @@ onDestroy(() => {
 								</p>
 								{#if catalogDebugNotice}
 									<p class="text-sm text-neutral-200">{catalogDebugNotice}</p>
+								{/if}
+								<label
+									class="flex items-center gap-3 text-sm font-medium text-neutral-100"
+									for="dino-top-n"
+								>
+									DINOv2 matches
+									<input
+										id="dino-top-n"
+										type="number"
+										min={DINO_TOP_MIN}
+										max={DINO_TOP_MAX}
+										step="1"
+										class="h-9 w-16 border border-neutral-600 bg-neutral-950 text-center font-mono text-sm text-neutral-100"
+										aria-label="DINOv2 matches"
+										value={dinoTopText}
+										on:input={(event) => {
+											dinoTopText = event.currentTarget.value;
+										}}
+										on:change={commitDinoTop}
+										on:blur={commitDinoTop}
+									/>
+								</label>
+								<p class="text-sm text-neutral-400">
+									Preview Detect lists this many closest catalogue descriptions under each RF-DETR box. Default 3. Range 1 to 8. The operator inspection is unchanged.
+								</p>
+								{#if dinoTopNotice}
+									<p class="text-sm text-neutral-200">{dinoTopNotice}</p>
 								{/if}
 							</fieldset>
 							<div class="flex flex-wrap items-center gap-2">

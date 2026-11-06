@@ -11,6 +11,12 @@ import {
 	type UvcSettings,
 } from "$lib/camera-settings";
 import { catalogueMiss, readMatchThreshold } from "$lib/catalogue-capture";
+import {
+	type DinoMatch,
+	dinoDisagrees,
+	dinoMatchChoice,
+	dinoMatchLabel,
+} from "$lib/dino-feedback";
 // biome-ignore lint/correctness/noUnusedImports: the template uses this component
 import DetectingOverlay from "$lib/DetectingOverlay.svelte";
 // biome-ignore lint/correctness/noUnusedImports: the template uses this component
@@ -116,6 +122,7 @@ let snapshotSaved = "";
 
 type DetectMark = {
 	ic: string;
+	classIc: string;
 	confidence: number;
 	x: number;
 	y: number;
@@ -126,6 +133,7 @@ type DetectMark = {
 	embed: boolean;
 	sensor: [number, number, number, number];
 	catalogueMiss: boolean;
+	dinoMatches: DinoMatch[];
 	metrologyNote: string;
 	metrologyMismatch: boolean;
 	spans: MetrologySpan[];
@@ -175,7 +183,6 @@ let detectNote = "";
 let admin = false;
 // The each block has to read this array itself. A helper is not redrawn when it changes.
 let selected: number[] = [];
-let saveMode: "append" | "replace" = "append";
 let saveBusy = false;
 let saveNote = "";
 let saveGeneration = 0;
@@ -187,6 +194,9 @@ let captureBusy = false;
 let captureNote = "";
 let captureGen = 0;
 let cataloguePress: DetectMark | null = null;
+let chosenIc: Record<string, string> = {};
+let assignBusy = false;
+let assignGen = 0;
 let sourceW = 0;
 let sourceH = 0;
 let classNames: string[] = [];
@@ -1252,6 +1262,7 @@ function readDetections(rows: PreviewBox[]): DetectMark[] {
 			prefix && row.slot !== null ? `${row.slot} ${row.ic}` : row.ic;
 		marks.push({
 			ic,
+			classIc: row.ic,
 			confidence: row.confidence,
 			x: x1,
 			y: y1,
@@ -1262,6 +1273,7 @@ function readDetections(rows: PreviewBox[]): DetectMark[] {
 			embed: row.embed,
 			sensor: [x1, y1, x2, y2],
 			catalogueMiss: catalogueMiss(row.twoPass, matchThreshold),
+			dinoMatches: row.dinoMatches,
 			metrologyNote: mismatchNote(row.metrology),
 			metrologyMismatch:
 				readMetrologyResult(row.metrology)?.status === "DIMENSION_MISMATCH",
@@ -1339,6 +1351,7 @@ function clearDetect() {
 	sourceH = 0;
 	detectMarks = [];
 	detectNote = "";
+	chosenIc = {};
 	closeCatalogue();
 	selected = [];
 	saveNote = "";
@@ -1378,6 +1391,7 @@ async function runDetect() {
 	const camera = index;
 	detectBusy = true;
 	detectNote = "";
+	chosenIc = {};
 	closeCatalogue();
 	selected = [];
 	saveNote = "";
@@ -1400,6 +1414,7 @@ async function runDetect() {
 		const body = await invoke<unknown>("detect_image", {
 			holdReferences: true,
 			confidence: PREVIEW_CONFIDENCE,
+			dinoFeedback: true,
 		});
 		if (closed || gen !== detectGeneration || camera !== index) return;
 		const message = detectFailure(body);
@@ -1567,6 +1582,47 @@ async function saveCatalogueCrop() {
 	}
 }
 
+function selectedIc(mark: DetectMark): string {
+	const picked = chosenIc[String(mark.index)];
+	if (picked && mark.dinoMatches.some((hit) => hit.ic === picked)) return picked;
+	return mark.dinoMatches[0]?.ic ?? "";
+}
+
+function selectedMatch(mark: DetectMark): DinoMatch | undefined {
+	const ic = selectedIc(mark);
+	return mark.dinoMatches.find((hit) => hit.ic === ic);
+}
+
+function chooseMatch(index: number, event: Event) {
+	const value = event.currentTarget instanceof HTMLSelectElement ? event.currentTarget.value : "";
+	if (!value) return;
+	chosenIc = { ...chosenIc, [String(index)]: value };
+}
+
+async function assignAs(mark: DetectMark, ic: string) {
+	if (assignBusy || ic.trim().length === 0) return;
+	const gen = ++assignGen;
+	assignBusy = true;
+	try {
+		const result = await invoke<{ message?: unknown }>("save_catalogue_crop", {
+			ic,
+			x1: mark.sensor[0],
+			y1: mark.sensor[1],
+			x2: mark.sensor[2],
+			y2: mark.sensor[3],
+		});
+		if (closed || gen !== assignGen) return;
+		const message = typeof result.message === "string" ? result.message.trim() : "";
+		const hit = mark.dinoMatches.find((item) => item.ic === ic);
+		detectNote = message || `Appended ${hit ? dinoMatchLabel(hit) : ic}.`;
+	} catch (err: unknown) {
+		if (closed || gen !== assignGen) return;
+		detectNote = invokeMessage(err, "Could not save the crop.");
+	} finally {
+		if (gen === assignGen) assignBusy = false;
+	}
+}
+
 async function loadClassNames() {
 	try {
 		const data = await invoke<{ classes?: unknown }>("model_class_names");
@@ -1653,13 +1709,12 @@ async function saveReferences() {
 	if (!admin || saveBusy || selected.length === 0) return;
 	const gen = saveGeneration;
 	const indices = selected.slice();
-	const replace = saveMode === "replace";
 	saveBusy = true;
 	saveNote = "";
 	try {
 		const message = await invoke<string>("save_detection_references", {
 			indices,
-			replace,
+			replace: false,
 		});
 		if (closed || gen !== saveGeneration) return;
 		saveNote = message.trim() || "Saved.";
@@ -2144,39 +2199,74 @@ onDestroy(() => {
 				{/each}
 			</svg>
 			<div
-				class="absolute left-3 top-3 z-[4] max-h-80 max-w-xs overflow-auto border border-neutral-700 bg-neutral-950/90 px-3 py-2"
+				class="absolute left-3 top-3 z-[4] max-h-[75vh] w-[min(28rem,calc(100%-1.5rem))] overflow-auto border border-neutral-700 bg-neutral-950/95 px-4 py-3"
 				on:pointerdown|stopPropagation
 			>
-				<p class="text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+				<p class="text-xs font-semibold uppercase tracking-widest text-neutral-400">
 					Detections
 				</p>
 				{#if detectMarks.length === 0}
-					<p class="mt-1 text-sm text-neutral-200">No detections.</p>
+					<p class="mt-1 text-base text-neutral-200">No detections.</p>
 				{:else}
-					<ul class="mt-1 space-y-1">
+					<ul class="mt-2 space-y-3">
 						{#each detectMarks as mark, markIndex (`${markIndex}:${mark.ic}:${mark.confidence}`)}
+							{@const picked = selectedMatch(mark)}
+							{@const typeOff = dinoDisagrees(mark.classIc, picked ? [picked] : mark.dinoMatches)}
 							<li>
 								{#if admin && mark.embed}
 									<button
 										type="button"
-										class="w-full px-1 text-left font-mono text-sm text-neutral-100"
+										class="w-full px-1 text-left text-base font-semibold"
 										class:bg-neutral-800={selected.includes(mark.index)}
+										class:text-blue-300={typeOff}
+										class:text-neutral-100={!typeOff}
 										aria-pressed={selected.includes(mark.index)}
 										on:click={() => toggleMark(mark.index)}
 									>
 										{mark.ic}
-										<span class="text-neutral-400">{mark.confidence.toFixed(2)}</span>
+										<span class="text-sm font-normal text-neutral-400">{mark.confidence.toFixed(2)}</span>
 									</button>
 								{:else}
-									<p class="px-1 font-mono text-sm text-neutral-100">
+									<p
+										class="px-1 text-base font-semibold"
+										class:text-blue-300={typeOff}
+										class:text-neutral-100={!typeOff}
+									>
 										{mark.ic}
-										<span class="text-neutral-400">{mark.confidence.toFixed(2)}</span>
+										<span class="text-sm font-normal text-neutral-400">{mark.confidence.toFixed(2)}</span>
 									</p>
+								{/if}
+								{#if mark.dinoMatches.length > 0}
+									<div class="mt-1 flex items-center gap-2">
+										<label class="min-w-0 flex-1" for={"dino-match-" + mark.index}>
+											<span class="sr-only">Closest matches for {mark.classIc}</span>
+											<select
+												id={"dino-match-" + mark.index}
+												class="w-full border border-neutral-600 bg-neutral-950 px-2 py-1.5 text-sm text-neutral-100"
+												value={selectedIc(mark)}
+												on:change={(event) => chooseMatch(mark.index, event)}
+											>
+												{#each mark.dinoMatches as hit (hit.ic)}
+													<option value={hit.ic} title={hit.ic}>{dinoMatchChoice(hit)}</option>
+												{/each}
+											</select>
+										</label>
+										{#if admin}
+											<button
+												type="button"
+												class="shrink-0 border border-blue-500 bg-blue-600 px-3 py-1.5 text-sm font-semibold text-white disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
+												disabled={assignBusy || selectedIc(mark).length === 0}
+												on:click={() => void assignAs(mark, selectedIc(mark))}
+											>
+												Append
+											</button>
+										{/if}
+									</div>
 								{/if}
 								{#if mark.catalogueMiss}
 									<button
 										type="button"
-										class="mt-0.5 px-1 text-left text-xs font-semibold text-amber-200"
+										class="mt-1 px-1 text-left text-xs font-semibold text-amber-200"
 										on:click={() => openCatalogueCapture(mark)}
 									>
 										Save to catalogue
@@ -2190,23 +2280,12 @@ onDestroy(() => {
 					</ul>
 				{/if}
 				{#if admin && detectMarks.some((mark) => mark.embed)}
-					<div class="mt-2 flex flex-wrap items-center gap-2">
-						<label class="flex items-center gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
-							For this IC
-							<select
-								bind:value={saveMode}
-								class="border border-neutral-600 bg-neutral-950 px-1 py-1 font-sans text-xs font-medium normal-case tracking-normal text-neutral-100"
-								disabled={saveBusy}
-								title="Append adds these crops to the class. Replace keeps only these crops for that class."
-							>
-								<option value="append">Append</option>
-								<option value="replace">Replace</option>
-							</select>
-						</label>
+					<div class="mt-3">
 						<button
 							type="button"
-							class="border border-blue-500 bg-blue-600 px-2 py-1 text-xs font-semibold text-white disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
+							class="border border-neutral-600 bg-neutral-800 px-2 py-1 text-xs font-semibold text-neutral-100 disabled:border-neutral-700 disabled:text-neutral-500"
 							disabled={saveBusy || selected.length === 0}
+							title="Appends these crops under the model class."
 							on:click={saveReferences}
 						>
 							{saveBusy ? "Saving..." : "Save as reference"}
@@ -2215,7 +2294,7 @@ onDestroy(() => {
 					{#if saveNote}
 						<p class="mt-1 text-xs text-neutral-200">{saveNote}</p>
 					{:else if selected.length === 0}
-						<p class="mt-1 text-xs text-neutral-400">Select one or more boxes.</p>
+						<p class="mt-1 text-xs text-neutral-400">Select one or more boxes to save a reference.</p>
 					{/if}
 				{:else if admin && detectMarks.length > 0}
 					<p class="mt-2 text-xs text-amber-200">DINOv2 is not loaded.</p>

@@ -75,6 +75,24 @@ check(
 );
 check("a slot array has no failure message", detectFailure(slotBody) === "");
 check("blank message is ignored", detectFailure({ message: "  " }) === "");
+const dinoBox = detectionsFromBody({
+	detections: [
+		{
+			ic: "BOLT",
+			confidence: 0.5,
+			bbox: [0, 0, 2, 2],
+			dinoMatches: [
+				{ ic: "ACH01", description: " Hinge ", partType: " hinge ", score: 0.74 },
+			],
+		},
+	],
+})[0]?.dinoMatches[0];
+check(
+	"dino matches ride on the box",
+	dinoBox?.description === "Hinge" &&
+		dinoBox?.partType === "hinge" &&
+		dinoBox?.ic === "ACH01",
+);
 
 if (failed > 0) {
 	console.error(`${failed} failed`);

@@ -132,6 +132,37 @@ fn blank_to_none(value: &str) -> Option<String> {
     }
 }
 
+/// One catalogue match for preview feedback. The dropdown shows `part_type`
+/// and `description`. A blank field is omitted.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DinoHit {
+    pub ic: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part_type: Option<String>,
+    pub score: f32,
+}
+
+/// Highest scores, one row per item code. `n` of 0 returns nothing.
+/// This is the same ranking `classify` uses. It does not embed again.
+pub(crate) fn top_hits(entries: &[CatalogEntry], query: &[f32], n: usize) -> Vec<DinoHit> {
+    if n == 0 || entries.is_empty() || query.is_empty() {
+        return Vec::new();
+    }
+    rank(entries, query)
+        .into_iter()
+        .take(n)
+        .map(|candidate| DinoHit {
+            ic: candidate.ic,
+            description: blank_to_none(&candidate.description),
+            part_type: blank_to_none(&candidate.part_type),
+            score: candidate.score,
+        })
+        .collect()
+}
+
 /// Best score for each item code, highest first.
 fn rank(entries: &[CatalogEntry], query: &[f32]) -> Vec<CatalogCandidate> {
     if entries.is_empty() || query.is_empty() {
@@ -302,5 +333,30 @@ mod tests {
         );
         assert_eq!(matched.status, MatchStatus::MatchedBom);
         assert!(matched.score > 0.99, "{}", matched.score);
+    }
+
+    #[test]
+    fn top_hits_keeps_the_best_crop_and_stops_at_n() {
+        let entries = catalogue();
+        let query = unit(&[1.0, 1.0, 0.0]);
+        assert!(top_hits(&entries, &query, 0).is_empty());
+        let three = top_hits(&entries, &query, 3);
+        assert_eq!(
+            three.iter().map(|hit| hit.ic.as_str()).collect::<Vec<_>>(),
+            vec!["6PBB833", "2ERGM22", "4LRS006"]
+        );
+        assert_eq!(three[0].description.as_deref(), Some("Bracket"));
+        assert_eq!(three[1].description.as_deref(), Some("Hinge"));
+        assert_eq!(three[2].description.as_deref(), Some("Rail"));
+        assert_eq!(three[0].part_type.as_deref(), Some("bracket"));
+        assert_eq!(three[1].part_type.as_deref(), Some("hinge"));
+        assert_eq!(three[2].part_type.as_deref(), Some("rail"));
+        assert!(three[0].score > three[1].score);
+        assert!(three[1].score > three[2].score);
+        let one = top_hits(&entries, &query, 1);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].ic, "6PBB833");
+        // Two crops of 6PBB833 collapse to the closer one.
+        assert!(one[0].score > 0.8, "{}", one[0].score);
     }
 }
