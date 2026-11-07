@@ -28,7 +28,8 @@
       "nsis"
     ],
     "resources": {
-      "models/*": "models/",
+      "models/dinov2_vits14_reg.onnx": "models/dinov2_vits14_reg.onnx",
+      "models/dinov2_vitb14_reg.onnx": "models/dinov2_vitb14_reg.onnx",
       "openvino/*.dll": ""
     },
     "icon": [

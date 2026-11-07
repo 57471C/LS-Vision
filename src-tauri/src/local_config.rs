@@ -1085,8 +1085,22 @@ mod tests {
             .as_object()
             .expect("bundle.resources");
         assert_eq!(
-            resources.get("models/*").and_then(Value::as_str),
-            Some("models/")
+            resources
+                .get("models/dinov2_vits14_reg.onnx")
+                .and_then(Value::as_str),
+            Some("models/dinov2_vits14_reg.onnx")
+        );
+        assert_eq!(
+            resources
+                .get("models/dinov2_vitb14_reg.onnx")
+                .and_then(Value::as_str),
+            Some("models/dinov2_vitb14_reg.onnx")
+        );
+        assert!(
+            !resources
+                .keys()
+                .any(|key| key.contains("dinov2_vits14.onnx") || key == "models/*"),
+            "{resources:?}"
         );
         assert_eq!(
             resources.get("openvino/*.dll").and_then(Value::as_str),
