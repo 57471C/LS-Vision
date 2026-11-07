@@ -125,23 +125,36 @@ fn catalogue_file() -> Result<PathBuf, String> {
 }
 
 fn read_installed_file() -> Vec<CatalogEntry> {
-    match catalogue_file() {
-        Ok(path) => read_catalogue_for_model(&path, &crate::dinov2::selected_model_id()),
+    let active = crate::dinov2::selected_model_id();
+    let path = match catalogue_file() {
+        Ok(path) => path,
         Err(err) => {
             eprintln!("warning: {err} Catalogue matching has no parts.");
-            Vec::new()
+            return Vec::new();
+        }
+    };
+    let entries = read_catalogue_for_model(&path, &active);
+    if let Some(width) = crate::dinov2::loaded_cls_width() {
+        if entries.iter().any(|entry| entry.embedding.len() != width) {
+            eprintln!(
+                "warning: catalogue embeddings at {} do not match DINOv2 model {active}. Matching skips them until the next extract.",
+                path.display()
+            );
+            return Vec::new();
         }
     }
+    entries
 }
 
 /// Parse one catalogue file. A missing, empty, or unreadable file is an empty list.
 /// Embeddings are returned even when they were extracted with another model.
 /// Matching uses [`read_catalogue_for_model`] so those vectors are left out.
+#[cfg(test)]
 pub(crate) fn read_catalogue(path: &Path) -> Vec<CatalogEntry> {
     read_catalogue_filtered(path, None)
 }
 
-/// Same as [`read_catalogue`], but vectors from another DINOv2 model are omitted.
+/// Parse one catalogue file and omit vectors from another DINOv2 model.
 pub(crate) fn read_catalogue_for_model(path: &Path, active: &str) -> Vec<CatalogEntry> {
     read_catalogue_filtered(path, Some(active))
 }
@@ -801,7 +814,7 @@ mod tests {
     #[test]
     fn a_known_part_snapshot_scores_above_0_80() {
         let _hold = crate::dinov2::lock_for_test();
-        let model = crate::dinov2::model_path();
+        let model = crate::dinov2::model_file_path(crate::dinov2::model_file_name("s_reg"));
         if !model.is_file() {
             eprintln!("skip: dinov2 model is missing");
             return;

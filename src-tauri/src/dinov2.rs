@@ -72,6 +72,10 @@ pub struct Dinov2Status {
 struct State {
     session: Option<ort::session::Session>,
     status: Dinov2Status,
+    /// `s_reg` or `b_reg` when `status.path` is that model's file.
+    model_id: Option<String>,
+    /// CLS length reported by the loaded graph. Empty until a session loads.
+    cls_width: Option<usize>,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -108,10 +112,14 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// copy is `models/<file>` beside `ls-vision.exe`.
 /// Dev and tests use `src-tauri/models/<file>` when that bundled file is absent.
 pub(crate) fn model_path() -> PathBuf {
+    model_file_path(model_file_name(&selected_model_id()))
+}
+
+pub(crate) fn model_file_path(file_name: &str) -> PathBuf {
     resolve_model_path(
         std::env::current_exe().ok().as_deref(),
         Path::new(env!("CARGO_MANIFEST_DIR")),
-        model_file_name(&selected_model_id()),
+        file_name,
     )
 }
 
@@ -178,11 +186,15 @@ pub(crate) fn reload_session() -> Dinov2Status {
 }
 
 pub(crate) fn load_at(path: &Path) -> Dinov2Status {
+    let model_id = model_id_for_path(path);
     let status = match open_held(path) {
         Ok((session, status)) => {
+            let cls_width = cls_width(&status.outputs);
             *lock(&STATE) = Some(State {
                 session: Some(session),
                 status: status.clone(),
+                model_id,
+                cls_width,
             });
             status
         }
@@ -197,12 +209,118 @@ pub(crate) fn load_at(path: &Path) -> Dinov2Status {
             *lock(&STATE) = Some(State {
                 session: None,
                 status: status.clone(),
+                model_id,
+                cls_width: None,
             });
             status
         }
     };
     log_status(&status);
     status
+}
+
+fn model_id_for_path(path: &Path) -> Option<String> {
+    let name = path.file_name().and_then(|name| name.to_str())?;
+    if name == FILE_B_REG {
+        Some(MODEL_B_REG.to_string())
+    } else if name == FILE_S_REG {
+        Some(MODEL_S_REG.to_string())
+    } else {
+        None
+    }
+}
+
+/// The catalogue extract uses this session. A loaded file for another
+/// `dinoModel` is replaced with the file named by the current setting.
+pub(crate) struct CatalogueModel {
+    pub id: String,
+    pub width: usize,
+}
+
+pub(crate) fn session_for_catalogue() -> Result<CatalogueModel, String> {
+    let id = selected_model_id();
+    if let Some(model) = prepared_model(&id) {
+        announce_catalogue_model(&model);
+        return Ok(model);
+    }
+    let status = reload_session();
+    if let Some(model) = prepared_model(&id) {
+        announce_catalogue_model(&model);
+        return Ok(model);
+    }
+    if !status.loaded {
+        return Err(status.message);
+    }
+    Err("DINOv2 model did not report an embedding length.".to_string())
+}
+
+fn prepared_model(selected: &str) -> Option<CatalogueModel> {
+    let guard = lock(&STATE);
+    let state = guard.as_ref()?;
+    let width = ready_width(
+        state.status.loaded,
+        state.model_id.as_deref(),
+        state.cls_width,
+        selected,
+    )?;
+    Some(CatalogueModel {
+        id: selected.to_string(),
+        width,
+    })
+}
+
+/// A session is ready for catalogue crops only when it is the selected model
+/// and the graph reported a CLS length. Width comes from that graph.
+fn ready_width(
+    loaded: bool,
+    loaded_id: Option<&str>,
+    width: Option<usize>,
+    selected: &str,
+) -> Option<usize> {
+    if !loaded || loaded_id != Some(selected) {
+        return None;
+    }
+    width.filter(|value| *value > 0)
+}
+
+fn announce_catalogue_model(model: &CatalogueModel) {
+    static LAST: Mutex<String> = Mutex::new(String::new());
+    let line = format!("{}:{}", model.id, model.width);
+    let mut last = LAST.lock().unwrap_or_else(|err| err.into_inner());
+    if *last == line {
+        return;
+    }
+    *last = line;
+    eprintln!(
+        "DINOv2 catalogue extract uses {} ({}), embedding length {}.",
+        model.id,
+        model_file_name(&model.id),
+        model.width
+    );
+}
+
+/// CLS length of the loaded DINOv2 graph. `None` when no session is open.
+pub(crate) fn loaded_cls_width() -> Option<usize> {
+    let guard = lock(&STATE);
+    let state = guard.as_ref()?;
+    if !state.status.loaded {
+        return None;
+    }
+    state.cls_width
+}
+
+/// Last dimension of `last_hidden_state`, or of the first output when that
+/// name is absent. A non-positive dimension is not a length.
+pub(crate) fn cls_width(outputs: &[Dinov2Port]) -> Option<usize> {
+    let port = outputs
+        .iter()
+        .find(|port| port.name == "last_hidden_state")
+        .or_else(|| outputs.first())?;
+    let dim = *port.shape.last()?;
+    if dim <= 0 {
+        return None;
+    }
+    usize::try_from(dim).ok()
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -448,10 +566,7 @@ pub(crate) fn forward_nchw(data: Vec<f32>) -> Result<Vec<f32>, String> {
     let outputs = session
         .run(ort::inputs![tensor])
         .map_err(|err| format!("embed failed: {}", brief(&err.to_string())))?;
-    let (shape, values) = outputs[0]
-        .try_extract_tensor::<f32>()
-        .map_err(|err| format!("embed failed: {}", brief(&err.to_string())))?;
-    cls_vector(shape, values)
+    embedding_from_outputs(&outputs)
 }
 
 /// The register ONNX files return `last_hidden_state` as
@@ -1292,14 +1407,22 @@ fn embed_one(
     let outputs = session
         .run(ort::inputs![tensor])
         .map_err(|err| format!("embed failed: {}", brief(&err.to_string())))?;
-    let (shape, values) = outputs[0]
-        .try_extract_tensor::<f32>()
-        .map_err(|err| format!("embed failed: {}", brief(&err.to_string())))?;
-    let values = cls_vector(shape, values)?;
+    let values = embedding_from_outputs(&outputs)?;
     if values.len() < 4 {
         return Err("embedding was shorter than 4 values".to_string());
     }
     Ok(values)
+}
+
+fn embedding_from_outputs(outputs: &ort::session::SessionOutputs<'_>) -> Result<Vec<f32>, String> {
+    if outputs.len() == 0 {
+        return Err("DINOv2 returned an empty embedding.".to_string());
+    }
+    let value = outputs.get("last_hidden_state").unwrap_or(&outputs[0]);
+    let (shape, values) = value
+        .try_extract_tensor::<f32>()
+        .map_err(|err| format!("embed failed: {}", brief(&err.to_string())))?;
+    cls_vector(shape, values)
 }
 
 fn crop_box(
@@ -1540,6 +1663,54 @@ mod tests {
         );
         assert!(cls_vector(&[1, 5], &values).is_err());
         assert!(cls_vector(&[1, 4], &[1.0, f32::NAN, 0.0, 1.0]).is_err());
+    }
+
+    #[test]
+    fn the_catalogue_session_uses_the_loaded_cls_width() {
+        let narrow = Dinov2Port {
+            name: "last_hidden_state".to_string(),
+            shape: vec![1, 261, 384],
+            dtype: "f32".to_string(),
+        };
+        let wide = Dinov2Port {
+            name: "last_hidden_state".to_string(),
+            shape: vec![1, -1, 768],
+            dtype: "f32".to_string(),
+        };
+        assert_eq!(cls_width(&[narrow]), Some(384));
+        assert_eq!(cls_width(&[wide]), Some(768));
+        assert_eq!(cls_width(&[]), None);
+        let dynamic = Dinov2Port {
+            name: "last_hidden_state".to_string(),
+            shape: vec![1, 261, -1],
+            dtype: "f32".to_string(),
+        };
+        assert_eq!(cls_width(&[dynamic]), None);
+        let mut values = vec![0.5_f32; 768];
+        values.extend(std::iter::repeat(0.0).take(768));
+        let cls = cls_vector(&[1, 2, 768], &values).unwrap();
+        assert_eq!(cls.len(), 768);
+        assert_eq!(cls[0], 0.5);
+        assert_eq!(
+            ready_width(true, Some(MODEL_S_REG), Some(384), MODEL_B_REG),
+            None
+        );
+        assert_eq!(
+            ready_width(true, Some(MODEL_B_REG), Some(768), MODEL_B_REG),
+            Some(768)
+        );
+        assert_eq!(
+            ready_width(false, Some(MODEL_B_REG), Some(768), MODEL_B_REG),
+            None
+        );
+        assert_eq!(
+            ready_width(true, Some(MODEL_S_REG), Some(384), MODEL_S_REG),
+            Some(384)
+        );
+        assert_eq!(
+            ready_width(true, Some(MODEL_B_REG), None, MODEL_B_REG),
+            None
+        );
     }
 
     #[test]

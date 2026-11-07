@@ -10,7 +10,7 @@
 
 ## DINOv2 model
 
-Settings > Training, directly under Inference, chooses the catalogue matcher. `dinoModel` is `s_reg` (`dinov2_vits14_reg.onnx`, 384-dim CLS) or `b_reg` (`dinov2_vitb14_reg.onnx`, 768-dim CLS). A missing value is `s_reg`. The page shows the file name. Saving reloads the Rust session. Catalogue embeddings from the previous model are marked stale, and the next extract writes vectors from the new model only.
+Settings > Training, directly under Inference, chooses the catalogue matcher. `dinoModel` is `s_reg` (`dinov2_vits14_reg.onnx`, 384-dim CLS) or `b_reg` (`dinov2_vitb14_reg.onnx`, 768-dim CLS). A missing value is `s_reg`. The page shows the file name. Saving reloads the Rust session. Catalogue embeddings from the previous model are marked stale. The next extract opens the selected ONNX file and writes vectors of that model's CLS length only.
 
 ## Decoder
 

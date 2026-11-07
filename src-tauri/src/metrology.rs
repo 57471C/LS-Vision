@@ -650,6 +650,7 @@ struct Gauge {
 
 /// Measure one matched box with the catalogue method. `custom` is not passed
 /// here. A method that cannot read its sizes falls back to the generic caliper.
+#[cfg(test)]
 fn measure_method(
     rgb: &[u8],
     width: u32,

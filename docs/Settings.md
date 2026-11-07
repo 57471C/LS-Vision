@@ -28,7 +28,7 @@ Settings are stored in `vision/config.local.json` (gitignored). The unlock passw
 
 ## DINOv2 model
 
-Directly under Inference, Training lists two DINOv2 files. The choice is `dinoModel` in `vision/config.local.json`. `s_reg` is `dinov2_vits14_reg.onnx` (384 values) and `b_reg` is `dinov2_vitb14_reg.onnx` (768 values). A missing value is `s_reg`. The page shows the current file name. Changing it saves `dinoModel` and reloads the matcher. Catalogue embeddings from the other model are marked stale. The next catalogue extract replaces them, so the two vector lengths are not mixed. The operator inspection and Preview Detect both use the loaded file.
+Directly under Inference, Training lists two DINOv2 files. The choice is `dinoModel` in `vision/config.local.json`. `s_reg` is `dinov2_vits14_reg.onnx` (384 values) and `b_reg` is `dinov2_vitb14_reg.onnx` (768 values). A missing value is `s_reg`. The page shows the current file name. Changing it saves `dinoModel` and reloads the matcher. Catalogue embeddings from the other model are marked stale. The next catalogue extract opens that ONNX file and writes vectors of its CLS length, so the two lengths are not mixed. Vectors of a different length stay unused until that extract succeeds. The operator inspection and Preview Detect both use the loaded file.
 
 ## Models
 
@@ -36,7 +36,7 @@ Training lists `.pt` and `.onnx` files in the app data models folder. The path b
 
 ## Part rules
 
-Update references, above the part rules, opens a native file dialog that accepts `.tar`. The archive contains `catalogue.json` and JPEG crops under `crops/`, including `crops/<IC>/<file>.jpg`. Each crop is embedded with the DINOv2 model already loaded at startup. The IC, description, type, dimensions, crop paths, and embeddings are written to `vision/catalogue.json`, beside `vision/config.local.json`. The JPEGs are copied under `vision/catalogue-crops/`. The next start loads that file.
+Update references, above the part rules, opens a native file dialog that accepts `.tar`. The archive contains `catalogue.json` and JPEG crops under `crops/`, including `crops/<IC>/<file>.jpg`. Each crop is embedded with the ONNX file named by the current `dinoModel`. The written vectors have that model's CLS length. The IC, description, type, dimensions, crop paths, and embeddings are written to `vision/catalogue.json`, beside `vision/config.local.json`. The JPEGs are copied under `vision/catalogue-crops/`. The next start loads that file.
 
 The default import adds item codes from the tar and updates item codes that are already on this PC. Parts and crops that are only on this PC stay, including crops an admin added from the camera preview. Nothing that is missing from the tar is deleted. A non-empty description, type, or measurement method from the tar updates that field. An empty field leaves the saved value. Success says "Catalogue updated. N parts on this PC."
 

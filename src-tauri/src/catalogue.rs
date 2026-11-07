@@ -2,7 +2,8 @@
 //!
 //! Settings > Parts > Update references picks a tar. The archive holds
 //! `catalogue.json` and JPEG crops under `crops/`. Each crop is embedded with
-//! the DINOv2 session that startup already opened. A model change marks those
+//! the DINOv2 session for the current `dinoModel`. The extract opens that ONNX
+//! file and writes vectors of its CLS length. A model change marks stored
 //! vectors stale. The next extract replaces them, so embeddings from ViT-S and
 //! ViT-B are not stored together. The result is written to
 //! `vision/catalogue.json`, beside `vision/config.local.json`, and the JPEGs
@@ -158,6 +159,7 @@ fn reembed_book(
     done: &mut usize,
     total: usize,
 ) -> Result<(), String> {
+    let mut expected_width = None;
     for part in &mut book.parts {
         let mut fresh = Vec::with_capacity(part.crops.len());
         for crop in &part.crops {
@@ -168,6 +170,7 @@ fn reembed_book(
             if values.is_empty() || values.iter().any(|value| !value.is_finite()) {
                 return Err(format!("Could not embed {}.", part.ic));
             }
+            remember_width(&mut expected_width, &values)?;
             fresh.push(values);
             *done = done.saturating_add(1);
             report_extract(progress, &part.ic, *done, total);
@@ -235,7 +238,44 @@ pub(crate) fn embeddings_need_extract(active: &str) -> Result<bool, String> {
     let Some(book) = load_book(&vision)? else {
         return Ok(false);
     };
-    Ok(!model_matches(&book, active))
+    if !model_matches(&book, active) {
+        return Ok(true);
+    }
+    if let Some(width) = crate::dinov2::loaded_cls_width() {
+        if book_has_vectors(&book) && !stored_widths_match(&book, width) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn stored_widths_match(book: &Book, width: usize) -> bool {
+    book.parts.iter().all(|part| {
+        part.embeddings
+            .iter()
+            .all(|values| values.is_empty() || values.len() == width)
+    })
+}
+
+/// Re-embed a saved book whose vectors are a different length from the model
+/// that just embedded a new crop. Tests that append a vector directly do not
+/// call this.
+fn rewrite_catalogue_width(vision: &Path, width: usize) -> Result<(), String> {
+    let Some(mut book) = load_book(vision)? else {
+        return Ok(());
+    };
+    if !book_has_vectors(&book) || stored_widths_match(&book, width) {
+        return Ok(());
+    }
+    let mut embed = embed_jpeg;
+    let mut silent = |_: &str, _: usize, _: usize| {};
+    let mut done = 0usize;
+    let total = book.parts.iter().map(|part| part.crops.len()).sum();
+    reembed_book(vision, &mut book, &mut embed, &mut silent, &mut done, total)?;
+    stamp_extracted(&mut book, &crate::dinov2::selected_model_id());
+    let bytes = book_json(&book)?;
+    replace_file_bytes(&catalogue_path(vision), &bytes)?;
+    Ok(())
 }
 
 struct Built {
@@ -710,9 +750,10 @@ pub fn save_catalogue_crop(
         return Err("Enter an IC.".to_string());
     }
     let (rgb, width, height) = held_crop(x1, y1, x2, y2)?;
-    let embedding = crate::inference::dino::embed_rgb(&rgb, width, height)?;
+    let embedding = embed_catalogue_image(&rgb, width, height)?;
     let jpeg = encode_rgb(&rgb, width, height)?;
     let vision = vision_directory()?;
+    rewrite_catalogue_width(&vision, embedding.len())?;
     let saved_ic = append_catalogue_crop(&vision, &ic, &jpeg, &embedding)?;
     if let Some(book) = load_book(&vision)? {
         *lock(&CATALOGUE) = book;
@@ -874,10 +915,43 @@ fn encode_rgb(rgb: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
 
 fn embed_jpeg(bytes: &[u8]) -> Result<Vec<f32>, String> {
     let (rgb, width, height) = decode_jpeg(bytes)?;
-    // Same 224×224 stretch the box matcher uses, so a stored crop matches itself.
-    crate::inference::dino::embed_rgb(&rgb, width, height)
+    embed_catalogue_image(&rgb, width, height)
 }
 
+/// Stretch-embed one crop with the ONNX session for the current `dinoModel`.
+/// The returned vector is that session's CLS length.
+fn embed_catalogue_image(rgb: &[u8], width: u32, height: u32) -> Result<Vec<f32>, String> {
+    let model = crate::dinov2::session_for_catalogue()?;
+    // Same 224×224 stretch the box matcher uses, so a stored crop matches itself.
+    let values = crate::inference::dino::embed_rgb(rgb, width, height)?;
+    accept_embedding(values, model.width)
+}
+
+fn accept_embedding(values: Vec<f32>, width: usize) -> Result<Vec<f32>, String> {
+    if width == 0 || values.len() != width {
+        return Err(format!(
+            "DINOv2 returned {} values. The loaded model reports {width}.",
+            values.len()
+        ));
+    }
+    Ok(values)
+}
+
+fn remember_width(expected: &mut Option<usize>, values: &[f32]) -> Result<(), String> {
+    match *expected {
+        Some(width) if values.len() != width => Err(format!(
+            "DINOv2 returned {} values. The loaded model reports {width}.",
+            values.len()
+        )),
+        Some(_) => Ok(()),
+        None => {
+            *expected = Some(values.len());
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
 fn import_tar_bytes(
     bytes: &[u8],
     vision: &Path,
@@ -1429,6 +1503,7 @@ fn kept_within_limit(parts: Vec<ResolvedPart>) -> Result<Vec<KeptPart>, String> 
     Ok(kept)
 }
 
+#[cfg(test)]
 fn build_from_tar(
     bytes: &[u8],
     embed: &mut dyn FnMut(&[u8]) -> Result<Vec<f32>, String>,
@@ -1618,6 +1693,7 @@ fn prompt_for(part: &ResolvedPart, limit: usize) -> CropClassPrompt {
     }
 }
 
+#[cfg(test)]
 fn commit_replace(
     vision: &Path,
     draft: &ReplaceDraft,
@@ -1957,6 +2033,7 @@ fn resolve_sources(archive: &Archive, sources: Vec<SourcePart>) -> Vec<ResolvedP
     parts
 }
 
+#[cfg(test)]
 fn embed_kept_quiet(
     kept: Vec<KeptPart>,
     embed: &mut dyn FnMut(&[u8]) -> Result<Vec<f32>, String>,
@@ -1977,6 +2054,7 @@ fn embed_kept(
     let mut used = HashSet::new();
     let mut parts = Vec::with_capacity(kept.len());
     let mut files = Vec::new();
+    let mut expected_width = None;
     for part in kept {
         let folder = allocate_folder(&mut used, &part.ic);
         let mut crops = Vec::with_capacity(part.crops.len());
@@ -1988,6 +2066,7 @@ fn embed_kept(
             if values.is_empty() || values.iter().any(|value| !value.is_finite()) {
                 return Err(format!("Could not embed {}.", part.ic));
             }
+            remember_width(&mut expected_width, &values)?;
             *done = done.saturating_add(1);
             report_extract(progress, &part.ic, *done, total);
             let file_name = stored_crop_name(&crop.key, index);
@@ -3599,6 +3678,65 @@ mod tests {
         let err = append_catalogue_crop(&dir, "  ", &jpeg, &embedding).unwrap_err();
         assert!(err.to_ascii_lowercase().contains("ic"));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_extract_rejects_a_vector_that_is_not_the_loaded_width() {
+        let err = accept_embedding(vec![0.0; 384], 768).unwrap_err();
+        assert!(err.contains("384"), "{err}");
+        assert!(err.contains("768"), "{err}");
+        assert_eq!(accept_embedding(vec![0.25; 768], 768).unwrap().len(), 768);
+        assert_eq!(accept_embedding(vec![0.25; 384], 384).unwrap().len(), 384);
+        assert!(accept_embedding(vec![0.25; 384], 0).is_err());
+    }
+
+    #[test]
+    fn an_extract_does_not_write_when_the_embedding_length_changes() {
+        let dir = temp_dir("width-change");
+        let jpeg = tiny_jpeg();
+        let bytes = pack(&[
+            (
+                "catalogue.json",
+                br#"{"parts":[{"ic":"A","crops":["crops/a.jpg"]},{"ic":"B","crops":["crops/b.jpg"]}]}"#,
+            ),
+            ("crops/a.jpg", jpeg.as_slice()),
+            ("crops/b.jpg", jpeg.as_slice()),
+        ]);
+        let mut n = 0;
+        let err = import_tar_bytes(&bytes, &dir, true, &mut |_| {
+            n += 1;
+            if n == 1 {
+                Ok(vec![1.0; 768])
+            } else {
+                Ok(vec![1.0; 384])
+            }
+        })
+        .unwrap_err();
+        assert!(err.contains("384"), "{err}");
+        assert!(err.contains("768"), "{err}");
+        assert!(load_book(&dir).unwrap().is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stored_vectors_of_another_width_do_not_match() {
+        let book = Book {
+            parts: vec![Part {
+                ic: "A".to_string(),
+                description: String::new(),
+                kind: String::new(),
+                measurement_method: String::new(),
+                dimensions: Value::Null,
+                crops: vec!["catalogue-crops/A/a.jpg".to_string()],
+                embeddings: vec![vec![0.0; 384]],
+                crop_limit: None,
+            }],
+            embedding_model: Some("b_reg".to_string()),
+            embeddings_stale: false,
+        };
+        assert!(model_matches(&book, "b_reg"));
+        assert!(!stored_widths_match(&book, 768));
+        assert!(stored_widths_match(&book, 384));
     }
 
     #[test]
