@@ -133,6 +133,10 @@ let cropPrompt: { token: number; classes: CropClassPrompt[] } | null = null;
 let cropChoices: Record<string, CropLimitAction> = {};
 let cropBusy = false;
 let cropCancel: HTMLButtonElement | null = null;
+let extractIc = "";
+let extractDone = 0;
+let extractTotal = 0;
+let stopExtractListen: (() => void) | null = null;
 
 let toastText = "";
 let toastKind: "ok" | "neutral" | "error" = "ok";
@@ -1421,6 +1425,60 @@ function readCropPrompt(
 	return { token, classes };
 }
 
+function readExtractEvent(
+	payload: unknown,
+): { ic: string; done: number; total: number } | null {
+	if (!payload || typeof payload !== "object") return null;
+	const record = payload as Record<string, unknown>;
+	const done = record.done;
+	const total = record.total;
+	const ic = typeof record.ic === "string" ? record.ic : "";
+	if (typeof done !== "number" || typeof total !== "number") return null;
+	if (!Number.isFinite(done) || !Number.isFinite(total) || total <= 0)
+		return null;
+	return { ic, done, total };
+}
+
+function extractPercent(): number {
+	if (extractTotal <= 0) return 0;
+	const ratio = extractDone / extractTotal;
+	if (!Number.isFinite(ratio)) return 0;
+	return Math.max(0, Math.min(100, Math.round(ratio * 100)));
+}
+
+function stopExtractEvents() {
+	const stop = stopExtractListen;
+	stopExtractListen = null;
+	stop?.();
+}
+
+async function withExtractProgress(work: () => Promise<void>): Promise<void> {
+	extractIc = "";
+	extractDone = 0;
+	extractTotal = 0;
+	stopExtractEvents();
+	try {
+		const { listen } = await import("@tauri-apps/api/event");
+		stopExtractListen = await listen("catalogue-extract", (event) => {
+			const row = readExtractEvent(event.payload);
+			if (!row) return;
+			extractIc = row.ic;
+			extractDone = row.done;
+			extractTotal = row.total;
+		});
+	} catch {
+		stopExtractListen = null;
+	}
+	try {
+		await work();
+	} finally {
+		stopExtractEvents();
+		extractIc = "";
+		extractDone = 0;
+		extractTotal = 0;
+	}
+}
+
 function applyCatalogueResult(data: Record<string, unknown>) {
 	const message =
 		typeof data.message === "string" && data.message
@@ -1441,25 +1499,51 @@ function applyCatalogueResult(data: Record<string, unknown>) {
 
 async function runCatalogueImport(replace: boolean) {
 	updatingReferences = true;
+	const outcome: {
+		data: Record<string, unknown> | null;
+		failed: string;
+	} = { data: null, failed: "" };
 	try {
-		const data = await invokeRust<Record<string, unknown>>("import_catalogue", {
-			replace,
+		await withExtractProgress(async () => {
+			try {
+				const result = await invokeRust<Record<string, unknown>>(
+					"import_catalogue",
+					{ replace },
+				);
+				if (!result || typeof result !== "object" || Array.isArray(result)) {
+					outcome.failed = "Could not update the catalogue";
+					return;
+				}
+				outcome.data = result;
+			} catch (err: unknown) {
+				outcome.failed = invokeError(err, "Could not update the catalogue");
+			}
 		});
-		if (!data || typeof data !== "object" || Array.isArray(data)) {
+		if (outcome.failed) {
+			showToast(outcome.failed, "error");
+			return;
+		}
+		const data = outcome.data;
+		if (!data) {
 			showToast("Could not update the catalogue", "error");
 			return;
 		}
+		const message = typeof data.message === "string" ? data.message : "";
 		const prompt = readCropPrompt(data);
 		if (prompt) {
-			cropChoices = {};
-			cropPrompt = prompt;
-			await tick();
-			cropCancel?.focus();
+			if (message.startsWith("Catalogue loaded ")) {
+				showToast(message, "ok");
+				cropChoices = {};
+				cropPrompt = prompt;
+				if (catalogueOpen) catalogueEpoch += 1;
+				await tick();
+				cropCancel?.focus();
+				return;
+			}
+			showToast(message || "Could not update the catalogue", "error");
 			return;
 		}
 		applyCatalogueResult(data);
-	} catch (err: unknown) {
-		showToast(invokeError(err, "Could not update the catalogue"), "error");
 	} finally {
 		updatingReferences = false;
 		if (!cropPrompt) replaceCatalogue = false;
@@ -2897,6 +2981,7 @@ onMount(() => {
 });
 
 onDestroy(() => {
+	stopExtractEvents();
 	cancelCameraApply();
 	cancelConfidenceSave();
 	if (toastTimer) clearTimeout(toastTimer);
@@ -4168,6 +4253,24 @@ onDestroy(() => {
 							>
 								{updatingReferences ? "Updating..." : "Update references"}
 							</button>
+							{#if extractTotal > 0}
+								<div class="w-full max-w-md">
+									<p class="text-sm text-neutral-200">
+										{extractIc ? `Extracting ${extractIc}` : "Extracting catalogue"}
+										({extractDone} / {extractTotal})
+									</p>
+									<div
+										class="mt-1 h-2 w-full bg-neutral-800"
+										role="progressbar"
+										aria-valuemin="0"
+										aria-valuemax={extractTotal}
+										aria-valuenow={extractDone}
+										aria-label="Catalogue extract"
+									>
+										<div class="h-2 bg-blue-500" style="width: {extractPercent()}%"></div>
+									</div>
+								</div>
+							{/if}
 							<label class="flex items-center gap-3 text-sm font-medium text-neutral-100">
 								<input
 									type="checkbox"
@@ -4186,7 +4289,7 @@ onDestroy(() => {
 								View references
 							</button>
 							<p class="text-sm text-neutral-400">
-								Opens a .tar catalogue. Each JPEG in crops/ is embedded with DINOv2 and saved on this PC. Item codes in the tar are added or updated. Parts and crops already on this PC are kept, including ones an admin added. Fully replace catalogue removes anything that is not in the tar, after a confirmation. If a class has more crops than its limit, that replace pauses so you can truncate the class or keep the higher count. The checkbox applies to the next import only and is not saved.
+								Opens a .tar catalogue. Each JPEG in crops/ is embedded with DINOv2 and saved on this PC. Item codes in the tar are added or updated. Parts and crops already on this PC are kept, including ones an admin added. Fully replace catalogue removes anything that is not in the tar, after a confirmation. The page shows which item code is being extracted and how many crops are done. If a class has more crops than its limit, that list appears after catalogue.json has been written. Truncate removes the extra crops. Keep all raises the limit. A failed write shows the error and does not offer that choice. The checkbox applies to the next import only and is not saved.
 							</p>
 						</div>
 						<h3 class="text-base font-semibold tracking-tight xl:col-span-2">Part rules</h3>
@@ -4636,7 +4739,7 @@ onDestroy(() => {
 				Crops over the limit
 			</h2>
 			<p class="mt-2 text-sm text-neutral-200">
-				These classes have more crops than their limit. Truncate keeps the most recent crops, or a sample when the archive has no dates. Keep all raises the limit for that class. The catalogue stays as it is until you continue.
+				These classes have more crops than their limit. The catalogue is already saved. Truncate removes the extra crops, keeping the most recent, or a sample when the archive has no dates. Keep all raises the limit for that class. Cancel leaves this catalogue in place.
 			</p>
 			<div class="mt-3 flex flex-wrap gap-2">
 				<button
@@ -4724,7 +4827,7 @@ onDestroy(() => {
 					on:click={confirmCropLimits}
 					disabled={cropBusy || !choicesReady}
 				>
-					{cropBusy ? "Importing..." : "Continue"}
+					{cropBusy ? "Saving..." : "Continue"}
 				</button>
 			</div>
 		</div>
