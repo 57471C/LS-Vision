@@ -4,7 +4,7 @@
 
 LS-Vision inspects kits on a bench. It reads a barcode or QR, looks up the Bill of Materials, captures a still, runs object detection, and compares what it sees against the expected parts and quantities.
 
-Inference is ONNX Runtime in the Rust backend. The app does not start a Python process.
+Inference is ONNX Runtime in the Rust backend.
 
 ## Running the app
 

@@ -2,7 +2,7 @@
 
 Desktop application for verifying fastener kits on the bench using computer vision.
 
-Built with Tauri 2, SvelteKit, TypeScript, and Rust. Version 0.5.1. Inference is ONNX Runtime in the Rust process. The camera, barcode decode, and BoM lookup run there too. The app does not start Python.
+Built with Tauri 2, SvelteKit, TypeScript, and Rust. Version 0.5.1. Inference is ONNX Runtime in the Rust process. The camera, barcode decode, and BoM lookup run there too.
 
 ## What it does
 
@@ -31,11 +31,11 @@ npm install
 npm run tauri dev
 ```
 
-In Settings > Training, use Update model to copy an `.onnx` file into the app data models folder. Dev and the installed app share that folder. YOLO weight files are not stored in git and are not bundled. The installer does bundle `models/dinov2_vits14.onnx` and the OpenVINO DLLs in the same directory as the exe when those files are present at build time. Both stay gitignored. See [vision/README.md](vision/README.md) for the offline training and export steps.
+In Settings > Training, use Update model to copy an `.onnx` file into the app data models folder. Dev and the installed app share that folder. YOLO weight files are not stored in git and are not bundled. The installer does bundle `models/dinov2_vits14.onnx` and the OpenVINO DLLs in the same directory as the exe when those files are present at build time. Both stay gitignored. Training and export happen offline. The app loads `.onnx` files only. See [docs/Training-and-Models.md](docs/Training-and-Models.md).
 
 ## Project status
 
-Version 0.5.1 runs inference, the camera, barcode decode, and BoM lookup in the Tauri process. There is no Python sidecar and no port 8008 client. A `.pt` model shows a warning instead of detecting.
+Version 0.5.1 runs inference, the camera, barcode decode, and BoM lookup in the Tauri process. A `.pt` model shows a warning instead of detecting.
 
 Recent additions:
 
