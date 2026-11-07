@@ -4,6 +4,7 @@
 
 import { onDestroy, onMount, tick } from "svelte";
 import ClassPicker from "$lib/ClassPicker.svelte";
+import ReferencesModal from "$lib/settings/ReferencesModal.svelte";
 import {
 	activateCamera,
 	assignActiveCamera,
@@ -106,18 +107,8 @@ let savingModel = false;
 let updatingModel = false;
 let modelsFolder = "";
 let updatingReferences = false;
-type CataloguePart = {
-	ic: string;
-	description: string;
-	type: string;
-	dimensions: string;
-	thumbs: string[];
-};
 let catalogueOpen = false;
-let catalogueLoading = false;
-let catalogueNotice = "";
-let catalogueParts: CataloguePart[] = [];
-let cataloguePath = "";
+let catalogueEpoch = 0;
 let replaceCatalogue = false;
 let replaceWarningOpen = false;
 let replaceCancel: HTMLButtonElement | null = null;
@@ -134,9 +125,7 @@ let cropPrompt: { token: number; classes: CropClassPrompt[] } | null = null;
 let cropChoices: Record<string, CropLimitAction> = {};
 let cropBusy = false;
 let cropCancel: HTMLButtonElement | null = null;
-let deletingCatalogueIc = "";
-let catalogueGeneration = 0;
-let catalogueClose: HTMLButtonElement | null = null;
+
 let toastText = "";
 let toastKind: "ok" | "neutral" | "error" = "ok";
 let toastTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1285,7 +1274,6 @@ function readCropPrompt(
 }
 
 function applyCatalogueResult(data: Record<string, unknown>) {
-	if (typeof data.path === "string" && data.path) cataloguePath = data.path;
 	const message =
 		typeof data.message === "string" && data.message
 			? data.message
@@ -1295,7 +1283,7 @@ function applyCatalogueResult(data: Record<string, unknown>) {
 		message.startsWith("Catalogue updated.")
 	) {
 		showToast(message, "ok");
-		if (catalogueOpen) void openReferences();
+		if (catalogueOpen) catalogueEpoch += 1;
 	} else if (message === "No file selected.") {
 		showToast(message, "neutral");
 	} else {
@@ -1349,7 +1337,7 @@ function cropChoicesReady(): boolean {
 }
 
 // A call alone is not a dependency. Name the objects the function reads.
-$: choicesReady = (cropChoices, cropPrompt, cropChoicesReady());
+$: choicesReady = [cropChoices, cropPrompt].length > 0 && cropChoicesReady();
 
 async function confirmCropLimits() {
 	if (!cropPrompt || cropBusy || !cropChoicesReady()) return;
@@ -1392,114 +1380,27 @@ async function cancelCropLimits() {
 	}
 }
 
-function readCataloguePart(value: unknown): CataloguePart | null {
-	if (!value || typeof value !== "object") return null;
-	const record = value as Record<string, unknown>;
-	const ic = typeof record.ic === "string" ? record.ic.trim() : "";
-	if (!ic) return null;
-	const description =
-		typeof record.description === "string" ? record.description.trim() : "";
-	const type = typeof record.type === "string" ? record.type.trim() : "";
-	const dimensions =
-		typeof record.dimensions === "string" ? record.dimensions.trim() : "";
-	const thumbs = Array.isArray(record.thumbs)
-		? record.thumbs.filter(
-				(item): item is string =>
-					typeof item === "string" && item.startsWith("data:image/"),
-			)
-		: [];
-	return { ic, description, type, dimensions, thumbs };
-}
-
-function readCatalogueList(
-	value: unknown,
-): { path: string; parts: CataloguePart[]; rawCount: number } | null {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-	const record = value as Record<string, unknown>;
-	const path = typeof record.path === "string" ? record.path : "";
-	const raw = Array.isArray(record.parts) ? record.parts : null;
-	if (!raw) return { path, parts: [], rawCount: -1 };
-	const parts: CataloguePart[] = [];
-	for (const item of raw) {
-		const part = readCataloguePart(item);
-		if (part) parts.push(part);
-	}
-	return { path, parts, rawCount: raw.length };
-}
-
-function catalogueNoticeClass(text: string): string {
-	if (text.startsWith("Removed ")) return "text-neutral-200";
-	return "text-red-300";
-}
-
-async function openReferences() {
+function openReferences() {
 	catalogueOpen = true;
-	catalogueNotice = "";
-	catalogueLoading = true;
-	const generation = ++catalogueGeneration;
-	try {
-		const data = await invokeRust<unknown>("list_catalogue");
-		if (generation !== catalogueGeneration || !catalogueOpen) return;
-		const list = readCatalogueList(data);
-		if (
-			!list ||
-			list.rawCount < 0 ||
-			(list.rawCount > 0 && list.parts.length === 0)
-		) {
-			catalogueParts = [];
-			catalogueNotice = "Could not load the references";
-			return;
-		}
-		if (list.path) cataloguePath = list.path;
-		catalogueParts = list.parts;
-	} catch (err: unknown) {
-		if (generation !== catalogueGeneration || !catalogueOpen) return;
-		catalogueParts = [];
-		catalogueNotice = invokeError(err, "Could not load the references");
-	} finally {
-		if (generation === catalogueGeneration) catalogueLoading = false;
-	}
-	if (catalogueOpen && generation === catalogueGeneration) {
-		await tick();
-		catalogueClose?.focus();
-	}
 }
 
 function closeReferences() {
 	catalogueOpen = false;
-	catalogueGeneration += 1;
-	catalogueLoading = false;
 }
 
 function onReferencesKey(event: KeyboardEvent) {
 	if (event.key !== "Escape") return;
 	if (cropPrompt) {
 		event.preventDefault();
+		event.stopImmediatePropagation();
 		void cancelCropLimits();
 		return;
 	}
 	if (replaceWarningOpen) {
 		event.preventDefault();
+		event.stopImmediatePropagation();
 		cancelReplaceCatalogue();
 		return;
-	}
-	if (!catalogueOpen) return;
-	event.preventDefault();
-	closeReferences();
-}
-
-async function deleteCataloguePart(ic: string) {
-	if (deletingCatalogueIc) return;
-	deletingCatalogueIc = ic;
-	catalogueNotice = "";
-	try {
-		await invokeRust("delete_catalogue_part", { ic });
-		catalogueParts = catalogueParts.filter((part) => part.ic !== ic);
-		catalogueNotice = `Removed ${ic}.`;
-	} catch (err: unknown) {
-		catalogueNotice = invokeError(err, "Could not delete the part");
-	} finally {
-		deletingCatalogueIc = "";
 	}
 }
 
@@ -4434,93 +4335,7 @@ onDestroy(() => {
 </div>
 
 {#if catalogueOpen}
-	<div
-		class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
-		on:click={closeReferences}
-	>
-		<div
-			class="flex max-h-[80vh] w-full max-w-4xl flex-col border border-neutral-700 bg-neutral-900 p-4"
-			role="dialog"
-			aria-modal="true"
-			aria-labelledby="references-title"
-			on:click|stopPropagation
-		>
-			<h2 id="references-title" class="text-lg font-semibold tracking-tight">DINOv2 references</h2>
-			<p class="mt-2 text-sm text-neutral-400">
-				Imported parts. Delete removes one part from the catalogue.
-			</p>
-			{#if cataloguePath}
-				<p class="mt-2 break-all font-mono text-xs text-neutral-500">{cataloguePath}</p>
-			{/if}
-			{#if catalogueNotice}
-				<p class="mt-3 text-sm {catalogueNoticeClass(catalogueNotice)}">{catalogueNotice}</p>
-			{/if}
-			<div class="mt-4 min-h-0 flex-1 overflow-auto">
-				{#if catalogueLoading}
-					<p class="text-sm text-neutral-200">Loading...</p>
-				{:else if catalogueParts.length === 0}
-					{#if !catalogueNotice || catalogueNotice.startsWith("Removed ")}
-						<p class="text-sm text-neutral-200">No references loaded.</p>
-					{/if}
-				{:else}
-					<ul class="flex flex-col">
-						{#each catalogueParts as part (part.ic)}
-							<li class="flex items-start gap-3 border-b border-neutral-800 py-3">
-								<div class="flex w-44 shrink-0 flex-wrap gap-1">
-									{#if part.thumbs.length === 0}
-										<div
-											class="flex h-16 w-16 items-center justify-center border border-neutral-800 text-[10px] font-semibold uppercase tracking-wide text-neutral-500"
-										>
-											No crop
-										</div>
-									{:else}
-										{#each part.thumbs as src, index (`${part.ic}-${index}`)}
-											<img
-												src={src}
-												alt="{part.ic} crop {index + 1}"
-												class="h-16 w-16 border border-neutral-800 bg-neutral-950 object-contain"
-											/>
-										{/each}
-									{/if}
-								</div>
-								<div class="min-w-0 flex-1">
-									<p class="font-mono text-sm text-neutral-100">{part.ic}</p>
-									{#if part.description}
-										<p class="text-sm text-neutral-200">{part.description}</p>
-									{/if}
-									{#if part.type}
-										<p class="text-sm text-neutral-400">Type {part.type}</p>
-									{/if}
-									{#if part.dimensions}
-										<p class="text-sm text-neutral-400">{part.dimensions}</p>
-									{/if}
-								</div>
-								<button
-									type="button"
-									class="inline-flex min-h-9 shrink-0 items-center border border-neutral-600 bg-neutral-800 px-3 text-sm font-semibold text-neutral-100 disabled:border-neutral-700 disabled:text-neutral-500"
-									aria-label="Delete {part.ic}"
-									on:click={() => deleteCataloguePart(part.ic)}
-									disabled={deletingCatalogueIc !== ""}
-								>
-									{deletingCatalogueIc === part.ic ? "Deleting..." : "Delete"}
-								</button>
-							</li>
-						{/each}
-					</ul>
-				{/if}
-			</div>
-			<div class="mt-4 flex justify-end">
-				<button
-					type="button"
-					bind:this={catalogueClose}
-					class="inline-flex min-h-11 items-center border border-neutral-600 bg-neutral-800 px-4 text-sm font-semibold text-neutral-100"
-					on:click={closeReferences}
-				>
-					Close
-				</button>
-			</div>
-		</div>
-	</div>
+	<ReferencesModal epoch={catalogueEpoch} on:close={closeReferences} />
 {/if}
 
 {#if replaceWarningOpen}

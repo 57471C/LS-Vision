@@ -36,11 +36,19 @@
 //! A crop path is `crops/<file>.jpg` or `crops/<IC>/<file>.jpg`. The folder
 //! after `crops/` groups those images under that IC. An IC is left out when
 //! its crop list is empty or none of the listed files are in the tar.
+//!
+//! The references dialog can delete, reassign, or reorder crops. That only
+//! changes the existing `crops` and `embeddings` arrays. Per-dimension
+//! tolerances are stored in `vision/catalogue-tolerances.json`, not in
+//! `catalogue.json`.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
+
+use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 
@@ -59,6 +67,7 @@ const MAX_PARTS: usize = 2_000;
 const MAX_CROPS: usize = 24;
 const PROMPT_THUMBS: usize = 4;
 const CROP_LIMITS_FILE: &str = "catalogue-crop-limits.json";
+const TOLERANCES_FILE: &str = "catalogue-tolerances.json";
 const MAX_PIXELS: usize = 40_000_000;
 const MAX_TEXT: usize = 500;
 const THUMB_EDGE: u32 = 160;
@@ -196,6 +205,22 @@ pub struct CropChoiceInput {
 }
 
 #[derive(Clone, Serialize)]
+pub struct CatalogueCropView {
+    pub index: usize,
+    pub src: String,
+    pub hash: String,
+}
+
+#[derive(Clone, Serialize)]
+pub struct CatalogueSizeView {
+    pub key: String,
+    pub label: String,
+    pub value: String,
+    #[serde(rename = "toleranceMm", skip_serializing_if = "Option::is_none")]
+    pub tolerance_mm: Option<f64>,
+}
+
+#[derive(Clone, Serialize)]
 pub struct CatalogueView {
     pub ic: String,
     pub description: String,
@@ -203,6 +228,10 @@ pub struct CatalogueView {
     pub kind: String,
     pub dimensions: String,
     pub thumbs: Vec<String>,
+    pub crops: Vec<CatalogueCropView>,
+    pub sizes: Vec<CatalogueSizeView>,
+    #[serde(rename = "addedUnix", skip_serializing_if = "Option::is_none")]
+    pub added_unix: Option<i64>,
 }
 
 #[derive(Clone, Serialize)]
@@ -413,6 +442,57 @@ fn catalogue_list_from(vision: &Path) -> Result<CatalogueList, String> {
 pub fn delete_catalogue_part(ic: String) -> Result<(), String> {
     let vision = vision_directory()?;
     remove_part(&vision, &ic)
+}
+
+/// Remove the chosen crops from one part. The part stays, including when it
+/// has no images left.
+#[tauri::command]
+pub fn delete_catalogue_crops(ic: String, indexes: Vec<usize>) -> Result<(), String> {
+    let vision = vision_directory()?;
+    delete_crops(&vision, &ic, &indexes)
+}
+
+/// Move the chosen crops, and their embeddings, onto another item code.
+/// A new item code is added when it is not already in the catalogue.
+#[tauri::command]
+pub fn reassign_catalogue_crops(
+    ic: String,
+    indexes: Vec<usize>,
+    target: String,
+) -> Result<(), String> {
+    let vision = vision_directory()?;
+    reassign_crops(&vision, &ic, &indexes, &target)
+}
+
+/// Rewrite one part's crop order. The first index is the primary image.
+#[tauri::command]
+pub fn reorder_catalogue_crops(ic: String, order: Vec<usize>) -> Result<(), String> {
+    let vision = vision_directory()?;
+    reorder_crops(&vision, &ic, &order)
+}
+
+/// Save or clear one dimension tolerance for an item code.
+/// `mm` null removes the override. The catalogue file is not rewritten.
+#[tauri::command]
+pub fn set_catalogue_tolerance(ic: String, key: String, mm: Option<f64>) -> Result<(), String> {
+    let vision = vision_directory()?;
+    set_tolerance(&vision, &ic, &key, mm)
+}
+
+/// Tolerances saved for one item code, keyed by the normalised dimension name.
+/// A missing file is an empty map.
+pub(crate) fn tolerances_for(ic: &str) -> HashMap<String, f64> {
+    let ic = ic.trim();
+    if ic.is_empty() {
+        return HashMap::new();
+    }
+    let Ok(vision) = vision_directory() else {
+        return HashMap::new();
+    };
+    read_tolerances(&vision)
+        .get(ic)
+        .cloned()
+        .unwrap_or_default()
 }
 
 #[derive(Clone, Serialize)]
@@ -2175,6 +2255,7 @@ fn remove_part(vision: &Path, ic: &str) -> Result<(), String> {
     replace_file_bytes(&catalogue_path(vision), &bytes)?;
     *lock(&CATALOGUE) = book;
     crate::catalog::reload_installed();
+    drop_tolerance(vision, ic);
     for crop in &removed.crops {
         if let Some(path) = crop_file(vision, crop) {
             let _ = fs::remove_file(&path);
@@ -2184,6 +2265,239 @@ fn remove_part(vision: &Path, ic: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn store_book(vision: &Path, book: Book) -> Result<(), String> {
+    let bytes = book_json(&book)?;
+    replace_file_bytes(&catalogue_path(vision), &bytes)?;
+    *lock(&CATALOGUE) = book;
+    crate::catalog::reload_installed();
+    Ok(())
+}
+
+fn unique_indexes(indexes: &[usize], len: usize) -> Result<Vec<usize>, String> {
+    if indexes.is_empty() {
+        return Err("Choose an image.".to_string());
+    }
+    let mut unique = Vec::new();
+    for index in indexes {
+        if *index >= len {
+            return Err("That image is not in the catalogue.".to_string());
+        }
+        if !unique.contains(index) {
+            unique.push(*index);
+        }
+    }
+    unique.sort_unstable();
+    Ok(unique)
+}
+
+fn permutation(order: &[usize], len: usize) -> Result<Vec<usize>, String> {
+    if order.len() != len {
+        return Err("Could not reorder the images.".to_string());
+    }
+    let mut seen = vec![false; len];
+    for index in order {
+        if *index >= len || seen[*index] {
+            return Err("Could not reorder the images.".to_string());
+        }
+        seen[*index] = true;
+    }
+    Ok(order.to_vec())
+}
+
+fn delete_crops(vision: &Path, ic: &str, indexes: &[usize]) -> Result<(), String> {
+    let ic = clean_ic(ic)?;
+    let Some(mut book) = load_book(vision)? else {
+        return Err("That part is not in the catalogue.".to_string());
+    };
+    if book.parts.iter().all(|part| part.ic != ic) {
+        return Err("That part is not in the catalogue.".to_string());
+    }
+    let removed = {
+        let part = book
+            .parts
+            .iter_mut()
+            .find(|part| part.ic == ic)
+            .expect("part");
+        let unique = unique_indexes(indexes, part.crops.len())?;
+        let mut removed = Vec::new();
+        for index in unique.into_iter().rev() {
+            removed.push(part.crops.remove(index));
+            part.embeddings.remove(index);
+        }
+        removed
+    };
+    let doomed: Vec<String> = removed
+        .into_iter()
+        .filter(|crop| {
+            !book
+                .parts
+                .iter()
+                .any(|part| part.crops.iter().any(|have| have == crop))
+        })
+        .collect();
+    store_book(vision, book)?;
+    for crop in doomed {
+        if let Some(path) = crop_file(vision, &crop) {
+            let _ = fs::remove_file(&path);
+            if let Some(parent) = path.parent() {
+                let _ = fs::remove_dir(parent);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn reassign_crops(vision: &Path, ic: &str, indexes: &[usize], target: &str) -> Result<(), String> {
+    let ic = clean_ic(ic)?;
+    let target = clean_ic(target)?;
+    if ic == target {
+        return Err("Choose a different IC.".to_string());
+    }
+    let Some(mut book) = load_book(vision)? else {
+        return Err("That part is not in the catalogue.".to_string());
+    };
+    let source_index = book
+        .parts
+        .iter()
+        .position(|part| part.ic == ic)
+        .ok_or_else(|| "That part is not in the catalogue.".to_string())?;
+    let unique = unique_indexes(indexes, book.parts[source_index].crops.len())?;
+    let moving = unique.len();
+    if let Some(target_index) = book.parts.iter().position(|part| part.ic == target) {
+        let allowed = book.parts[target_index].crop_limit.unwrap_or(MAX_CROPS);
+        if book.parts[target_index].crops.len() + moving > allowed {
+            return Err(format!("Part {target} has too many crops."));
+        }
+    } else if book.parts.len() >= MAX_PARTS {
+        return Err("The catalogue has too many parts.".to_string());
+    }
+    let mut moved_crops = Vec::with_capacity(moving);
+    let mut moved_embeddings = Vec::with_capacity(moving);
+    for index in unique.into_iter().rev() {
+        moved_crops.push(book.parts[source_index].crops.remove(index));
+        moved_embeddings.push(book.parts[source_index].embeddings.remove(index));
+    }
+    moved_crops.reverse();
+    moved_embeddings.reverse();
+    if let Some(target_index) = book.parts.iter().position(|part| part.ic == target) {
+        book.parts[target_index].crops.extend(moved_crops);
+        book.parts[target_index].embeddings.extend(moved_embeddings);
+    } else {
+        book.parts.push(Part {
+            ic: target,
+            description: String::new(),
+            kind: String::new(),
+            measurement_method: String::new(),
+            dimensions: Value::Null,
+            crops: moved_crops,
+            embeddings: moved_embeddings,
+            crop_limit: None,
+        });
+    }
+    store_book(vision, book)
+}
+
+fn reorder_crops(vision: &Path, ic: &str, order: &[usize]) -> Result<(), String> {
+    let ic = clean_ic(ic)?;
+    let Some(mut book) = load_book(vision)? else {
+        return Err("That part is not in the catalogue.".to_string());
+    };
+    {
+        let Some(part) = book.parts.iter_mut().find(|part| part.ic == ic) else {
+            return Err("That part is not in the catalogue.".to_string());
+        };
+        let order = permutation(order, part.crops.len())?;
+        let crops: Vec<String> = order.iter().map(|index| part.crops[*index].clone()).collect();
+        let embeddings: Vec<Vec<f32>> = order
+            .iter()
+            .map(|index| part.embeddings[*index].clone())
+            .collect();
+        part.crops = crops;
+        part.embeddings = embeddings;
+    }
+    store_book(vision, book)
+}
+
+fn set_tolerance(vision: &Path, ic: &str, key: &str, mm: Option<f64>) -> Result<(), String> {
+    let ic = clean_ic(ic)?;
+    let key = norm_size_key(key);
+    if key.is_empty() || key.len() > 80 {
+        return Err("That dimension is not on this part.".to_string());
+    }
+    let Some(book) = load_book(vision)? else {
+        return Err("That part is not in the catalogue.".to_string());
+    };
+    let Some(part) = book.parts.iter().find(|part| part.ic == ic) else {
+        return Err("That part is not in the catalogue.".to_string());
+    };
+    if !size_rows(&part.dimensions)
+        .iter()
+        .any(|row| row.key == key)
+    {
+        return Err("That dimension is not on this part.".to_string());
+    }
+    let mut saved = read_tolerances(vision);
+    match mm {
+        None => {
+            if let Some(entry) = saved.get_mut(&ic) {
+                entry.remove(&key);
+                if entry.is_empty() {
+                    saved.remove(&ic);
+                }
+            }
+        }
+        Some(mm) => {
+            if !mm.is_finite() || !(0.0..=1000.0).contains(&mm) {
+                return Err("Enter a tolerance from 0 to 1000 mm.".to_string());
+            }
+            saved.entry(ic).or_default().insert(key, mm);
+        }
+    }
+    write_tolerances(vision, &saved)
+}
+
+fn drop_tolerance(vision: &Path, ic: &str) {
+    let mut saved = read_tolerances(vision);
+    if saved.remove(ic).is_some() {
+        let _ = write_tolerances(vision, &saved);
+    }
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct ToleranceFile {
+    version: u32,
+    #[serde(default)]
+    parts: HashMap<String, HashMap<String, f64>>,
+}
+
+fn tolerances_path(vision: &Path) -> PathBuf {
+    vision.join(TOLERANCES_FILE)
+}
+
+fn read_tolerances(vision: &Path) -> HashMap<String, HashMap<String, f64>> {
+    let text = match fs::read_to_string(tolerances_path(vision)) {
+        Ok(text) => text,
+        Err(_) => return HashMap::new(),
+    };
+    serde_json::from_str::<ToleranceFile>(&text)
+        .map(|file| file.parts)
+        .unwrap_or_default()
+}
+
+fn write_tolerances(
+    vision: &Path,
+    parts: &HashMap<String, HashMap<String, f64>>,
+) -> Result<(), String> {
+    let file = ToleranceFile {
+        version: 1,
+        parts: parts.clone(),
+    };
+    let mut bytes = serde_json::to_vec(&file)
+        .map_err(|_| "Could not save the tolerance.".to_string())?;
+    bytes.push(b'\n');
+    replace_file_bytes(&tolerances_path(vision), &bytes)
 }
 
 fn replace_file_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -2197,20 +2511,202 @@ fn replace_file_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 fn views_from(book: &Book, vision: &Path) -> Vec<CatalogueView> {
+    let tolerances = read_tolerances(vision);
     book.parts
         .iter()
-        .map(|part| CatalogueView {
-            ic: part.ic.clone(),
-            description: part.description.clone(),
-            kind: part.kind.clone(),
-            dimensions: dimensions_text(&part.dimensions),
-            thumbs: part
-                .crops
-                .iter()
-                .filter_map(|crop| thumb_url(vision, crop))
-                .collect(),
+        .map(|part| {
+            let saved = tolerances.get(&part.ic);
+            let mut thumbs = Vec::new();
+            let mut crops = Vec::new();
+            for (index, crop) in part.crops.iter().enumerate() {
+                let (src, hash) = crop_preview(vision, crop);
+                if src.starts_with("data:image/") {
+                    thumbs.push(src.clone());
+                }
+                crops.push(CatalogueCropView { index, src, hash });
+            }
+            let sizes = size_rows(&part.dimensions)
+                .into_iter()
+                .map(|row| CatalogueSizeView {
+                    tolerance_mm: saved.and_then(|entry| entry.get(&row.key).copied()),
+                    key: row.key,
+                    label: row.label,
+                    value: row.value,
+                })
+                .collect();
+            CatalogueView {
+                ic: part.ic.clone(),
+                description: part.description.clone(),
+                kind: part.kind.clone(),
+                dimensions: dimensions_text(&part.dimensions),
+                thumbs,
+                crops,
+                sizes,
+                added_unix: oldest_crop_unix(vision, &part.crops),
+            }
         })
         .collect()
+}
+
+struct SizeRow {
+    key: String,
+    label: String,
+    value: String,
+}
+
+fn size_rows(dimensions: &Value) -> Vec<SizeRow> {
+    let mut rows = Vec::new();
+    match dimensions {
+        Value::Object(map) => {
+            for (key, value) in map {
+                if let Some(text) = number_text(value) {
+                    push_size(&mut rows, key, &text);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                let Some(map) = item.as_object() else {
+                    continue;
+                };
+                let Some(name) = map.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(text) = map
+                    .get("mm")
+                    .and_then(number_text)
+                    .or_else(|| map.get("value").and_then(number_text))
+                else {
+                    continue;
+                };
+                push_size(&mut rows, name.trim(), &text);
+            }
+        }
+        Value::String(text) => {
+            if let Some((diameter, length)) = split_size(text) {
+                push_size(&mut rows, "diameter", &diameter);
+                push_size(&mut rows, "length", &length);
+            } else if let Some(number) = number_text(dimensions) {
+                push_size(&mut rows, "size", &number);
+            }
+        }
+        Value::Number(_) => {
+            if let Some(number) = number_text(dimensions) {
+                push_size(&mut rows, "size", &number);
+            }
+        }
+        _ => {}
+    }
+    rows
+}
+
+fn push_size(rows: &mut Vec<SizeRow>, label: &str, value: &str) {
+    let label = label.trim();
+    let key = norm_size_key(label);
+    if label.is_empty() || key.is_empty() || rows.iter().any(|row| row.key == key) {
+        return;
+    }
+    rows.push(SizeRow {
+        key,
+        label: label.to_string(),
+        value: value.to_string(),
+    });
+}
+
+fn norm_size_key(name: &str) -> String {
+    name.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect()
+}
+
+fn number_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Number(number) => Some(number.to_string()),
+        Value::String(text) => leading_number_text(text),
+        _ => None,
+    }
+}
+
+fn leading_number_text(text: &str) -> Option<String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let mut end = 0;
+    let mut dot = false;
+    let mut digits = false;
+    for (index, ch) in text.char_indices() {
+        if ch.is_ascii_digit() {
+            digits = true;
+            end = index + 1;
+            continue;
+        }
+        if ch == '.' && !dot && digits {
+            dot = true;
+            end = index + 1;
+            continue;
+        }
+        break;
+    }
+    if !digits {
+        return None;
+    }
+    let number: f64 = text[..end].parse().ok()?;
+    if !number.is_finite() || number <= 0.0 {
+        return None;
+    }
+    Some(text[..end].trim_end_matches('.').to_string())
+}
+
+fn split_size(text: &str) -> Option<(String, String)> {
+    let lower = text.trim().to_ascii_lowercase();
+    let index = lower.find(['x', '×'])?;
+    let left = lower[..index].trim().trim_start_matches('m').trim();
+    let mark = lower[index..].chars().next()?.len_utf8();
+    let right = lower[index + mark..].trim();
+    Some((leading_number_text(left)?, leading_number_text(right)?))
+}
+
+fn crop_preview(vision: &Path, crop: &str) -> (String, String) {
+    let Some(path) = crop_file(vision, crop) else {
+        return (String::new(), String::new());
+    };
+    let Ok(bytes) = fs::read(path) else {
+        return (String::new(), String::new());
+    };
+    let hash = sha256_hex(&bytes);
+    let src = thumb_jpeg(&bytes).unwrap_or_default();
+    (src, hash)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn oldest_crop_unix(vision: &Path, crops: &[String]) -> Option<i64> {
+    let mut oldest: Option<i64> = None;
+    for crop in crops {
+        let Some(path) = crop_file(vision, crop) else {
+            continue;
+        };
+        let Ok(modified) = fs::metadata(path).and_then(|meta| meta.modified()) else {
+            continue;
+        };
+        let Ok(elapsed) = modified.duration_since(UNIX_EPOCH) else {
+            continue;
+        };
+        let secs = i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX);
+        oldest = Some(oldest.map_or(secs, |have| have.min(secs)));
+    }
+    oldest
 }
 
 /// Description, dimensions, and measurement method for one catalogue item code.
@@ -2263,12 +2759,6 @@ fn dimensions_text(value: &Value) -> String {
                 .join(", ")
         }
     }
-}
-
-fn thumb_url(vision: &Path, crop: &str) -> Option<String> {
-    let path = crop_file(vision, crop)?;
-    let bytes = fs::read(path).ok()?;
-    thumb_jpeg(&bytes)
 }
 
 fn crop_file(vision: &Path, crop: &str) -> Option<PathBuf> {
@@ -3287,6 +3777,128 @@ mod tests {
         assert!(err.contains("outside crops"), "{err}");
         assert_eq!(fs::read(catalogue_path(&dir)).unwrap(), before);
         assert!(!dir.join(CROP_LIMITS_FILE).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn color_jpeg(pixels: &[u8]) -> Vec<u8> {
+        let image = turbojpeg::Image {
+            pixels,
+            width: 2,
+            pitch: 6,
+            height: 2,
+            format: turbojpeg::PixelFormat::RGB,
+        };
+        turbojpeg::compress(image, 90, turbojpeg::Subsamp::Sub2x2)
+            .expect("jpeg")
+            .as_ref()
+            .to_vec()
+    }
+
+    #[test]
+    fn references_can_drop_move_and_reorder_without_changing_the_schema() {
+        let jpeg = tiny_jpeg();
+        let other = color_jpeg(&[0, 0, 255, 0, 0, 200, 255, 255, 255, 10, 20, 30]);
+        let catalogue = br#"{
+            "parts": [{
+                "ic": "2BBMNM08",
+                "description": "M8 nut",
+                "type": "fastener",
+                "dimensions": { "acrossFlats": 13, "h": 6.5 },
+                "crops": ["crops/a.jpg", "crops/b.jpg", "crops/a-copy.jpg"]
+            }]
+        }"#;
+        let bytes = pack(&[
+            ("catalogue.json", catalogue),
+            ("crops/a.jpg", jpeg.as_slice()),
+            ("crops/b.jpg", other.as_slice()),
+            ("crops/a-copy.jpg", jpeg.as_slice()),
+        ]);
+        let dir = temp_dir("refs");
+        import_tar_bytes(&bytes, &dir, true, &mut stub_embed).unwrap();
+        let listed = catalogue_list_from(&dir).unwrap();
+        assert_eq!(listed.parts.len(), 1);
+        assert_eq!(listed.parts[0].crops.len(), 3);
+        assert_eq!(listed.parts[0].thumbs.len(), 3);
+        assert_eq!(listed.parts[0].crops[0].index, 0);
+        assert_eq!(listed.parts[0].crops[0].hash.len(), 64);
+        assert_eq!(listed.parts[0].crops[0].hash, listed.parts[0].crops[2].hash);
+        assert_ne!(listed.parts[0].crops[0].hash, listed.parts[0].crops[1].hash);
+        assert!(listed.parts[0].added_unix.is_some());
+        let keys: Vec<&str> = listed.parts[0]
+            .sizes
+            .iter()
+            .map(|row| row.key.as_str())
+            .collect();
+        assert!(keys.contains(&"acrossflats"), "{keys:?}");
+        assert!(keys.contains(&"h"), "{keys:?}");
+        assert!(listed.parts[0]
+            .sizes
+            .iter()
+            .all(|row| row.tolerance_mm.is_none()));
+
+        let before = fs::read(catalogue_path(&dir)).unwrap();
+        set_tolerance(&dir, "2BBMNM08", "h", Some(0.25)).unwrap();
+        assert_eq!(fs::read(catalogue_path(&dir)).unwrap(), before);
+        assert!(!String::from_utf8_lossy(&before).contains("tolerance"));
+        let saved = catalogue_list_from(&dir).unwrap();
+        let height = saved.parts[0]
+            .sizes
+            .iter()
+            .find(|row| row.key == "h")
+            .unwrap();
+        assert_eq!(height.tolerance_mm, Some(0.25));
+        assert!(set_tolerance(&dir, "2BBMNM08", "nope", Some(1.0)).is_err());
+        assert!(set_tolerance(&dir, "2BBMNM08", "h", Some(1001.0)).is_err());
+        assert_eq!(fs::read(catalogue_path(&dir)).unwrap(), before);
+
+        let book = load_book(&dir).unwrap().unwrap();
+        let unique = listed.parts[0]
+            .crops
+            .iter()
+            .position(|crop| {
+                listed.parts[0]
+                    .crops
+                    .iter()
+                    .filter(|other| other.hash == crop.hash)
+                    .count()
+                    == 1
+            })
+            .unwrap();
+        let gone = book.parts[0].crops[unique].clone();
+        delete_crops(&dir, "2BBMNM08", &[unique]).unwrap();
+        assert!(!dir.join(&gone).is_file());
+        let left = load_book(&dir).unwrap().unwrap();
+        assert_eq!(left.parts[0].crops.len(), 2);
+        assert_eq!(left.parts[0].embeddings.len(), 2);
+        assert_eq!(left.parts[0].description, "M8 nut");
+        let listed = catalogue_list_from(&dir).unwrap();
+        assert!(listed.parts[0]
+            .crops
+            .iter()
+            .all(|crop| crop.hash == listed.parts[0].crops[0].hash));
+
+        let book = load_book(&dir).unwrap().unwrap();
+        let first = book.parts[0].crops[0].clone();
+        let second = book.parts[0].crops[1].clone();
+        let first_embed = book.parts[0].embeddings[0].clone();
+        reorder_crops(&dir, "2BBMNM08", &[1, 0]).unwrap();
+        let book = load_book(&dir).unwrap().unwrap();
+        assert_eq!(book.parts[0].crops[0], second);
+        assert_eq!(book.parts[0].crops[1], first);
+        assert_eq!(book.parts[0].embeddings[1], first_embed);
+        assert!(reorder_crops(&dir, "2BBMNM08", &[0]).is_err());
+
+        reassign_crops(&dir, "2BBMNM08", &[0], "NEW-1").unwrap();
+        let book = load_book(&dir).unwrap().unwrap();
+        assert_eq!(book.parts[0].crops.len(), 1);
+        assert_eq!(book.parts[1].ic, "NEW-1");
+        assert_eq!(book.parts[1].embeddings.len(), 1);
+        assert!(dir.join(&book.parts[1].crops[0]).is_file());
+        assert!(reassign_crops(&dir, "NEW-1", &[0], "NEW-1").is_err());
+        assert!(delete_crops(&dir, "NEW-1", &[]).is_err());
+
+        remove_part(&dir, "2BBMNM08").unwrap();
+        assert!(read_tolerances(&dir).get("2BBMNM08").is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 }
