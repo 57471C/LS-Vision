@@ -36,7 +36,7 @@ Training lists `.pt` and `.onnx` files in the app data models folder. The path b
 
 ## Part rules
 
-Update references, above the part rules, opens a native file dialog that accepts `.tar`. The archive contains `catalogue.json` and JPEG crops under `crops/`, including `crops/<IC>/<file>.jpg`. Each crop is embedded with the ONNX file named by the current `dinoModel`. The written vectors have that model's CLS length. Embeddings are written to `dino_catalogue` for the selected model. Part text and crop paths are written to `app_config`. The JPEGs are copied under `vision/catalogue-crops/`. The next start loads that database.
+Update references, above the part rules, opens a native file dialog that accepts `.tar`. The archive contains `catalogue.json` and JPEG crops under `crops/`, including `crops/<IC>/<file>.jpg`. Each crop is embedded with the ONNX file named by the current `dinoModel`. The written vectors have that model's CLS length. Embeddings are written to `dino_catalogue` for the selected model. Part text and crop paths are written to `app_config`. The crop JPEG is stored in the `crop` column of that row. The next start loads that database.
 
 The default import adds item codes from the tar and updates item codes that are already on this PC. Parts and crops that are only on this PC stay, including crops an admin added from the camera preview. Nothing that is missing from the tar is deleted. A non-empty description, type, or measurement method from the tar updates that field. An empty field leaves the saved value. Success says "Catalogue updated. N parts on this PC."
 

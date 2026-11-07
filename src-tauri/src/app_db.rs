@@ -2,9 +2,10 @@
 //! backend settings.
 //!
 //! The file is `results.sqlite` under the user save directory. Results rows
-//! stay in the `results` table. Catalogue embeddings and settings use
-//! `dino_catalogue` and `app_config` in that same file.
+//! stay in the `results` table. Catalogue embeddings, crop images, and
+//! settings use `dino_catalogue` and `app_config` in that same file.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -22,6 +23,7 @@ CREATE TABLE IF NOT EXISTS dino_catalogue (
     embedding BLOB NOT NULL,
     source TEXT,
     created_at TEXT,
+    crop BLOB,
     UNIQUE(ic, model, source)
 );
 CREATE INDEX IF NOT EXISTS dino_catalogue_model ON dino_catalogue (model);
@@ -52,7 +54,35 @@ pub(crate) fn shared_database_path() -> Result<PathBuf, String> {
 }
 
 pub(crate) fn ensure_schema(connection: &Connection) -> Result<(), String> {
-    connection.execute_batch(SCHEMA).map_err(db_err)
+    connection.execute_batch(SCHEMA).map_err(db_err)?;
+    ensure_crop_column(connection)
+}
+
+/// Older databases were created before crop images lived in this table.
+fn ensure_crop_column(connection: &Connection) -> Result<(), String> {
+    let found = {
+        let mut statement = connection
+            .prepare("PRAGMA table_info(dino_catalogue)")
+            .map_err(db_err)?;
+        let names = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(db_err)?;
+        let mut present = false;
+        for name in names {
+            if name.map_err(db_err)? == "crop" {
+                present = true;
+                break;
+            }
+        }
+        present
+    };
+    if found {
+        return Ok(());
+    }
+    connection
+        .execute("ALTER TABLE dino_catalogue ADD COLUMN crop BLOB", [])
+        .map_err(db_err)?;
+    Ok(())
 }
 
 fn connect(path: &Path) -> Result<Connection, String> {
@@ -203,6 +233,16 @@ pub(crate) struct EmbeddingRow {
     pub ic: String,
     pub source: String,
     pub values: Vec<f32>,
+    /// JPEG (or PNG) bytes for this crop. `None` keeps the blob already stored
+    /// on this source. The matcher does not load this field.
+    pub crop: Option<Vec<u8>>,
+}
+
+/// Crop image loaded when a caller asks for it. The embedding query does not
+/// read this blob.
+pub(crate) struct StoredCrop {
+    pub bytes: Vec<u8>,
+    pub created_unix: Option<i64>,
 }
 
 pub(crate) fn read_catalogue_meta(scope: &Path) -> Result<Option<CatalogueMeta>, String> {
@@ -247,12 +287,78 @@ pub(crate) fn embeddings_for_model(scope: &Path, model: &str) -> Result<Vec<Embe
             ic,
             source: source.unwrap_or_default(),
             values: embedding_from_blob(&blob)?,
+            crop: None,
         });
     }
     Ok(embeddings)
 }
 
-/// Replace one model's embeddings and drop rows whose crop is gone.
+/// JPEG bytes for one logical crop id. Missing rows and empty blobs are
+/// `None`. This does not open a file.
+#[cfg(test)]
+pub(crate) fn crop_bytes(scope: &Path, source: &str) -> Result<Option<Vec<u8>>, String> {
+    let mut images = crops_for_sources(scope, &[source.to_string()])?;
+    Ok(images.remove(source).map(|image| image.bytes))
+}
+
+/// Crop images for the given logical ids, one database read.
+pub(crate) fn crops_for_sources(
+    scope: &Path,
+    sources: &[String],
+) -> Result<HashMap<String, StoredCrop>, String> {
+    let mut found = HashMap::new();
+    if sources.is_empty() {
+        return Ok(found);
+    }
+    let Some(connection) = open_existing(scope)? else {
+        return Ok(found);
+    };
+    let mut statement = connection
+        .prepare(
+            "SELECT crop, created_at FROM dino_catalogue
+             WHERE IFNULL(source, '') = ?1 AND crop IS NOT NULL
+             LIMIT 1",
+        )
+        .map_err(db_err)?;
+    for source in sources {
+        if found.contains_key(source) {
+            continue;
+        }
+        let row = statement
+            .query_row(params![source], |row| {
+                Ok((
+                    row.get::<_, Option<Vec<u8>>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            })
+            .optional()
+            .map_err(db_err)?;
+        let Some((bytes, created_at)) = row else {
+            continue;
+        };
+        let Some(bytes) = bytes.filter(|bytes| !bytes.is_empty()) else {
+            continue;
+        };
+        found.insert(
+            source.clone(),
+            StoredCrop {
+                bytes,
+                created_unix: unix_stamp(created_at),
+            },
+        );
+    }
+    Ok(found)
+}
+
+fn unix_stamp(text: Option<String>) -> Option<i64> {
+    let text = text?;
+    chrono::DateTime::parse_from_rfc3339(&text)
+        .ok()
+        .map(|time| time.timestamp())
+}
+
+/// Replace one model's embeddings and drop rows whose crop id is gone.
+/// A row keeps the JPEG already stored for that source when `crop` is empty.
 /// Rows for another model stay when that crop is still in `live_sources`.
 pub(crate) fn write_catalogue(
     scope: &Path,
@@ -264,6 +370,7 @@ pub(crate) fn write_catalogue(
     let connection = open_write(scope)?;
     let transaction = connection.unchecked_transaction().map_err(db_err)?;
     put_meta(&transaction, meta)?;
+    let (saved_pair, saved_source) = snapshot_crops(&transaction)?;
     transaction
         .execute(
             "DELETE FROM dino_catalogue WHERE model = ?1",
@@ -295,24 +402,99 @@ pub(crate) fn write_catalogue(
             [],
         )
         .map_err(db_err)?;
-    let created_at = chrono::Local::now().to_rfc3339();
+    let created_now = chrono::Local::now().to_rfc3339();
     {
         let mut insert = transaction
             .prepare(
                 "INSERT OR REPLACE INTO dino_catalogue
-                    (ic, model, embedding, source, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                    (ic, model, embedding, source, created_at, crop)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )
             .map_err(db_err)?;
         for row in rows {
+            let (crop, created_at) = kept_crop(row, &saved_pair, &saved_source, &created_now);
             let blob = embedding_blob(&row.values);
             insert
-                .execute(params![row.ic, model, blob, row.source, created_at])
+                .execute(params![row.ic, model, blob, row.source, created_at, crop])
                 .map_err(db_err)?;
         }
     }
     transaction.commit().map_err(db_err)?;
     Ok(())
+}
+
+struct SavedCrop {
+    bytes: Option<Vec<u8>>,
+    created_at: Option<String>,
+}
+
+fn snapshot_crops(
+    connection: &Connection,
+) -> Result<
+    (
+        HashMap<(String, String), SavedCrop>,
+        HashMap<String, SavedCrop>,
+    ),
+    String,
+> {
+    let mut statement = connection
+        .prepare("SELECT ic, IFNULL(source, ''), crop, created_at FROM dino_catalogue")
+        .map_err(db_err)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<Vec<u8>>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .map_err(db_err)?;
+    let mut by_pair: HashMap<(String, String), SavedCrop> = HashMap::new();
+    let mut by_source: HashMap<String, SavedCrop> = HashMap::new();
+    for row in rows {
+        let (ic, source, crop, created_at) = row.map_err(db_err)?;
+        let bytes = crop.filter(|bytes| !bytes.is_empty());
+        if bytes.is_some() {
+            by_source.entry(source.clone()).or_insert(SavedCrop {
+                bytes: bytes.clone(),
+                created_at: created_at.clone(),
+            });
+        }
+        let pair_key = (ic, source);
+        let replace = match by_pair.get(&pair_key) {
+            Some(saved) => saved.bytes.is_none() && bytes.is_some(),
+            None => true,
+        };
+        if replace {
+            by_pair.insert(pair_key, SavedCrop { bytes, created_at });
+        }
+    }
+    Ok((by_pair, by_source))
+}
+
+fn kept_crop(
+    row: &EmbeddingRow,
+    saved_pair: &HashMap<(String, String), SavedCrop>,
+    saved_source: &HashMap<String, SavedCrop>,
+    now: &str,
+) -> (Option<Vec<u8>>, String) {
+    if let Some(bytes) = row.crop.as_ref().filter(|bytes| !bytes.is_empty()) {
+        return (Some(bytes.clone()), now.to_string());
+    }
+    if let Some(saved) = saved_pair.get(&(row.ic.clone(), row.source.clone())) {
+        return (
+            saved.bytes.clone(),
+            saved.created_at.clone().unwrap_or_else(|| now.to_string()),
+        );
+    }
+    if let Some(saved) = saved_source.get(&row.source) {
+        return (
+            saved.bytes.clone(),
+            saved.created_at.clone().unwrap_or_else(|| now.to_string()),
+        );
+    }
+    (None, now.to_string())
 }
 
 fn put_meta(connection: &Connection, meta: &CatalogueMeta) -> Result<(), String> {
@@ -374,6 +556,7 @@ mod tests {
             ic: "FAST-1".to_string(),
             source: "catalogue-crops/FAST-1/a.jpg".to_string(),
             values: vec![1.0, 0.0],
+            crop: None,
         };
         write_catalogue(
             &scope,
@@ -390,11 +573,13 @@ mod tests {
             ic: "FAST-1".to_string(),
             source: "catalogue-crops/FAST-1/a.jpg".to_string(),
             values: vec![0.0, 9.0],
+            crop: None,
         };
         let other = EmbeddingRow {
             ic: "FAST-1".to_string(),
             source: "catalogue-crops/FAST-1/a.jpg".to_string(),
             values: vec![4.0, 0.0],
+            crop: None,
         };
         write_catalogue(
             &scope,
@@ -527,6 +712,180 @@ mod tests {
             get_text(&scope, "catalogue.parts").unwrap().as_deref(),
             Some("[]")
         );
+        let _ = fs::remove_dir_all(scope);
+    }
+
+    #[test]
+    fn a_rewrite_keeps_the_crop_blob_until_new_bytes_are_written() {
+        let scope = temp_scope("crop");
+        let source = "catalogue-crops/FAST-1/a.jpg";
+        let jpeg = vec![0xff, 0xd8, 0xff, 0x11];
+        let meta = CatalogueMeta {
+            embedding_model: Some("b_reg".to_string()),
+            embeddings_stale: false,
+            parts_json: "[]".to_string(),
+        };
+        let live = [("FAST-1".to_string(), source.to_string())];
+        write_catalogue(
+            &scope,
+            &meta,
+            "b_reg",
+            &[EmbeddingRow {
+                ic: "FAST-1".to_string(),
+                source: source.to_string(),
+                values: vec![1.0, 0.0],
+                crop: Some(jpeg.clone()),
+            }],
+            &live,
+        )
+        .unwrap();
+        let created: String = connect(&database_path(&scope))
+            .unwrap()
+            .query_row(
+                "SELECT created_at FROM dino_catalogue WHERE model = 'b_reg'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        write_catalogue(
+            &scope,
+            &meta,
+            "b_reg",
+            &[EmbeddingRow {
+                ic: "FAST-1".to_string(),
+                source: source.to_string(),
+                values: vec![0.0, 2.0],
+                crop: None,
+            }],
+            &live,
+        )
+        .unwrap();
+        let loaded = embeddings_for_model(&scope, "b_reg").unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].values, vec![0.0, 2.0]);
+        assert!(loaded[0].crop.is_none());
+        assert_eq!(crop_bytes(&scope, source).unwrap().unwrap(), jpeg);
+        let kept_at: String = connect(&database_path(&scope))
+            .unwrap()
+            .query_row(
+                "SELECT created_at FROM dino_catalogue WHERE model = 'b_reg'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept_at, created);
+
+        let moved = [("FAST-2".to_string(), source.to_string())];
+        write_catalogue(
+            &scope,
+            &meta,
+            "b_reg",
+            &[EmbeddingRow {
+                ic: "FAST-2".to_string(),
+                source: source.to_string(),
+                values: vec![3.0, 0.0],
+                crop: Some(Vec::new()),
+            }],
+            &moved,
+        )
+        .unwrap();
+        let row: (String, Vec<u8>) = connect(&database_path(&scope))
+            .unwrap()
+            .query_row(
+                "SELECT ic, crop FROM dino_catalogue WHERE model = 'b_reg'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, "FAST-2");
+        assert_eq!(row.1, jpeg);
+
+        let replacement = vec![0x89, 0x50, 0x4e, 0x47, 0x0d];
+        write_catalogue(
+            &scope,
+            &meta,
+            "b_reg",
+            &[EmbeddingRow {
+                ic: "FAST-2".to_string(),
+                source: source.to_string(),
+                values: vec![3.0, 0.0],
+                crop: Some(replacement.clone()),
+            }],
+            &moved,
+        )
+        .unwrap();
+        assert_eq!(crop_bytes(&scope, source).unwrap().unwrap(), replacement);
+        write_catalogue(
+            &scope,
+            &meta,
+            "s_reg",
+            &[EmbeddingRow {
+                ic: "FAST-2".to_string(),
+                source: source.to_string(),
+                values: vec![4.0, 0.0],
+                crop: None,
+            }],
+            &moved,
+        )
+        .unwrap();
+        let both: i64 = connect(&database_path(&scope))
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM dino_catalogue WHERE crop = ?1",
+                [replacement],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(both, 2);
+        let _ = fs::remove_dir_all(scope);
+    }
+
+    #[test]
+    fn an_older_catalogue_table_gains_a_crop_column() {
+        let scope = temp_scope("migrate-crop");
+        let path = scope.join(DB_FILE);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE dino_catalogue (
+                    id INTEGER PRIMARY KEY,
+                    ic TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    embedding BLOB NOT NULL,
+                    source TEXT,
+                    created_at TEXT,
+                    UNIQUE(ic, model, source)
+                );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO dino_catalogue (ic, model, embedding, source, created_at)
+                 VALUES ('FAST-1', 's_reg', ?1, 'catalogue-crops/FAST-1/a.jpg', '2020-01-01T00:00:00+00:00')",
+                [embedding_blob(&[1.0, 0.0])],
+            )
+            .unwrap();
+        drop(connection);
+        ensure_schema(&connect(&path).unwrap()).unwrap();
+        let loaded = embeddings_for_model(&scope, "s_reg").unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].values, vec![1.0, 0.0]);
+        assert!(
+            crop_bytes(&scope, "catalogue-crops/FAST-1/a.jpg")
+                .unwrap()
+                .is_none()
+        );
+        let columns = {
+            let connection = connect(&path).unwrap();
+            let mut statement = connection
+                .prepare("PRAGMA table_info(dino_catalogue)")
+                .unwrap();
+            let names = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap();
+            names.map(|name| name.unwrap()).collect::<Vec<_>>()
+        };
+        assert!(columns.iter().any(|name| name == "crop"));
         let _ = fs::remove_dir_all(scope);
     }
 }

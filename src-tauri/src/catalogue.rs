@@ -6,9 +6,9 @@
 //! file and writes vectors of its CLS length. A model change marks stored
 //! vectors stale. The next extract writes that model's rows. The matcher reads
 //! only the model it loaded, so ViT-S and ViT-B vectors are not mixed.
-//! Embeddings go into the `dino_catalogue` table of the results database.
-//! Part text and crop paths go into `app_config` in that same file. The JPEGs
-//! are copied under `vision/catalogue-crops/`. Startup loads the database.
+//! Embeddings and crop images go into the `dino_catalogue` table of the
+//! results database. Part text and crop ids go into `app_config` in that same
+//! file. Startup loads the database.
 //! The default import updates item codes that are in the tar and adds new
 //! ones. Parts and crops that are only on this PC stay. Full replace writes
 //! the tar as the whole catalogue, including classes over their crop limit.
@@ -47,9 +47,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
 
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -159,12 +158,17 @@ fn reembed_book(
     done: &mut usize,
     total: usize,
 ) -> Result<(), String> {
+    let mut sources = Vec::new();
+    for part in &book.parts {
+        sources.extend(part.crops.iter().cloned());
+    }
+    let stored = stored_crops(vision, &sources)?;
     let mut expected_width = None;
     for part in &mut book.parts {
         let mut fresh = Vec::with_capacity(part.crops.len());
         for crop in &part.crops {
             report_extract(progress, &part.ic, *done, total);
-            let bytes = read_kept_crop(vision, crop)?;
+            let bytes = jpeg_from_stored(stored.get(crop))?;
             let values =
                 embed(&bytes).map_err(|err| format!("Could not embed {}: {err}", part.ic))?;
             if values.is_empty() || values.iter().any(|value| !value.is_finite()) {
@@ -844,7 +848,7 @@ fn append_catalogue_crop(
         return Err(format!("Part {ic} has too many crops."));
     }
     let folder = folder_for(book.parts.iter().find(|part| part.ic == ic), &ic);
-    let relative = write_new_crop(vision, &folder, jpeg)?;
+    let relative = next_crop_source(&book, &folder)?;
     if let Some(part) = book.parts.iter_mut().find(|part| part.ic == ic) {
         part.crops.push(relative.clone());
         part.embeddings.push(embedding.to_vec());
@@ -861,12 +865,9 @@ fn append_catalogue_crop(
         });
     }
     stamp_extracted(&mut book, &active);
-    if let Err(err) = persist_book(vision, &book) {
-        if let Some(path) = crop_file(vision, &relative) {
-            let _ = fs::remove_file(path);
-        }
-        return Err(err);
-    }
+    let mut crops = HashMap::new();
+    crops.insert(relative, jpeg.to_vec());
+    persist_rows(vision, &book, &crops)?;
     Ok(ic)
 }
 
@@ -888,28 +889,18 @@ fn crop_folder(crop: &str) -> Option<String> {
     Some(folder.to_string())
 }
 
-fn write_new_crop(vision: &Path, folder: &str, jpeg: &[u8]) -> Result<String, String> {
-    let dir = vision.join(CROPS_DIR).join(folder);
-    fs::create_dir_all(&dir).map_err(|err| format!("Could not write the catalogue: {err}"))?;
+fn next_crop_source(book: &Book, folder: &str) -> Result<String, String> {
     for index in 1..10_000 {
-        let name = format!("crop-{index}.jpg");
-        let relative = format!("{CROPS_DIR}/{folder}/{name}");
+        let relative = format!("{CROPS_DIR}/{folder}/crop-{index}.jpg");
         if !safe_crop_path(&relative) {
             return Err("Could not write the catalogue.".to_string());
         }
-        let path = dir.join(&name);
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(mut file) => {
-                file.write_all(jpeg)
-                    .map_err(|err| format!("Could not write the catalogue: {err}"))?;
-                return Ok(relative);
-            }
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(format!("Could not write the catalogue: {err}")),
+        let taken = book
+            .parts
+            .iter()
+            .any(|part| part.crops.iter().any(|crop| crop == &relative));
+        if !taken {
+            return Ok(relative);
         }
     }
     Err("Could not write the catalogue.".to_string())
@@ -1892,7 +1883,6 @@ fn apply_crop_choice(
     }
     let mut notes = Vec::new();
     let mut overrides = Vec::new();
-    let mut dropped_files = Vec::new();
     for part in &draft.parts {
         let Some(saved) = book.parts.iter_mut().find(|item| item.ic == part.ic) else {
             return Err("Could not update the catalogue.".to_string());
@@ -1913,8 +1903,6 @@ fn apply_crop_choice(
                     if keep.contains(&index) {
                         crops.push(saved.crops[index].clone());
                         embeddings.push(saved.embeddings[index].clone());
-                    } else {
-                        dropped_files.push(saved.crops[index].clone());
                     }
                 }
                 if crops.len() != keep.len() {
@@ -1955,11 +1943,6 @@ fn apply_crop_choice(
     }
     let count = book.parts.len();
     store_book(vision, book)?;
-    for crop in &dropped_files {
-        if let Some(path) = crop_file(vision, crop) {
-            let _ = fs::remove_file(path);
-        }
-    }
     if let Err(err) = record_crop_limits(vision, &overrides) {
         eprintln!("warning: DINOv2 crop limits were not saved: {err}");
     }
@@ -2407,6 +2390,11 @@ fn merge_loaded(vision: &Path, incoming: Built, existing: Book) -> Result<Built,
     for (index, part) in incoming.book.parts.iter().enumerate() {
         indexes.insert(part.ic.clone(), index);
     }
+    let mut needed = Vec::new();
+    for old in &existing.parts {
+        needed.extend(old.crops.iter().cloned());
+    }
+    let stored = stored_crops(vision, &needed)?;
     let mut consumed = HashSet::new();
     let mut used = HashSet::new();
     let mut parts = Vec::with_capacity(existing.parts.len() + incoming.book.parts.len());
@@ -2417,13 +2405,13 @@ fn merge_loaded(vision: &Path, incoming: Built, existing: Book) -> Result<Built,
             parts.push(fuse_part(
                 &old,
                 &incoming.book.parts[index],
-                vision,
+                &stored,
                 &mut incoming_files,
                 &mut files,
                 &mut used,
             )?);
         } else {
-            keep_part_files(vision, &old, &mut files, &mut used)?;
+            keep_part_files(&old, &stored, &mut files, &mut used)?;
             parts.push(old);
         }
     }
@@ -2453,7 +2441,7 @@ fn merge_loaded(vision: &Path, incoming: Built, existing: Book) -> Result<Built,
 fn fuse_part(
     old: &Part,
     new_part: &Part,
-    vision: &Path,
+    stored: &HashMap<String, crate::app_db::StoredCrop>,
     incoming_files: &mut HashMap<String, Vec<u8>>,
     files: &mut Vec<(String, Vec<u8>)>,
     used: &mut HashSet<String>,
@@ -2477,7 +2465,7 @@ fn fuse_part(
         if incoming_keys.contains(&crop_match_key(crop)) {
             continue;
         }
-        let bytes = read_kept_crop(vision, crop)?;
+        let bytes = jpeg_from_stored(stored.get(crop))?;
         crops.push(crop.clone());
         embeddings.push(embedding.clone());
         push_crop_file(files, used, crop.clone(), bytes)?;
@@ -2529,26 +2517,34 @@ fn crop_match_key(relative: &str) -> String {
 }
 
 fn keep_part_files(
-    vision: &Path,
     part: &Part,
+    stored: &HashMap<String, crate::app_db::StoredCrop>,
     files: &mut Vec<(String, Vec<u8>)>,
     used: &mut HashSet<String>,
 ) -> Result<(), String> {
     for crop in &part.crops {
-        let bytes = read_kept_crop(vision, crop)?;
+        let bytes = jpeg_from_stored(stored.get(crop))?;
         push_crop_file(files, used, crop.clone(), bytes)?;
     }
     Ok(())
 }
 
-fn read_kept_crop(vision: &Path, crop: &str) -> Result<Vec<u8>, String> {
-    let path =
-        crop_file(vision, crop).ok_or_else(|| "Could not read the catalogue.".to_string())?;
-    let bytes = fs::read(&path).map_err(|err| format!("Could not read the catalogue: {err}"))?;
-    if bytes.len() < 3 || bytes[0] != 0xff || bytes[1] != 0xd8 {
+fn stored_crops(
+    vision: &Path,
+    crops: &[String],
+) -> Result<HashMap<String, crate::app_db::StoredCrop>, String> {
+    crate::app_db::crops_for_sources(vision, crops)
+        .map_err(|err| format!("Could not read the catalogue: {err}"))
+}
+
+fn jpeg_from_stored(image: Option<&crate::app_db::StoredCrop>) -> Result<Vec<u8>, String> {
+    let Some(image) = image else {
+        return Err("Could not read the catalogue.".to_string());
+    };
+    if image.bytes.len() < 3 || image.bytes[0] != 0xff || image.bytes[1] != 0xd8 {
         return Err("Could not read the catalogue.".to_string());
     }
-    Ok(bytes)
+    Ok(image.bytes.clone())
 }
 
 fn push_crop_file(
@@ -2565,47 +2561,8 @@ fn push_crop_file(
 }
 
 fn commit_book(vision: &Path, built: &Built) -> Result<(), String> {
-    fs::create_dir_all(vision).map_err(|err| format!("Could not write the catalogue: {err}"))?;
-    let incoming = vision.join(format!("{CROPS_DIR}.incoming"));
-    let dest = vision.join(CROPS_DIR);
-    let backup = vision.join(format!("{CROPS_DIR}.previous"));
-    let _ = fs::remove_dir_all(&incoming);
-    let _ = fs::remove_dir_all(&backup);
-    fs::create_dir_all(&incoming).map_err(|err| format!("Could not write the catalogue: {err}"))?;
-    for (relative, bytes) in &built.files {
-        let name = relative
-            .strip_prefix(&format!("{CROPS_DIR}/"))
-            .ok_or_else(|| "Could not write the catalogue.".to_string())?;
-        let path = incoming.join(name);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|err| format!("Could not write the catalogue: {err}"))?;
-        }
-        fs::write(&path, bytes).map_err(|err| format!("Could not write the catalogue: {err}"))?;
-    }
-    let had_dest = dest.exists();
-    if had_dest {
-        fs::rename(&dest, &backup).map_err(|err| {
-            let _ = fs::remove_dir_all(&incoming);
-            format!("Could not write the catalogue: {err}")
-        })?;
-    }
-    if let Err(err) = fs::rename(&incoming, &dest) {
-        if had_dest && backup.exists() && !dest.exists() {
-            let _ = fs::rename(&backup, &dest);
-        }
-        let _ = fs::remove_dir_all(&incoming);
-        return Err(format!("Could not write the catalogue: {err}"));
-    }
-    if let Err(err) = persist_book(vision, &built.book) {
-        let _ = fs::remove_dir_all(&dest);
-        if had_dest && backup.exists() {
-            let _ = fs::rename(&backup, &dest);
-        }
-        return Err(err);
-    }
-    let _ = fs::remove_dir_all(&backup);
-    Ok(())
+    let crops: HashMap<String, Vec<u8>> = built.files.iter().cloned().collect();
+    persist_rows(vision, &built.book, &crops)
 }
 
 #[cfg(test)]
@@ -2726,6 +2683,14 @@ fn parts_metadata(book: &Book) -> Result<String, String> {
 }
 
 fn persist_book(vision: &Path, book: &Book) -> Result<(), String> {
+    persist_rows(vision, book, &HashMap::new())
+}
+
+fn persist_rows(
+    vision: &Path,
+    book: &Book,
+    crops: &HashMap<String, Vec<u8>>,
+) -> Result<(), String> {
     if book.parts.len() > MAX_PARTS {
         return Err("The catalogue has too many parts.".to_string());
     }
@@ -2745,10 +2710,12 @@ fn persist_book(vision: &Path, book: &Book) -> Result<(), String> {
                 return Err("Could not write the catalogue.".to_string());
             }
             live.push((part.ic.clone(), crop.clone()));
+            let image = crops.get(crop).filter(|bytes| !bytes.is_empty()).cloned();
             rows.push(crate::app_db::EmbeddingRow {
                 ic: part.ic.clone(),
                 source: crop.clone(),
                 values: values.clone(),
+                crop: image,
             });
         }
     }
@@ -3068,19 +3035,11 @@ fn remove_part(vision: &Path, ic: &str) -> Result<(), String> {
     let Some(index) = book.parts.iter().position(|part| part.ic == ic) else {
         return Err("That part is not in the catalogue.".to_string());
     };
-    let removed = book.parts.remove(index);
+    book.parts.remove(index);
     persist_book(vision, &book)?;
     *lock(&CATALOGUE) = book;
     crate::catalog::reload_installed();
     drop_tolerance(vision, ic);
-    for crop in &removed.crops {
-        if let Some(path) = crop_file(vision, crop) {
-            let _ = fs::remove_file(&path);
-            if let Some(parent) = path.parent() {
-                let _ = fs::remove_dir(parent);
-            }
-        }
-    }
     Ok(())
 }
 
@@ -3130,38 +3089,19 @@ fn delete_crops(vision: &Path, ic: &str, indexes: &[usize]) -> Result<(), String
     if book.parts.iter().all(|part| part.ic != ic) {
         return Err("That part is not in the catalogue.".to_string());
     }
-    let removed = {
+    {
         let part = book
             .parts
             .iter_mut()
             .find(|part| part.ic == ic)
             .expect("part");
         let unique = unique_indexes(indexes, part.crops.len())?;
-        let mut removed = Vec::new();
         for index in unique.into_iter().rev() {
-            removed.push(part.crops.remove(index));
+            part.crops.remove(index);
             part.embeddings.remove(index);
         }
-        removed
-    };
-    let doomed: Vec<String> = removed
-        .into_iter()
-        .filter(|crop| {
-            !book
-                .parts
-                .iter()
-                .any(|part| part.crops.iter().any(|have| have == crop))
-        })
-        .collect();
-    store_book(vision, book)?;
-    for crop in doomed {
-        if let Some(path) = crop_file(vision, &crop) {
-            let _ = fs::remove_file(&path);
-            if let Some(parent) = path.parent() {
-                let _ = fs::remove_dir(parent);
-            }
-        }
     }
+    store_book(vision, book)?;
     Ok(())
 }
 
@@ -3338,6 +3278,17 @@ fn write_tolerances(
 
 fn views_from(book: &Book, vision: &Path) -> Vec<CatalogueView> {
     let tolerances = read_tolerances(vision);
+    let mut sources = Vec::new();
+    for part in &book.parts {
+        sources.extend(part.crops.iter().cloned());
+    }
+    let images = match crate::app_db::crops_for_sources(vision, &sources) {
+        Ok(images) => images,
+        Err(err) => {
+            eprintln!("warning: DINOv2 crops were not read: {err}");
+            HashMap::new()
+        }
+    };
     book.parts
         .iter()
         .map(|part| {
@@ -3345,7 +3296,7 @@ fn views_from(book: &Book, vision: &Path) -> Vec<CatalogueView> {
             let mut thumbs = Vec::new();
             let mut crops = Vec::new();
             for (index, crop) in part.crops.iter().enumerate() {
-                let (src, hash) = crop_preview(vision, crop);
+                let (src, hash) = crop_preview(images.get(crop));
                 if src.starts_with("data:image/") {
                     thumbs.push(src.clone());
                 }
@@ -3368,7 +3319,7 @@ fn views_from(book: &Book, vision: &Path) -> Vec<CatalogueView> {
                 thumbs,
                 crops,
                 sizes,
-                added_unix: oldest_crop_unix(vision, &part.crops),
+                added_unix: oldest_stamp(&images, &part.crops),
             }
         })
         .collect()
@@ -3494,15 +3445,15 @@ fn split_size(text: &str) -> Option<(String, String)> {
     Some((leading_number_text(left)?, leading_number_text(right)?))
 }
 
-fn crop_preview(vision: &Path, crop: &str) -> (String, String) {
-    let Some(path) = crop_file(vision, crop) else {
+fn crop_preview(image: Option<&crate::app_db::StoredCrop>) -> (String, String) {
+    let Some(image) = image else {
         return (String::new(), String::new());
     };
-    let Ok(bytes) = fs::read(path) else {
+    if image.bytes.is_empty() {
         return (String::new(), String::new());
-    };
-    let hash = sha256_hex(&bytes);
-    let src = thumb_jpeg(&bytes).unwrap_or_default();
+    }
+    let hash = sha256_hex(&image.bytes);
+    let src = thumb_jpeg(&image.bytes).unwrap_or_default();
     (src, hash)
 }
 
@@ -3517,19 +3468,15 @@ fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
-fn oldest_crop_unix(vision: &Path, crops: &[String]) -> Option<i64> {
+fn oldest_stamp(
+    images: &HashMap<String, crate::app_db::StoredCrop>,
+    crops: &[String],
+) -> Option<i64> {
     let mut oldest: Option<i64> = None;
     for crop in crops {
-        let Some(path) = crop_file(vision, crop) else {
+        let Some(secs) = images.get(crop).and_then(|image| image.created_unix) else {
             continue;
         };
-        let Ok(modified) = fs::metadata(path).and_then(|meta| meta.modified()) else {
-            continue;
-        };
-        let Ok(elapsed) = modified.duration_since(UNIX_EPOCH) else {
-            continue;
-        };
-        let secs = i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX);
         oldest = Some(oldest.map_or(secs, |have| have.min(secs)));
     }
     oldest
@@ -3585,15 +3532,6 @@ fn dimensions_text(value: &Value) -> String {
                 .join(", ")
         }
     }
-}
-
-fn crop_file(vision: &Path, crop: &str) -> Option<PathBuf> {
-    if !safe_crop_path(crop) {
-        return None;
-    }
-    let relative = crop.strip_prefix(&format!("{CROPS_DIR}/"))?;
-    let path = vision.join(CROPS_DIR).join(relative);
-    Some(path)
 }
 
 fn decode_jpeg(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
@@ -3742,6 +3680,10 @@ mod tests {
         part.crops.iter().map(|crop| crop_match_key(crop)).collect()
     }
 
+    fn stored_jpeg(dir: &Path, source: &str) -> Option<Vec<u8>> {
+        crate::app_db::crop_bytes(dir, source).unwrap()
+    }
+
     fn stub_embed(bytes: &[u8]) -> Result<Vec<f32>, String> {
         if bytes.len() < 2 || bytes[0] != 0xff {
             return Err("Could not read the image.".to_string());
@@ -3809,7 +3751,8 @@ mod tests {
         assert_eq!(book.parts[0].crops.len(), 3);
         assert_eq!(book.parts[0].embeddings.len(), 3);
         assert!(book.parts[0].crops[0].starts_with("catalogue-crops/2BBMNM08/"));
-        assert!(dir.join(&book.parts[0].crops[0]).is_file());
+        assert!(stored_jpeg(&dir, &book.parts[0].crops[0]).is_some());
+        assert!(!dir.join("catalogue-crops").exists());
         assert_eq!(book.parts[1].ic, "2ECT");
         assert_eq!(book.parts[1].kind, "label");
         assert_eq!(book.parts[1].dimensions, Value::String("20 mm".to_string()));
@@ -3985,12 +3928,10 @@ mod tests {
         let embedding = vec![3.0_f32, 4.0];
         let ic = append_catalogue_crop(&dir, "FAST-1", &jpeg, &embedding).unwrap();
         assert_eq!(ic, "FAST-1");
-        let crop = dir
-            .join("catalogue-crops")
-            .join("FAST-1")
-            .join("crop-1.jpg");
-        assert_eq!(fs::read(&crop).unwrap(), jpeg);
         let book = load_book(&dir).unwrap().unwrap();
+        assert!(book.parts[0].crops[0].ends_with("crop-1.jpg"));
+        assert_eq!(stored_jpeg(&dir, &book.parts[0].crops[0]).unwrap(), jpeg);
+        assert!(!dir.join("catalogue-crops").exists());
         assert_eq!(book.parts.len(), 1);
         assert_eq!(book.parts[0].description, "Washer");
         assert_eq!(book.parts[0].kind, "washer");
@@ -4006,13 +3947,20 @@ mod tests {
 
         let again = append_catalogue_crop(&dir, "FAST-1", &jpeg, &embedding).unwrap();
         assert_eq!(again, "FAST-1");
+        let book = load_book(&dir).unwrap().unwrap();
         assert!(
-            dir.join("catalogue-crops")
-                .join("FAST-1")
-                .join("crop-2.jpg")
-                .is_file()
+            book.parts[0]
+                .crops
+                .iter()
+                .any(|crop| crop.ends_with("crop-2.jpg"))
         );
-        assert_eq!(load_book(&dir).unwrap().unwrap().parts[0].crops.len(), 2);
+        assert!(
+            book.parts[0]
+                .crops
+                .iter()
+                .all(|crop| { stored_jpeg(&dir, crop).as_deref() == Some(jpeg.as_slice()) })
+        );
+        assert_eq!(book.parts[0].crops.len(), 2);
 
         let entries = entries_of(&load_book(&dir).unwrap().unwrap());
         assert_eq!(entries.len(), 2);
@@ -4027,13 +3975,17 @@ mod tests {
 
         let fresh = append_catalogue_crop(&dir, "NEW-9", &jpeg, &embedding).unwrap();
         assert_eq!(fresh, "NEW-9");
-        assert_eq!(load_book(&dir).unwrap().unwrap().parts.len(), 2);
-        assert!(
-            dir.join("catalogue-crops")
-                .join("NEW-9")
-                .join("crop-1.jpg")
-                .is_file()
-        );
+        let book = load_book(&dir).unwrap().unwrap();
+        assert_eq!(book.parts.len(), 2);
+        let fresh_crop = book
+            .parts
+            .iter()
+            .find(|part| part.ic == "NEW-9")
+            .unwrap()
+            .crops[0]
+            .clone();
+        assert!(fresh_crop.ends_with("crop-1.jpg"));
+        assert_eq!(stored_jpeg(&dir, &fresh_crop).unwrap(), jpeg);
 
         let err = append_catalogue_crop(&dir, "  ", &jpeg, &embedding).unwrap_err();
         assert!(err.to_ascii_lowercase().contains("ic"));
@@ -4368,7 +4320,7 @@ mod tests {
         let ics: Vec<_> = book.parts.iter().map(|part| part.ic.as_str()).collect();
         assert_eq!(ics, vec!["KEEP", "BOTH", "SPARSE", "ADMIN", "NEW"]);
         assert_eq!(book.parts[0].description, "Local only");
-        assert!(dir.join(&book.parts[0].crops[0]).is_file());
+        assert!(stored_jpeg(&dir, &book.parts[0].crops[0]).is_some());
 
         let both = &book.parts[1];
         assert_eq!(both.description, "New text");
@@ -4379,12 +4331,12 @@ mod tests {
         assert!(both.crops[1].ends_with("crop-1.jpg"));
         assert_eq!(both.embeddings[0][3], updated.len() as f32);
         assert_eq!(both.embeddings[1], vec![9.0, 0.0]);
-        assert!(dir.join(&both.crops[0]).is_file());
-        assert!(dir.join(&both.crops[1]).is_file());
+        assert!(stored_jpeg(&dir, &both.crops[0]).is_some());
+        assert!(stored_jpeg(&dir, &both.crops[1]).is_some());
         assert_eq!(book.parts[2].description, "Keep me");
         assert_eq!(book.parts[3].ic, "ADMIN");
         assert_eq!(book.parts[3].embeddings, vec![vec![8.0, 0.0]]);
-        assert!(dir.join(&book.parts[3].crops[0]).is_file());
+        assert!(stored_jpeg(&dir, &book.parts[3].crops[0]).is_some());
         assert_eq!(book.parts[4].description, "Added");
 
         let again = import_tar_bytes(&second, &dir, false, &mut stub_embed).unwrap();
@@ -4397,6 +4349,7 @@ mod tests {
             fs::read(dir.join("dinov2-references.json")).unwrap(),
             references
         );
+        assert!(!dir.join("catalogue-crops").exists());
         assert!(!dir.join("catalogue-crops.incoming").exists());
         assert!(!dir.join("catalogue-crops.previous").exists());
         let _ = fs::remove_dir_all(&dir);
@@ -4422,10 +4375,10 @@ mod tests {
         import_tar_bytes(&first, &dir, true, &mut stub_embed).unwrap();
         append_catalogue_crop(&dir, "ADMIN", &jpeg, &[8.0, 0.0]).unwrap();
         let saved = load_book(&dir).unwrap().unwrap();
-        let keep_crop = dir.join(&saved.parts[0].crops[0]);
-        let admin_crop = dir.join(&saved.parts[2].crops[0]);
-        assert!(keep_crop.is_file());
-        assert!(admin_crop.is_file());
+        let keep_source = saved.parts[0].crops[0].clone();
+        let admin_source = saved.parts[2].crops[0].clone();
+        assert!(stored_jpeg(&dir, &keep_source).is_some());
+        assert!(stored_jpeg(&dir, &admin_source).is_some());
 
         let second = pack(&[
             (
@@ -4440,8 +4393,10 @@ mod tests {
         assert_eq!(book.parts.len(), 1);
         assert_eq!(book.parts[0].ic, "BOTH");
         assert_eq!(book.parts[0].description, "Only");
-        assert!(!keep_crop.is_file());
-        assert!(!admin_crop.is_file());
+        assert!(stored_jpeg(&dir, &keep_source).is_none());
+        assert!(stored_jpeg(&dir, &admin_source).is_none());
+        assert!(stored_jpeg(&dir, &book.parts[0].crops[0]).is_some());
+        assert!(!dir.join("catalogue-crops").exists());
         assert!(!dir.join("dinov2-references.json").exists());
         let _ = fs::remove_dir_all(&dir);
     }
@@ -4459,8 +4414,17 @@ mod tests {
         ]);
         import_tar_bytes(&first, &dir, true, &mut stub_embed).unwrap();
         let before = stored_catalogue(&dir);
-        let crop = dir.join(&load_book(&dir).unwrap().unwrap().parts[0].crops[0]);
-        fs::remove_file(&crop).unwrap();
+        let source = load_book(&dir).unwrap().unwrap().parts[0].crops[0].clone();
+        {
+            let connection =
+                rusqlite::Connection::open(crate::app_db::database_path(&dir)).unwrap();
+            connection
+                .execute(
+                    "UPDATE dino_catalogue SET crop = NULL WHERE source = ?1",
+                    [&source],
+                )
+                .unwrap();
+        }
         let second = pack(&[
             (
                 "catalogue.json",
@@ -5051,7 +5015,7 @@ mod tests {
             .unwrap();
         let gone = book.parts[0].crops[unique].clone();
         delete_crops(&dir, "2BBMNM08", &[unique]).unwrap();
-        assert!(!dir.join(&gone).is_file());
+        assert!(stored_jpeg(&dir, &gone).is_none());
         let left = load_book(&dir).unwrap().unwrap();
         assert_eq!(left.parts[0].crops.len(), 2);
         assert_eq!(left.parts[0].embeddings.len(), 2);
@@ -5080,7 +5044,12 @@ mod tests {
         assert_eq!(book.parts[0].crops.len(), 1);
         assert_eq!(book.parts[1].ic, "NEW-1");
         assert_eq!(book.parts[1].embeddings.len(), 1);
-        assert!(dir.join(&book.parts[1].crops[0]).is_file());
+        let moved = book.parts[1].crops[0].clone();
+        assert!(stored_jpeg(&dir, &moved).is_some());
+        let listed = catalogue_list_from(&dir).unwrap();
+        let moved_part = listed.parts.iter().find(|part| part.ic == "NEW-1").unwrap();
+        assert!(moved_part.thumbs[0].starts_with("data:image/jpeg;base64,"));
+        assert!(!dir.join("catalogue-crops").exists());
         assert!(reassign_crops(&dir, "NEW-1", &[0], "NEW-1").is_err());
         assert!(delete_crops(&dir, "NEW-1", &[]).is_err());
 
