@@ -22,6 +22,8 @@ vision/dinov2-references.json.tmp
 # Imported part catalogue and the JPEG crops copied out of a tar.
 vision/catalogue.json
 vision/catalogue.json.tmp
+vision/catalogue-tolerances.json
+vision/catalogue-tolerances.json.tmp
 vision/catalogue-crops/
 vision/catalogue-crops.incoming/
 vision/catalogue-crops.previous/

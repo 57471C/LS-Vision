@@ -40,7 +40,7 @@ Fully replace catalogue is a checkbox on that same block. It is not saved. When 
 
 Cancel on the file dialog says "No file selected." A bad archive, a missing DINOv2 model, or a write error leaves the saved catalogue in place and shows an error toast. The same is true when a merge cannot read a crop that is already on this PC.
 
-View references lists every imported part. Each row shows the IC and description, the type and dimensions when they are present, and a thumbnail of the first crop, or a small gallery when there are several. Delete removes that part. The dialog does not edit the other fields. A missing or empty catalogue says "No references loaded."
+View references lists every imported part. Crops sit in a left-to-right wrap. A text field at the top filters by IC or description as you type. Each part shows its image count, for example "12 refs", and when the oldest crop was added. Click the IC to copy it. Identical files are marked Duplicate. Delete asks "Delete [IC] and all its reference images?" before it removes that part. A right-click on an image can reassign it or delete it, and several images can be selected and changed together. Drag an image to reorder it, or set one as primary. A tolerance beside a dimension is saved for that part in `vision/catalogue-tolerances.json` and does not change `catalogue.json`. A missing or empty catalogue says "No references loaded." A filter with no hits says "No matches."
 
 The parent and child rules stay below that control.
 

@@ -21,6 +21,8 @@
 //! The global length and diameter tolerances still apply. The Ø symbol is only
 //! used when the size is a diameter.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -518,11 +520,21 @@ pub(crate) fn measure_boxes(
                 .as_ref()
                 .map(|part| part.measurement_method.clone())
                 .unwrap_or_default();
+            let tolerances = crate::catalogue::tolerances_for(&item.ic);
+            let mut local = settings.clone();
+            let (length_override, diameter_override) =
+                generic_tolerance_overrides(&dimensions, &tolerances);
+            if let Some(mm) = length_override {
+                local.length_tolerance_mm = mm;
+            }
+            if let Some(mm) = diameter_override {
+                local.diameter_tolerance_mm = mm;
+            }
             let result = if method.is_empty() || method == "custom" {
                 let expected = expected_from(&description, &dimensions);
-                measure_rgb(rgb, width, height, item.bbox, &settings, mm, &expected)
+                measure_rgb(rgb, width, height, item.bbox, &local, mm, &expected)
             } else {
-                measure_method(
+                measure_method_for(
                     rgb,
                     width,
                     height,
@@ -532,6 +544,7 @@ pub(crate) fn measure_boxes(
                     &description,
                     &dimensions,
                     &method,
+                    &tolerances,
                 )
             };
             match result {
@@ -648,6 +661,32 @@ fn measure_method(
     dimensions: &Value,
     method: &str,
 ) -> Option<MetrologyResult> {
+    measure_method_for(
+        rgb,
+        width,
+        height,
+        bbox,
+        settings,
+        mm_per_px,
+        description,
+        dimensions,
+        method,
+        &HashMap::new(),
+    )
+}
+
+fn measure_method_for(
+    rgb: &[u8],
+    width: u32,
+    height: u32,
+    bbox: [i32; 4],
+    settings: &MetrologySettings,
+    mm_per_px: f64,
+    description: &str,
+    dimensions: &Value,
+    method: &str,
+    tolerances: &HashMap<String, f64>,
+) -> Option<MetrologyResult> {
     if !(mm_per_px.is_finite() && mm_per_px > 0.0) {
         return None;
     }
@@ -676,7 +715,17 @@ fn measure_method(
             mm_per_px,
             &method_label(method, &pairs),
             settings,
+            &pairs,
+            tolerances,
         );
+    }
+    let mut local = settings.clone();
+    let (length_override, diameter_override) = generic_tolerance_overrides(dimensions, tolerances);
+    if let Some(mm) = length_override {
+        local.length_tolerance_mm = mm;
+    }
+    if let Some(mm) = diameter_override {
+        local.diameter_tolerance_mm = mm;
     }
     generic_from_hit(
         hit,
@@ -684,7 +733,7 @@ fn measure_method(
         origin_y,
         mm_per_px,
         &expected_from(description, dimensions),
-        settings,
+        &local,
     )
 }
 
@@ -1403,6 +1452,145 @@ fn method_label(method: &str, pairs: &[(String, f64)]) -> String {
     }
 }
 
+fn generic_tolerance_overrides(
+    dimensions: &Value,
+    tolerances: &HashMap<String, f64>,
+) -> (Option<f64>, Option<f64>) {
+    let mut diameter_key = None;
+    let mut length_key = None;
+    match dimensions {
+        Value::Object(map) => note_tolerance_map(map, &mut diameter_key, &mut length_key),
+        Value::Array(items) => {
+            for item in items {
+                if let Some(map) = item.as_object() {
+                    note_tolerance_map(map, &mut diameter_key, &mut length_key);
+                }
+            }
+        }
+        Value::String(text) => {
+            if parse_size_text(text).is_some() {
+                diameter_key = Some("diameter".to_string());
+                length_key = Some("length".to_string());
+            }
+        }
+        _ => {}
+    }
+    (
+        length_key.and_then(|key| tolerances.get(&key).copied()),
+        diameter_key.and_then(|key| tolerances.get(&key).copied()),
+    )
+}
+
+fn note_tolerance_map(
+    map: &Map<String, Value>,
+    diameter: &mut Option<String>,
+    length: &mut Option<String>,
+) {
+    if let Some(name) = map.get("name").and_then(Value::as_str) {
+        let numbered = map
+            .get("mm")
+            .and_then(positive_number)
+            .or_else(|| map.get("value").and_then(positive_number))
+            .is_some();
+        if numbered {
+            note_tolerance_key(name, diameter, length);
+        }
+    }
+    for (key, value) in map {
+        if key.eq_ignore_ascii_case("name") || key.eq_ignore_ascii_case("mm") {
+            continue;
+        }
+        if positive_number(value).is_some() {
+            note_tolerance_key(key, diameter, length);
+        }
+    }
+}
+
+fn note_tolerance_key(name: &str, diameter: &mut Option<String>, length: &mut Option<String>) {
+    let key = norm_key(name);
+    match dimension_axis(name) {
+        Some(Axis::Diameter) | Some(Axis::InnerDiameter) if diameter.is_none() => {
+            *diameter = Some(key);
+        }
+        Some(Axis::Length) if length.is_none() => *length = Some(key),
+        _ => {}
+    }
+}
+
+fn picked_tolerance(
+    pairs: &[(String, f64)],
+    keys: &[&str],
+    tolerances: &HashMap<String, f64>,
+) -> Option<f64> {
+    let key = keys
+        .iter()
+        .copied()
+        .find(|key| pairs.iter().any(|(name, _)| name == key))?;
+    tolerances.get(key).copied()
+}
+
+fn tolerance_keys(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "length_under_head" => &[
+            "lengthunderhead",
+            "underheadlength",
+            "shanklength",
+            "griplength",
+            "length",
+            "lengthmm",
+            "len",
+            "l",
+        ],
+        "thread_diameter" => &[
+            "threaddiameter",
+            "threaddia",
+            "nominaldiameter",
+            "diameter",
+            "diametermm",
+            "dia",
+        ],
+        "across_flats" => &["acrossflats", "widthacrossflats", "af", "flats"],
+        "outer_diameter" => &[
+            "outerdiameter",
+            "od",
+            "outsidediameter",
+            "diameter",
+            "diametermm",
+            "dia",
+        ],
+        "inner_diameter" => &["innerdiameter", "id", "insidediameter"],
+        "thickness" => &["thickness", "thk", "height", "heightmm", "h"],
+        "length" => &[
+            "length",
+            "totallength",
+            "overalllength",
+            "lengthmm",
+            "len",
+            "l",
+        ],
+        "width" => &["strapwidth", "width", "bandwidth"],
+        "free_height" => &[
+            "freeheight",
+            "height",
+            "heightmm",
+            "h",
+            "length",
+            "lengthmm",
+            "len",
+            "l",
+        ],
+        "coil_diameter" => &[
+            "outerdiameter",
+            "coildiameter",
+            "od",
+            "diameter",
+            "diametermm",
+            "dia",
+        ],
+        _ => &[],
+    }
+}
+
 fn result_from_gauges(
     gauges: &[Gauge],
     origin_x: f64,
@@ -1410,6 +1598,8 @@ fn result_from_gauges(
     mm_per_px: f64,
     label: &str,
     settings: &MetrologySettings,
+    pairs: &[(String, f64)],
+    tolerances: &HashMap<String, f64>,
 ) -> Option<MetrologyResult> {
     if gauges.is_empty() {
         return None;
@@ -1426,11 +1616,12 @@ fn result_from_gauges(
         if !measured.is_finite() {
             return None;
         }
-        let tolerance = if gauge.diameter {
-            settings.diameter_tolerance_mm
-        } else {
-            settings.length_tolerance_mm
-        };
+        let tolerance = picked_tolerance(pairs, tolerance_keys(gauge.kind), tolerances)
+            .unwrap_or(if gauge.diameter {
+                settings.diameter_tolerance_mm
+            } else {
+                settings.length_tolerance_mm
+            });
         if (measured - want).abs() > tolerance {
             bad.push(gauge);
         }
@@ -2549,5 +2740,59 @@ mod tests {
         assert!(!height_span.text.contains('Ø'), "{}", height_span.text);
         assert!(coil.text.starts_with("Ø "), "{}", coil.text);
         assert!(span_length(coil) > span_length(height_span));
+    }
+
+    #[test]
+    fn a_saved_part_tolerance_overrides_the_global_band() {
+        let gauges = vec![Gauge {
+            kind: "across_flats",
+            px: 130.0,
+            expected: Some(10.0),
+            diameter: false,
+            ignored: false,
+            line: [0.0, 0.0, 130.0, 0.0],
+        }];
+        let mut settings = sample_settings(ThresholdMode::Otsu);
+        settings.length_tolerance_mm = 5.0;
+        let pairs = vec![("acrossflats".to_string(), 10.0)];
+        let open = result_from_gauges(
+            &gauges,
+            0.0,
+            0.0,
+            0.1,
+            "nut",
+            &settings,
+            &pairs,
+            &std::collections::HashMap::new(),
+        )
+        .expect("open band");
+        assert_eq!(open.status, MetrologyStatus::Pass, "{}", open.note);
+        let mut tolerances = std::collections::HashMap::new();
+        tolerances.insert("acrossflats".to_string(), 0.5);
+        let tight = result_from_gauges(
+            &gauges,
+            0.0,
+            0.0,
+            0.1,
+            "nut",
+            &settings,
+            &pairs,
+            &tolerances,
+        )
+        .expect("tight band");
+        assert_eq!(tight.status, MetrologyStatus::DimensionMismatch);
+        let (length, diameter) = generic_tolerance_overrides(
+            &json!({ "h": 6.5, "OD": 13 }),
+            &tolerances_from(&[("h", 0.2), ("od", 0.4)]),
+        );
+        assert_eq!(length, Some(0.2));
+        assert_eq!(diameter, Some(0.4));
+    }
+
+    fn tolerances_from(pairs: &[(&str, f64)]) -> std::collections::HashMap<String, f64> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), *value))
+            .collect()
     }
 }

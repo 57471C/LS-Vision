@@ -28,6 +28,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 native-tls = "0.2"
 url = "2"
 base64 = "0.22"
+sha2 = "0.10.9"
 image = { version = "=0.25.8", default-features = false, features = ["jpeg", "png"] }
 opencv = { version = "=0.101.1", default-features = false, features = ["clang-runtime", "imgproc"] }
 tar = "0.4"
