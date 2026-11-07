@@ -24,5 +24,5 @@
 
 ## 0.3.0
 
-- Inference, the camera, barcode decode, and BoM lookup run in the Tauri process. The app does not start Python and does not call port 8008.
+- Inference, the camera, barcode decode, and BoM lookup run in the Tauri process.
 - The Windows installer targets Program Files.

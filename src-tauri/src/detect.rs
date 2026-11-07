@@ -640,7 +640,7 @@ fn class_name(names: &[String], class_id: usize) -> String {
         .get(class_id)
         .filter(|name| !name.is_empty())
         .cloned()
-        .unwrap_or_else(|| class_id.to_string())
+        .unwrap_or_else(|| format!("class {class_id}"))
 }
 
 fn parse_class_names(text: &str) -> Vec<String> {
@@ -2716,6 +2716,15 @@ mod tests {
     fn class_names_accept_a_json_object() {
         let names = parse_class_names(r#"{"0":"2BBMNM08","1":"2BB06B2SZ"}"#);
         assert_eq!(names, vec!["2BBMNM08".to_string(), "2BB06B2SZ".to_string()]);
+    }
+
+    #[test]
+    fn a_missing_class_name_shows_the_index() {
+        let names = vec!["bolt".to_string(), String::new()];
+        assert_eq!(class_name(&names, 0), "bolt");
+        assert_eq!(class_name(&names, 1), "class 1");
+        assert_eq!(class_name(&names, 4), "class 4");
+        assert_eq!(class_name(&[], 4), "class 4");
     }
 
     fn proto_varint(value: u64) -> Vec<u8> {

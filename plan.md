@@ -15,7 +15,7 @@ Independent bench stations (NUCs) that:
 - On-demand / slow capture is fine
 - UI multi-camera capable from the start
 - Admin tools live in the same app
-- Vision engine is ONNX Runtime in Rust. The app does not start Python.
+- Vision engine is ONNX Runtime in Rust.
 
 ### Station flow
 1. Operator places parts on bench for inspection
@@ -88,7 +88,7 @@ WHERE p.kit_ic = @kitIc
 The app expects the combined result in the JSON shape above. `expectedKitCount` can come from a label-print count or be omitted.
 
 ### Vision / model exploration
-Labelling with Label Studio (Community, Apache 2.0). Export YOLO or COCO format.
+Boxes and YOLO or COCO training are done in [LS-Marker](https://github.com/57471C/LS-Marker).
 
 Candidate detectors to train and compare on the same labelled set:
 
@@ -134,8 +134,6 @@ Train several options, compare on validation set (especially close variants), pi
 - Optional central logging/dashboard
 
 **Later**  
-- Move vision inference fully to ONNX-in-Rust (see the migration notes below)  
-- Separate training app if labeling needs grow  
 - More advanced kit grouping if required
 
 ### ONNX-in-Rust migration
@@ -150,22 +148,21 @@ Copy the `.onnx` file into the app data models folder with Settings > Training >
 
 **Phase 1 (done on this branch).** `.onnx` detection runs in Rust through ONNX Runtime (`detect_image`). The operator page calls that command when the active model name ends in `.onnx`. An empty model selection uses `best.onnx` when that file is present, then `best.pt`. The detection JSON is `{ detections: [{ ic, confidence, bbox }], classes }`. `detect_image` reads the latest raw frame and does not return `image_base64`. The page still draws the boxes.
 
-Python `YOLO(best.pt)` and `YOLO(best.onnx)` already disagree on `vision/test-images/Example3.jpg` (172 boxes from the checkpoint, 181 from the ONNX graph). Rust is checked against the ONNX result.
+A `best.pt` checkpoint and `best.onnx` already disagree on `vision/test-images/Example3.jpg` (172 boxes from the checkpoint, 181 from the ONNX graph). Rust is checked against the ONNX result.
 
-**Phase 2 (done on this branch).** The desktop app no longer starts `vision/main.py`, and the operator page no longer waits on port 8008.
+**Phase 2.** Camera, barcode, and BoM run in Rust.
 
 - Camera: `list_cameras`, `list_camera_modes`, and `capture_snapshot` use Media Foundation on one worker thread. Only one camera is open. The previous media source is shut down before the next camera opens. Settings lists that camera's modes as size and fps. The saved value is `WIDTHxHEIGHT@FPS` (a blank value, or a size the camera does not list, uses the highest 16:9 mode at 30 fps, or the closest listed rate). The reader reopens in that exact mode and prefers NV12. 640×480 is used only when it is the saved mode or the only listed one. The source-reader callback requests the next sample, then hands off that sample's contiguous media buffer as a preview handle and a still handle. The pixels are not copied. Encoding locks the buffer on the command thread. `capture_preview` takes the preview handle. `capture_snapshot` copies the still handle and does not empty the preview slot, so a barcode snapshot does not freeze the preview canvas. Frames are not queued. JPEG encoding runs only inside `capture_preview`, off that callback. `capture_snapshot` copies the still handle, converts it to an RGB `RawFrame`, stores that frame for barcode and detection, and returns `width`, `height`, and `timestamp_ms`. `capture_preview` scales that same frame to fit in 1280×720 and returns a JPEG. The Settings canvas asks for the next preview frame only after `drawImage` finishes. Display FPS is 15, 20, 25, or 30, default 15, and that choice is the target interval. The header shows the capture rate next to the canvas rate. The operator live view calls `capture_preview` and draws the next frame only after the previous `drawImage` finishes, at the saved Display FPS. Barcode reads and detection still call `capture_snapshot`. JPEG quality is 80. Media Foundation indexes can differ from the old DirectShow indexes, so a saved index may need to be chosen again. Brightness and contrast are stored in `vision/config.local.json` and are not applied to the device. The camera preview writes UVC exposure, gain, and focus on the open camera, and it saves focus for that camera. A Settings slider change does not write the file; Save does. Choosing a resolution or a display rate writes it immediately. Switching cameras loads that camera's saved resolution, display rate, and levels. A camera with no saved record uses the defaults.
-- Barcode: the page tries the native detector and ZXing on the preview JPEG, then `decode_barcode` reads the raw frame. A crop whose long edge is over 1920 pixels is halved until it fits, and that smaller image is read first. It does not call the sidecar for a frame.
-- BoM: JSON uses `load_bom_json`, the job-card API uses `post_bom_api`, and MSSQL uses `inspect_bom` (ODBC Driver 18, `Encrypt=optional;TrustServerCertificate=yes`). The SQL file is still `vision/bom_queries.sql`, with the example file as the fallback. The Rust path does not set the pyodbc `attrs_before` values. A missing kit is still `Barcode not found in BoM`.
+- Barcode: the page tries the native detector and ZXing on the preview JPEG, then `decode_barcode` reads the raw frame. A crop whose long edge is over 1920 pixels is halved until it fits, and that smaller image is read first.
+- BoM: JSON uses `load_bom_json`, the job-card API uses `post_bom_api`, and MSSQL uses `inspect_bom` (ODBC Driver 18, `Encrypt=optional;TrustServerCertificate=yes`). The SQL file is `vision/bom_queries.sql`, with the example file as the fallback. A missing kit is `Barcode not found in BoM`.
 - A `.pt` model does not detect. The page returns no boxes and the message `{name} is a .pt file. Choose an .onnx model to detect parts.` Choosing a model saves the basename in `vision/config.local.json`. Detection loads that `.onnx` file in Rust.
 - Settings lists an Inference EP dropdown for the providers this PC can run. CPU is always listed. DirectML is listed when the DirectML runtime and a Direct3D 12 GPU are present. CUDA is listed when an NVIDIA GPU and the CUDA execution provider libraries load. The OpenVINO-only prebuilt does not contain those providers, so this build lists CPU and uses the OpenVINO switch for the Arc GPU. The saved `inferenceEp` is used when the ONNX session is created, and a provider that fails to start falls back to CPU.
-- The FastAPI sidecar is gone. `vision/main.py` is not in the repo, Settings has no Kill button, and the app does not call port 8008. Offline training still uses `vision/requirements.txt` (`opencv-python`, `ultralytics`, `numpy`, `pillow`).
 - Part rules (`partRules` in `vision/config.local.json`, edited in Settings > Parts) run on the operator page after `detect_image` returns. A matching parent box is renamed to the result IC before the BoM count and the overlay. A child box used by that match is left out of the BoM comparison. Operators do not see its box. Admin sees a thin outline. A rule whose parent or named child is not in that model's class list is skipped, and the operator page shows a dismissible notice. The model output itself stays the trained class names. An empty list does not rewrite.
 
-**Phase 3 (done).** The Python sidecar is off the runtime path. Training notes stay in `vision/README.md`. The README states that inference is ONNX Runtime in Rust. The model switcher, detect ROI, barcode ROI, and Settings write `vision/config.local.json` through Rust. Version 0.3.0.
+The model switcher, detect ROI, barcode ROI, and Settings write `vision/config.local.json` through Rust.
 
 ### Immediate next steps
-2. Collect and label part and kit images in Label Studio.
+2. Collect part and kit images and label them in [LS-Marker](https://github.com/57471C/LS-Marker).
 3. Train and compare candidate models; export winning ONNX.
 4. Wire detection results into the snapshot view.
 
