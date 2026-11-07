@@ -39,6 +39,7 @@ Version 0.5.1 runs inference, the camera, barcode decode, and BoM lookup in the 
 
 Recent additions:
 
+- After a barcode is accepted, the operator page waits a motion delay (default 400 ms) before detection. The overlay marks surplus, near-miss, and rogue parts for display only. Hovering a box shows its measured sizes.
 - While detection runs, the operator camera and the camera preview show a green Detecting mark.
 - Settings > Training > Decoder is Auto, YOLO, or RF-DETR. Auto reads the file name and the ONNX outputs. An RF-DETR export is stretched and ImageNet-normalised. A YOLO graph keeps the letterbox decoder.
 - Settings > Camera > Preview, while admin is unlocked, draws a marquee on the detected still and saves that crop to the DINOv2 catalogue. A short press on a box still selects it. Crosshairs is optional, off by default, and shows the pointer in pixels and millimetres.

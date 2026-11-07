@@ -8,6 +8,7 @@ import {
 } from "$lib/detect-rois";
 import type { MetrologyResult } from "$lib/metrology";
 import type { ConsoleLine } from "$lib/operator/console";
+import type { Residual } from "$lib/operator/residual";
 
 export type { DetectRoi };
 
@@ -57,6 +58,8 @@ export type Detection = {
 	twoPass?: TwoPassMatch;
 	// Length and diameter check. Absent when metrology is off.
 	metrology?: MetrologyResult;
+	// Display category. QTY SEEN and PASS/FAIL do not read it.
+	residual?: Residual;
 };
 
 export type SlotDetections = {

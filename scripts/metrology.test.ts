@@ -5,6 +5,7 @@ import {
 	layoutDimensions,
 	METROLOGY_DEFAULTS,
 	metrologyDocument,
+	metrologyReadout,
 	mismatchNote,
 	readMetrology,
 	readMetrologyResult,
@@ -205,6 +206,22 @@ const washerMarks = layoutDimensions(
 	[],
 	{ x: 0, y: 0, w: 160, h: 90 },
 	1,
+);
+check(
+	"a pass readout uses the span labels",
+	metrologyReadout(spanned) === "25.2 mm, Ø 6.1 mm",
+);
+check(
+	"a pass without spans uses length and diameter",
+	metrologyReadout({
+		status: "pass",
+		lengthMm: 40,
+		diameterMm: 6,
+	}) === "40.0 mm, Ø 6.0 mm",
+);
+check(
+	"a box with no metrology has no readout",
+	metrologyReadout(undefined) === "",
 );
 check("a washer draws each method span", washerMarks.length === 3);
 check(

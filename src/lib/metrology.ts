@@ -246,6 +246,27 @@ export function mismatchNote(value: unknown): string {
 	return result.note?.trim() ?? "";
 }
 
+function oneDecimal(value: number): string {
+	return value.toFixed(1);
+}
+
+// Sizes already stored on the box. A pass uses the span labels, or length
+// and diameter when those spans are missing. This does not measure again.
+export function metrologyReadout(value: unknown): string {
+	const result = readMetrologyResult(value);
+	if (!result) return "";
+	const spans = (result.spans ?? [])
+		.map((span) => span.text.trim())
+		.filter(Boolean);
+	if (spans.length > 0) return spans.join(", ");
+	const parts: string[] = [];
+	if (result.lengthMm > 0) parts.push(`${oneDecimal(result.lengthMm)} mm`);
+	if (result.diameterMm > 0)
+		parts.push(`Ø ${oneDecimal(result.diameterMm)} mm`);
+	if (parts.length > 0) return parts.join(", ");
+	return result.note?.trim() ?? "";
+}
+
 const PASS_STROKE = "#f5f5f5";
 const MISMATCH_STROKE = "#f59e0b";
 const LABEL_FILL = "#0a0a0a";
