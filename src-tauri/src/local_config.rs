@@ -221,6 +221,7 @@ fn default_config() -> Value {
         "detector": "auto",
         "matchThreshold": 0.7,
         "dinoTopN": 3,
+        "dinoModel": "s_reg",
         "partRules": [],
         "inferenceEp": "directml",
         "useOpenVino": false,
@@ -854,6 +855,7 @@ mod tests {
         assert_eq!(document["detector"], "auto");
         assert_eq!(document["matchThreshold"], 0.7);
         assert_eq!(document["dinoTopN"], 3);
+        assert_eq!(document["dinoModel"], "s_reg");
         assert_eq!(document["partRules"], serde_json::json!([]));
         assert_eq!(document["inferenceEp"], "directml");
         assert_eq!(document["useOpenVino"], false);

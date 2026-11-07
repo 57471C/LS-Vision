@@ -69,6 +69,8 @@ pub fn run() {
             detect::benchmark_detect,
             detect::model_class_names,
             dinov2::dinov2_status,
+            dinov2::dino_model_status,
+            dinov2::set_dino_model,
             catalogue::import_catalogue,
             catalogue::finish_catalogue_replace,
             catalogue::cancel_catalogue_replace,

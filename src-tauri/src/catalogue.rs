@@ -2,7 +2,9 @@
 //!
 //! Settings > Parts > Update references picks a tar. The archive holds
 //! `catalogue.json` and JPEG crops under `crops/`. Each crop is embedded with
-//! the DINOv2 session that startup already opened. The result is written to
+//! the DINOv2 session that startup already opened. A model change marks those
+//! vectors stale. The next extract replaces them, so embeddings from ViT-S and
+//! ViT-B are not stored together. The result is written to
 //! `vision/catalogue.json`, beside `vision/config.local.json`, and the JPEGs
 //! are copied under `vision/catalogue-crops/`. Startup loads that file.
 //! The default import updates item codes that are in the tar and adds new
@@ -88,12 +90,135 @@ struct Part {
 
 struct Book {
     parts: Vec<Part>,
+    /// `s_reg` or `b_reg` when these vectors were extracted with that model.
+    /// Missing means the vectors came from an older model.
+    embedding_model: Option<String>,
+    /// Set when the saved vectors must not be matched until the next extract.
+    embeddings_stale: bool,
 }
 
 impl Book {
     fn empty() -> Self {
-        Self { parts: Vec::new() }
+        Self {
+            parts: Vec::new(),
+            embedding_model: None,
+            embeddings_stale: false,
+        }
     }
+
+    fn from_parts(parts: Vec<Part>) -> Self {
+        Self {
+            parts,
+            embedding_model: None,
+            embeddings_stale: false,
+        }
+    }
+}
+
+fn book_has_vectors(book: &Book) -> bool {
+    book.parts
+        .iter()
+        .any(|part| part.embeddings.iter().any(|values| !values.is_empty()))
+}
+
+/// Stored vectors can be scored only when they were extracted with `active`
+/// and have not been marked stale. A book with no vectors is usable.
+pub(crate) fn embeddings_usable(
+    embedding_model: Option<&str>,
+    embeddings_stale: bool,
+    has_vectors: bool,
+    active: &str,
+) -> bool {
+    if !has_vectors {
+        return true;
+    }
+    !embeddings_stale && embedding_model == Some(active)
+}
+
+fn model_matches(book: &Book, active: &str) -> bool {
+    embeddings_usable(
+        book.embedding_model.as_deref(),
+        book.embeddings_stale,
+        book_has_vectors(book),
+        active,
+    )
+}
+
+fn stamp_extracted(book: &mut Book, active: &str) {
+    book.embedding_model = Some(active.to_string());
+    book.embeddings_stale = false;
+}
+
+/// Replace every stored vector. The caller writes the book after this returns.
+fn reembed_book(
+    vision: &Path,
+    book: &mut Book,
+    embed: &mut dyn FnMut(&[u8]) -> Result<Vec<f32>, String>,
+) -> Result<(), String> {
+    for part in &mut book.parts {
+        let mut fresh = Vec::with_capacity(part.crops.len());
+        for crop in &part.crops {
+            let bytes = read_kept_crop(vision, crop)?;
+            let values =
+                embed(&bytes).map_err(|err| format!("Could not embed {}: {err}", part.ic))?;
+            if values.is_empty() || values.iter().any(|value| !value.is_finite()) {
+                return Err(format!("Could not embed {}.", part.ic));
+            }
+            fresh.push(values);
+        }
+        part.embeddings = fresh;
+    }
+    Ok(())
+}
+
+fn aligned_stamp(book: &Book, active: &str) -> (Option<String>, bool) {
+    if !book_has_vectors(book) || book.embedding_model.as_deref() == Some(active) {
+        return (Some(active.to_string()), false);
+    }
+    (book.embedding_model.clone(), true)
+}
+
+/// Mark vectors that belong to another model. Vectors already extracted with
+/// `active` stay usable, including a switch back to that model before the
+/// next extract. Returns whether matching must skip the stored vectors.
+pub(crate) fn align_embeddings_file(vision: &Path, active: &str) -> Result<bool, String> {
+    let Some(mut book) = load_book(vision)? else {
+        return Ok(false);
+    };
+    let has_vectors = book_has_vectors(&book);
+    let (model, stale) = aligned_stamp(&book, active);
+    let skipped = stale && has_vectors;
+    if book.embedding_model == model && book.embeddings_stale == stale {
+        return Ok(skipped);
+    }
+    book.embedding_model = model;
+    book.embeddings_stale = stale;
+    let bytes = book_json(&book)?;
+    replace_file_bytes(&catalogue_path(vision), &bytes)?;
+    if skipped {
+        eprintln!(
+            "DINOv2 catalogue embeddings are stale for model {active}. The next extract uses that model."
+        );
+    }
+    Ok(skipped)
+}
+
+pub(crate) fn align_saved_embeddings(active: &str) -> Result<bool, String> {
+    let vision = vision_directory()?;
+    let stale = align_embeddings_file(&vision, active)?;
+    if let Some(book) = load_book(&vision)? {
+        *lock(&CATALOGUE) = book;
+    }
+    crate::catalog::reload_installed();
+    Ok(stale)
+}
+
+pub(crate) fn embeddings_need_extract(active: &str) -> Result<bool, String> {
+    let vision = vision_directory()?;
+    let Some(book) = load_book(&vision)? else {
+        return Ok(false);
+    };
+    Ok(!model_matches(&book, active))
 }
 
 struct Built {
@@ -335,11 +460,7 @@ fn install_picked_catalogue(
         ));
     }
     clear_waiting();
-    let report = if draft
-        .parts
-        .iter()
-        .any(|part| part.crops.len() > MAX_CROPS)
-    {
+    let report = if draft.parts.iter().any(|part| part.crops.len() > MAX_CROPS) {
         commit_replace(&vision, &draft, &[], &mut embed_jpeg)?
     } else {
         let count = import_tar_bytes(&bytes, &vision, true, &mut embed_jpeg)?;
@@ -588,6 +709,11 @@ fn append_catalogue_crop(
         return Err("Could not embed the crop.".to_string());
     }
     let mut book = load_book(vision)?.unwrap_or_else(Book::empty);
+    let active = crate::dinov2::selected_model_id();
+    if !model_matches(&book, &active) {
+        let mut embed = embed_jpeg;
+        reembed_book(vision, &mut book, &mut embed)?;
+    }
     if book.parts.len() >= MAX_PARTS && book.parts.iter().all(|part| part.ic != ic) {
         return Err("The catalogue has too many parts.".to_string());
     }
@@ -615,6 +741,7 @@ fn append_catalogue_crop(
             crop_limit: None,
         });
     }
+    stamp_extracted(&mut book, &active);
     let bytes = book_json(&book)?;
     if let Err(err) = replace_file_bytes(&catalogue_path(vision), &bytes) {
         if let Some(path) = crop_file(vision, &relative) {
@@ -702,11 +829,13 @@ fn import_tar_bytes(
     embed: &mut dyn FnMut(&[u8]) -> Result<Vec<f32>, String>,
 ) -> Result<usize, String> {
     let built = build_from_tar(bytes, embed)?;
-    let built = if replace {
+    let active = crate::dinov2::selected_model_id();
+    let mut built = if replace {
         built
     } else {
-        merge_with_saved(vision, built)?
+        merge_with_saved(vision, built, &active, embed)?
     };
+    stamp_extracted(&mut built.book, &active);
     let count = built.book.parts.len();
     commit_book(vision, &built)?;
     *lock(&CATALOGUE) = built.book;
@@ -765,13 +894,7 @@ fn read_tar(bytes: &[u8]) -> Result<Archive, String> {
         if body.len() as u64 > MAX_ENTRY_BYTES {
             return Err("A file in the archive is too large.".to_string());
         }
-        files.insert(
-            key,
-            TarFile {
-                bytes: body,
-                mtime,
-            },
-        );
+        files.insert(key, TarFile { bytes: body, mtime });
     }
     let (catalogue_key, prefix) = locate_catalogue(&files)?;
     let catalogue = String::from_utf8(
@@ -915,10 +1038,7 @@ fn parse_source(text: &str, enforce_crop_limit: bool) -> Result<Vec<SourcePart>,
     Ok(merge_parts(parts, enforce_crop_limit)?)
 }
 
-fn source_part(
-    map: &Map<String, Value>,
-    enforce_crop_limit: bool,
-) -> Result<SourcePart, String> {
+fn source_part(map: &Map<String, Value>, enforce_crop_limit: bool) -> Result<SourcePart, String> {
     let ic = clean_ic(&field_string(
         map,
         &["ic", "IC", "code", "inventoryCode", "inventory_code"],
@@ -1439,11 +1559,7 @@ fn commit_replace(
                     dropped,
                     overrode: false,
                 };
-                (
-                    indexes,
-                    stored_allowance(kept_count, limit),
-                    Some(note),
-                )
+                (indexes, stored_allowance(kept_count, limit), Some(note))
             }
             Some(CropAction::Override) => {
                 let count = part.crops.len();
@@ -1482,7 +1598,8 @@ fn commit_replace(
             crops,
         });
     }
-    let built = embed_kept(kept, embed)?;
+    let mut built = embed_kept(kept, embed)?;
+    stamp_extracted(&mut built.book, &crate::dinov2::selected_model_id());
     let count = built.book.parts.len();
     commit_book(vision, &built)?;
     if let Err(err) = record_crop_limits(vision, &overrides) {
@@ -1616,7 +1733,7 @@ fn embed_kept(
         return Err("Catalogue has no parts.".to_string());
     }
     Ok(Built {
-        book: Book { parts },
+        book: Book::from_parts(parts),
         files,
     })
 }
@@ -1674,10 +1791,7 @@ fn read_limit_map(vision: &Path) -> HashMap<String, usize> {
     };
     let mut limits = HashMap::new();
     for (ic, value) in map {
-        let Some(count) = value
-            .as_u64()
-            .and_then(|count| usize::try_from(count).ok())
-        else {
+        let Some(count) = value.as_u64().and_then(|count| usize::try_from(count).ok()) else {
             continue;
         };
         if count > MAX_CROPS {
@@ -1885,10 +1999,18 @@ fn stored_crop_name(key: &str, index: usize) -> String {
 /// Parts and crops that are only in the saved catalogue stay.
 /// A missing saved file installs `incoming` as it is.
 /// A read error returns before anything is written.
-fn merge_with_saved(vision: &Path, incoming: Built) -> Result<Built, String> {
-    let Some(existing) = load_book(vision)? else {
+fn merge_with_saved(
+    vision: &Path,
+    incoming: Built,
+    active: &str,
+    embed: &mut dyn FnMut(&[u8]) -> Result<Vec<f32>, String>,
+) -> Result<Built, String> {
+    let Some(mut existing) = load_book(vision)? else {
         return Ok(incoming);
     };
+    if !model_matches(&existing, active) {
+        reembed_book(vision, &mut existing, embed)?;
+    }
     let mut incoming_files: HashMap<String, Vec<u8>> = incoming.files.into_iter().collect();
     let mut indexes = HashMap::new();
     for (index, part) in incoming.book.parts.iter().enumerate() {
@@ -1930,7 +2052,7 @@ fn merge_with_saved(vision: &Path, incoming: Built) -> Result<Built, String> {
         return Err("The catalogue has too many parts.".to_string());
     }
     Ok(Built {
-        book: Book { parts },
+        book: Book::from_parts(parts),
         files,
     })
 }
@@ -2104,6 +2226,8 @@ fn commit_book(vision: &Path, built: &Built) -> Result<(), String> {
 fn book_json(book: &Book) -> Result<Vec<u8>, String> {
     let file = StoredFile {
         version: VERSION,
+        embedding_model: book.embedding_model.clone(),
+        embeddings_stale: book.embeddings_stale,
         parts: book
             .parts
             .iter()
@@ -2144,7 +2268,23 @@ fn replace_file(tmp: &Path, path: &Path) -> Result<(), String> {
 #[derive(Serialize, Deserialize)]
 struct StoredFile {
     version: u32,
+    #[serde(
+        default,
+        rename = "embeddingModel",
+        skip_serializing_if = "Option::is_none"
+    )]
+    embedding_model: Option<String>,
+    #[serde(
+        default,
+        rename = "embeddingsStale",
+        skip_serializing_if = "skip_false"
+    )]
+    embeddings_stale: bool,
     parts: Vec<StoredPart>,
+}
+
+fn skip_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2164,11 +2304,7 @@ struct StoredPart {
     dimensions: Value,
     crops: Vec<String>,
     embeddings: Vec<Vec<f32>>,
-    #[serde(
-        default,
-        rename = "cropLimit",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, rename = "cropLimit", skip_serializing_if = "Option::is_none")]
     crop_limit: Option<usize>,
 }
 
@@ -2195,7 +2331,11 @@ fn load_book(vision: &Path) -> Result<Option<Book>, String> {
     for part in file.parts {
         parts.push(stored_part(part, &path)?);
     }
-    Ok(Some(Book { parts }))
+    Ok(Some(Book {
+        parts,
+        embedding_model: file.embedding_model,
+        embeddings_stale: file.embeddings_stale,
+    }))
 }
 
 fn stored_part(part: StoredPart, path: &Path) -> Result<Part, String> {
@@ -2409,7 +2549,10 @@ fn reorder_crops(vision: &Path, ic: &str, order: &[usize]) -> Result<(), String>
             return Err("That part is not in the catalogue.".to_string());
         };
         let order = permutation(order, part.crops.len())?;
-        let crops: Vec<String> = order.iter().map(|index| part.crops[*index].clone()).collect();
+        let crops: Vec<String> = order
+            .iter()
+            .map(|index| part.crops[*index].clone())
+            .collect();
         let embeddings: Vec<Vec<f32>> = order
             .iter()
             .map(|index| part.embeddings[*index].clone())
@@ -2432,10 +2575,7 @@ fn set_tolerance(vision: &Path, ic: &str, key: &str, mm: Option<f64>) -> Result<
     let Some(part) = book.parts.iter().find(|part| part.ic == ic) else {
         return Err("That part is not in the catalogue.".to_string());
     };
-    if !size_rows(&part.dimensions)
-        .iter()
-        .any(|row| row.key == key)
-    {
+    if !size_rows(&part.dimensions).iter().any(|row| row.key == key) {
         return Err("That dimension is not on this part.".to_string());
     }
     let mut saved = read_tolerances(vision);
@@ -2494,8 +2634,8 @@ fn write_tolerances(
         version: 1,
         parts: parts.clone(),
     };
-    let mut bytes = serde_json::to_vec(&file)
-        .map_err(|_| "Could not save the tolerance.".to_string())?;
+    let mut bytes =
+        serde_json::to_vec(&file).map_err(|_| "Could not save the tolerance.".to_string())?;
     bytes.push(b'\n');
     replace_file_bytes(&tolerances_path(vision), &bytes)
 }
@@ -3153,18 +3293,21 @@ mod tests {
         assert_eq!(book.parts[0].crops.len(), 1);
         assert_eq!(book.parts[0].embeddings, vec![embedding.clone()]);
         assert!(!dir.join("dinov2-references.json").exists());
-        assert!(fs::read_dir(&dir)
-            .unwrap()
-            .filter_map(Result::ok)
-            .all(|entry| entry.path().extension().and_then(|ext| ext.to_str()) != Some("txt")));
+        assert!(
+            fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| entry.path().extension().and_then(|ext| ext.to_str()) != Some("txt"))
+        );
 
         let again = append_catalogue_crop(&dir, "FAST-1", &jpeg, &embedding).unwrap();
         assert_eq!(again, "FAST-1");
-        assert!(dir
-            .join("catalogue-crops")
-            .join("FAST-1")
-            .join("crop-2.jpg")
-            .is_file());
+        assert!(
+            dir.join("catalogue-crops")
+                .join("FAST-1")
+                .join("crop-2.jpg")
+                .is_file()
+        );
         assert_eq!(load_book(&dir).unwrap().unwrap().parts[0].crops.len(), 2);
 
         let entries = crate::catalog::read_catalogue(&dir.join("catalogue.json"));
@@ -3181,14 +3324,80 @@ mod tests {
         let fresh = append_catalogue_crop(&dir, "NEW-9", &jpeg, &embedding).unwrap();
         assert_eq!(fresh, "NEW-9");
         assert_eq!(load_book(&dir).unwrap().unwrap().parts.len(), 2);
-        assert!(dir
-            .join("catalogue-crops")
-            .join("NEW-9")
-            .join("crop-1.jpg")
-            .is_file());
+        assert!(
+            dir.join("catalogue-crops")
+                .join("NEW-9")
+                .join("crop-1.jpg")
+                .is_file()
+        );
 
         let err = append_catalogue_crop(&dir, "  ", &jpeg, &embedding).unwrap_err();
         assert!(err.to_ascii_lowercase().contains("ic"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_model_change_marks_embeddings_stale_and_the_next_extract_replaces_them() {
+        let dir = temp_dir("dino-model");
+        let jpeg = tiny_jpeg();
+        let original = vec![1.0_f32, 0.0, 0.0, 1.0];
+        append_catalogue_crop(&dir, "FAST-1", &jpeg, &original).unwrap();
+        let mut book = load_book(&dir).unwrap().unwrap();
+        book.embedding_model = Some("s_reg".to_string());
+        book.embeddings_stale = false;
+        let bytes = book_json(&book).unwrap();
+        replace_file_bytes(&catalogue_path(&dir), &bytes).unwrap();
+
+        assert!(align_embeddings_file(&dir, "b_reg").unwrap());
+        let stale = load_book(&dir).unwrap().unwrap();
+        assert!(stale.embeddings_stale);
+        assert_eq!(stale.embedding_model.as_deref(), Some("s_reg"));
+        assert_eq!(stale.parts[0].embeddings, vec![original.clone()]);
+
+        assert!(!align_embeddings_file(&dir, "s_reg").unwrap());
+        let restored = load_book(&dir).unwrap().unwrap();
+        assert!(!restored.embeddings_stale);
+        assert_eq!(restored.parts[0].embeddings, vec![original.clone()]);
+
+        assert!(align_embeddings_file(&dir, "b_reg").unwrap());
+        let mut next = load_book(&dir).unwrap().unwrap();
+        let fresh = vec![9.0_f32, 8.0, 7.0];
+        reembed_book(&dir, &mut next, &mut |_bytes| Ok(fresh.clone())).unwrap();
+        assert_eq!(next.parts[0].embeddings, vec![fresh.clone()]);
+        assert!(
+            next.parts[0]
+                .embeddings
+                .iter()
+                .all(|values| values != &original)
+        );
+        stamp_extracted(&mut next, "b_reg");
+        let bytes = book_json(&next).unwrap();
+        replace_file_bytes(&catalogue_path(&dir), &bytes).unwrap();
+        let saved = load_book(&dir).unwrap().unwrap();
+        assert!(!saved.embeddings_stale);
+        assert_eq!(saved.embedding_model.as_deref(), Some("b_reg"));
+        assert_eq!(saved.parts[0].embeddings, vec![fresh]);
+        assert!(!model_matches(&saved, "s_reg"));
+        assert!(model_matches(&saved, "b_reg"));
+
+        let legacy = serde_json::json!({
+            "version": 1,
+            "parts": [{
+                "ic": "OLD-1",
+                "crops": ["catalogue-crops/OLD-1/crop-1.jpg"],
+                "embeddings": [[1.0, 0.0]]
+            }]
+        });
+        fs::write(
+            dir.join("catalogue.json"),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        assert!(align_embeddings_file(&dir, "s_reg").unwrap());
+        let legacy_book = load_book(&dir).unwrap().unwrap();
+        assert!(legacy_book.embeddings_stale);
+        assert!(legacy_book.embedding_model.is_none());
+        assert_eq!(legacy_book.parts[0].embeddings, vec![vec![1.0, 0.0]]);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3595,9 +3804,12 @@ mod tests {
         let before = fs::read(catalogue_path(&dir)).unwrap();
         let wide = oversized_tar("ACH01", 30, true, &jpeg);
         let draft = inspect_replace(&wide, &dir).unwrap();
-        let err = commit_replace(&dir, &draft, &[("ACH01".to_string(), CropAction::Override)], &mut |_| {
-            Err("DINOv2 model is not loaded.".to_string())
-        })
+        let err = commit_replace(
+            &dir,
+            &draft,
+            &[("ACH01".to_string(), CropAction::Override)],
+            &mut |_| Err("DINOv2 model is not loaded.".to_string()),
+        )
         .unwrap_err();
         assert!(err.contains("DINOv2 model is not loaded"), "{err}");
         assert_eq!(fs::read(catalogue_path(&dir)).unwrap(), before);
@@ -3710,11 +3922,7 @@ mod tests {
 
         let mut left = Vec::new();
         let mut right = Vec::new();
-        let mut files = vec![(
-            "catalogue.json".to_string(),
-            Vec::new(),
-            1_u64,
-        )];
+        let mut files = vec![("catalogue.json".to_string(), Vec::new(), 1_u64)];
         for index in 0..13 {
             let name = format!("crops/ACH01/a{index:02}.jpg");
             left.push(name.clone());
@@ -3831,10 +4039,12 @@ mod tests {
             .collect();
         assert!(keys.contains(&"acrossflats"), "{keys:?}");
         assert!(keys.contains(&"h"), "{keys:?}");
-        assert!(listed.parts[0]
-            .sizes
-            .iter()
-            .all(|row| row.tolerance_mm.is_none()));
+        assert!(
+            listed.parts[0]
+                .sizes
+                .iter()
+                .all(|row| row.tolerance_mm.is_none())
+        );
 
         let before = fs::read(catalogue_path(&dir)).unwrap();
         set_tolerance(&dir, "2BBMNM08", "h", Some(0.25)).unwrap();
@@ -3872,10 +4082,12 @@ mod tests {
         assert_eq!(left.parts[0].embeddings.len(), 2);
         assert_eq!(left.parts[0].description, "M8 nut");
         let listed = catalogue_list_from(&dir).unwrap();
-        assert!(listed.parts[0]
-            .crops
-            .iter()
-            .all(|crop| crop.hash == listed.parts[0].crops[0].hash));
+        assert!(
+            listed.parts[0]
+                .crops
+                .iter()
+                .all(|crop| crop.hash == listed.parts[0].crops[0].hash)
+        );
 
         let book = load_book(&dir).unwrap().unwrap();
         let first = book.parts[0].crops[0].clone();

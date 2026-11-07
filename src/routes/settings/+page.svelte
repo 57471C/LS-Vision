@@ -164,6 +164,14 @@ let dinoTopText = String(DINO_TOP_DEFAULT);
 let dinoTopNotice = "";
 let dinoTopGeneration = 0;
 let dinoTopChain: Promise<void> = Promise.resolve();
+const DINO_MODEL_S = "s_reg";
+const DINO_MODEL_B = "b_reg";
+let dinoModel = DINO_MODEL_S;
+let dinoModelSaved = DINO_MODEL_S;
+let dinoEmbeddingsStale = false;
+let dinoModelNotice = "";
+let savingDinoModel = false;
+let dinoModelGeneration = 0;
 const DETECTOR_OPTIONS = [
 	{ value: "auto", label: "Auto" },
 	{ value: "yolo", label: "YOLO" },
@@ -644,6 +652,7 @@ async function loadModel() {
 	await loadModelsFolder();
 	await loadConfidence();
 	await loadMatchThreshold();
+	await loadDinoModel();
 }
 
 function clampConfidence(value: number): number {
@@ -781,6 +790,92 @@ function queueMatchSave() {
 function normalizeDetector(value: unknown): string {
 	if (value === "yolo" || value === "rf-detr") return value;
 	return "auto";
+}
+
+function normalizeDinoModel(value: unknown): string {
+	return value === DINO_MODEL_B ? DINO_MODEL_B : DINO_MODEL_S;
+}
+
+function dinoFileName(model: string): string {
+	return model === DINO_MODEL_B
+		? "dinov2_vitb14_reg.onnx"
+		: "dinov2_vits14_reg.onnx";
+}
+
+function dinoSavedText(
+	fileName: string,
+	stale: boolean,
+	sessionMessage: string,
+): string {
+	let text = `Saved. DINOv2 model is ${fileName}.`;
+	if (stale) {
+		text +=
+			" Catalogue embeddings are marked stale. The next extract uses this model.";
+	}
+	if (sessionMessage && !sessionMessage.includes("session is ready")) {
+		text += ` ${sessionMessage}`;
+	}
+	return text;
+}
+
+async function loadDinoModel() {
+	const generation = dinoModelGeneration;
+	try {
+		const data = await invokeRust<{
+			model?: unknown;
+			message?: unknown;
+			embeddingsStale?: unknown;
+			loaded?: unknown;
+		}>("dino_model_status");
+		if (generation !== dinoModelGeneration || savingDinoModel) return;
+		dinoModel = normalizeDinoModel(data.model);
+		dinoModelSaved = dinoModel;
+		dinoEmbeddingsStale = data.embeddingsStale === true;
+		if (
+			data.loaded === false &&
+			typeof data.message === "string" &&
+			data.message
+		) {
+			dinoModelNotice = data.message;
+		}
+	} catch (err: unknown) {
+		if (generation !== dinoModelGeneration) return;
+		dinoModelNotice = invokeError(err, "Could not load the DINOv2 model");
+	}
+}
+
+function onDinoModelChange() {
+	const choice = dinoModel;
+	const generation = ++dinoModelGeneration;
+	const previous = dinoModelSaved;
+	savingDinoModel = true;
+	dinoModelNotice = "";
+	void invokeRust<{
+		model?: unknown;
+		message?: unknown;
+		embeddingsStale?: unknown;
+	}>("set_dino_model", { model: choice })
+		.then((data) => {
+			if (generation !== dinoModelGeneration) return;
+			dinoModel = normalizeDinoModel(data.model);
+			dinoModelSaved = dinoModel;
+			dinoEmbeddingsStale = data.embeddingsStale === true;
+			const sessionMessage =
+				typeof data.message === "string" ? data.message : "";
+			dinoModelNotice = dinoSavedText(
+				dinoFileName(dinoModel),
+				dinoEmbeddingsStale,
+				sessionMessage,
+			);
+		})
+		.catch((err: unknown) => {
+			if (generation !== dinoModelGeneration) return;
+			dinoModel = previous;
+			dinoModelNotice = invokeError(err, "Could not save the DINOv2 model");
+		})
+		.finally(() => {
+			if (generation === dinoModelGeneration) savingDinoModel = false;
+		});
 }
 
 function detectorSaved(choice: string): string {
@@ -2792,6 +2887,7 @@ onMount(() => {
 	previewChannel.onmessage = onPreviewMessage;
 	window.addEventListener("focus", onWindowFocus);
 	void loadInference();
+	void loadDinoModel();
 	if (!unlocked) {
 		void loadModel();
 		return;
@@ -4020,6 +4116,44 @@ onDestroy(() => {
 							{#if inferenceNotice}
 								<p class="text-sm text-neutral-200">{inferenceNotice}</p>
 							{/if}
+						</form>
+						<form
+							class="flex flex-col gap-4 border border-neutral-700 bg-neutral-900 p-4 xl:col-start-2"
+							on:submit|preventDefault={() => undefined}
+						>
+							<fieldset class="flex flex-col gap-3">
+								<legend class="text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+									DINOv2
+								</legend>
+								<p class="text-sm text-neutral-200">
+									Current model
+									<span class="font-mono text-neutral-100">{dinoFileName(dinoModel)}</span>
+								</p>
+								<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+									Model
+									<select
+										class="border border-neutral-600 bg-neutral-950 px-3 py-2 font-mono text-base font-medium normal-case tracking-normal text-neutral-100 disabled:text-neutral-500"
+										bind:value={dinoModel}
+										on:change={onDinoModelChange}
+										disabled={savingDinoModel}
+										aria-label="DINOv2 model"
+									>
+										<option value={DINO_MODEL_S}>dinov2_vits14_reg.onnx</option>
+										<option value={DINO_MODEL_B}>dinov2_vitb14_reg.onnx</option>
+									</select>
+								</label>
+								<p class="text-sm text-neutral-400">
+									ViT-S/14 reg is the default. A missing value uses that file. Changing the model reloads the matcher. Catalogue embeddings from the other model are marked stale, and the next extract replaces them. S vectors are 384 long and B vectors are 768 long.
+								</p>
+								{#if dinoEmbeddingsStale}
+									<p class="text-sm text-neutral-200">
+										Catalogue embeddings are marked stale. The next extract uses this model.
+									</p>
+								{/if}
+								{#if dinoModelNotice}
+									<p class="text-sm text-neutral-200">{dinoModelNotice}</p>
+								{/if}
+							</fieldset>
 						</form>
 					{:else if section === "parts"}
 						<h2 id="settings-section-heading" class="text-lg font-semibold tracking-tight xl:col-span-2">

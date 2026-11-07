@@ -2,7 +2,7 @@
 //!
 //! A crop is stretched to 224×224 with bilinear interpolation, packed as
 //! float32 NCHW, and ImageNet-normalised. The forward pass uses the session
-//! opened at startup from `dinov2_vits14.onnx`. The returned vector is L2
+//! opened at startup from the DINOv2 model selected in config. The returned vector is L2
 //! normalised so a later cosine similarity is a dot product.
 //!
 //! The BoM reference file still letterboxes its crops. This path is only for

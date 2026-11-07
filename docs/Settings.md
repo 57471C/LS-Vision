@@ -26,6 +26,10 @@ Settings are stored in `vision/config.local.json` (gitignored). The unlock passw
 - **Use OpenVINO (Arc)** is `useOpenVino`, default off. Off keeps the ONNX Runtime provider above. On registers `onnxruntime_providers_openvino_plugin.dll`, or `onnxruntime_providers_openvino.dll`, from `openvino/` next to the exe, then beside the exe, then `resources/openvino`. It loads the same `.onnx` files on the OpenVINO GPU device. `openvino.dll` and the TBB runtime have to sit in that same folder. The installer places those DLLs beside `ls-vision.exe`. If the DLL is missing, registration fails, or the GPU session does not start, the session stays on ONNX Runtime and the status line says so. The switch stays saved.
 - Benchmark times the active provider on a fixed image.
 
+## DINOv2 model
+
+Directly under Inference, Training lists two DINOv2 files. The choice is `dinoModel` in `vision/config.local.json`. `s_reg` is `dinov2_vits14_reg.onnx` (384 values) and `b_reg` is `dinov2_vitb14_reg.onnx` (768 values). A missing value is `s_reg`. The page shows the current file name. Changing it saves `dinoModel` and reloads the matcher. Catalogue embeddings from the other model are marked stale. The next catalogue extract replaces them, so the two vector lengths are not mixed. The operator inspection and Preview Detect both use the loaded file.
+
 ## Models
 
 Training lists `.pt` and `.onnx` files in the app data models folder. The path beside Update model opens that folder. Update model copies an `.onnx` file over the selected `.onnx` name, or over `best.onnx`. The selected basename is `model` in `vision/config.local.json`. Detection runs only for `.onnx`, and the next run loads the copied file.

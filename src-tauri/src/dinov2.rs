@@ -1,7 +1,9 @@
 //! Optional DINOv2 ONNX session, stored beside the YOLO session.
 //!
-//! Startup opens `models/dinov2_vits14.onnx` next to the exe when the installer
-//! shipped it, and otherwise `src-tauri/models/dinov2_vits14.onnx`.
+//! Startup opens the DINOv2 file named by `dinoModel` in `vision/config.local.json`.
+//! `s_reg` is `dinov2_vits14_reg.onnx` (384-dim CLS) and `b_reg` is
+//! `dinov2_vitb14_reg.onnx` (768-dim CLS). A missing value is `s_reg`.
+//! The file is taken from `models/` next to the exe, then `src-tauri/models/`.
 //! A missing or unloadable file is a warning. Detection keeps using the YOLO session.
 //! After YOLO keeps a box, this module can crop it, letterbox it to 224, and log
 //! the embedding. A test-mode capture stores that vector under the box's IC.
@@ -27,7 +29,10 @@ use tauri_plugin_dialog::DialogExt;
 use crate::detect;
 use crate::inference_ep::{self, Provider};
 
-const FILE_NAME: &str = "dinov2_vits14.onnx";
+const MODEL_S_REG: &str = "s_reg";
+const MODEL_B_REG: &str = "b_reg";
+const FILE_S_REG: &str = "dinov2_vits14_reg.onnx";
+const FILE_B_REG: &str = "dinov2_vitb14_reg.onnx";
 const REFERENCES_FILE: &str = "dinov2-references.json";
 const REFERENCES_VERSION: u32 = 1;
 const MIN_REFERENCE_THRESHOLD: f32 = 0.50;
@@ -100,23 +105,58 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// On Windows the resource directory is the exe directory, so the installer
-/// copy is `models/dinov2_vits14.onnx` beside `ls-vision.exe`.
-/// Dev and tests use `src-tauri/models/dinov2_vits14.onnx` when that bundled file is absent.
+/// copy is `models/<file>` beside `ls-vision.exe`.
+/// Dev and tests use `src-tauri/models/<file>` when that bundled file is absent.
 pub(crate) fn model_path() -> PathBuf {
     resolve_model_path(
         std::env::current_exe().ok().as_deref(),
         Path::new(env!("CARGO_MANIFEST_DIR")),
+        model_file_name(&selected_model_id()),
     )
 }
 
-fn resolve_model_path(exe: Option<&Path>, manifest_dir: &Path) -> PathBuf {
+/// `s_reg` or `b_reg`. A missing or unknown config value is `s_reg`.
+pub(crate) fn selected_model_id() -> String {
+    let Ok(root) = crate::local_config::project_root() else {
+        return MODEL_S_REG.to_string();
+    };
+    let Ok(document) = crate::local_config::load_document(&root) else {
+        return MODEL_S_REG.to_string();
+    };
+    normalize_model_id(document.get("dinoModel").and_then(|value| value.as_str())).to_string()
+}
+
+pub(crate) fn normalize_model_id(value: Option<&str>) -> &'static str {
+    match value.map(str::trim) {
+        Some(MODEL_B_REG) => MODEL_B_REG,
+        _ => MODEL_S_REG,
+    }
+}
+
+pub(crate) fn model_file_name(id: &str) -> &'static str {
+    if id == MODEL_B_REG {
+        FILE_B_REG
+    } else {
+        FILE_S_REG
+    }
+}
+
+fn parse_model_choice(value: &str) -> Option<&'static str> {
+    match value.trim() {
+        MODEL_S_REG => Some(MODEL_S_REG),
+        MODEL_B_REG => Some(MODEL_B_REG),
+        _ => None,
+    }
+}
+
+fn resolve_model_path(exe: Option<&Path>, manifest_dir: &Path, file_name: &str) -> PathBuf {
     if let Some(dir) = exe.and_then(|path| path.parent()) {
-        let bundled = dir.join("models").join(FILE_NAME);
+        let bundled = dir.join("models").join(file_name);
         if bundled.is_file() {
             return bundled;
         }
     }
-    manifest_dir.join("models").join(FILE_NAME)
+    manifest_dir.join("models").join(file_name)
 }
 
 /// Open the DINOv2 session once. A missing file does not touch the YOLO cache.
@@ -132,9 +172,9 @@ pub(crate) fn load_on_startup() {
     load_saved_references();
 }
 
-/// Reopen the DINOv2 file with the current backend. References stay in memory.
-pub(crate) fn reload_session() {
-    load_at(&model_path());
+/// Reopen the DINOv2 file selected in config. References stay in memory.
+pub(crate) fn reload_session() -> Dinov2Status {
+    load_at(&model_path())
 }
 
 pub(crate) fn load_at(path: &Path) -> Dinov2Status {
@@ -163,6 +203,63 @@ pub(crate) fn load_at(path: &Path) -> Dinov2Status {
     };
     log_status(&status);
     status
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DinoModelStatus {
+    pub model: String,
+    pub file_name: String,
+    pub loaded: bool,
+    pub message: String,
+    pub embeddings_stale: bool,
+}
+
+fn model_status(model: &str, session: &Dinov2Status, embeddings_stale: bool) -> DinoModelStatus {
+    DinoModelStatus {
+        model: model.to_string(),
+        file_name: model_file_name(model).to_string(),
+        loaded: session.loaded,
+        message: session.message.clone(),
+        embeddings_stale,
+    }
+}
+
+/// The saved DINOv2 choice, the file it names, and whether the session loaded.
+#[tauri::command]
+pub fn dino_model_status() -> DinoModelStatus {
+    let model = selected_model_id();
+    let session = dinov2_status();
+    let embeddings_stale = crate::catalogue::embeddings_need_extract(&model).unwrap_or(false);
+    model_status(&model, &session, embeddings_stale)
+}
+
+/// Save `dinoModel` and reload the matcher.
+/// A different model marks catalogue embeddings stale. The next extract
+/// replaces them, so vectors from S and B are not stored together.
+#[tauri::command]
+pub fn set_dino_model(model: String) -> Result<DinoModelStatus, String> {
+    let Some(choice) = parse_model_choice(&model) else {
+        return Err("Choose ViT-S/14 reg or ViT-B/14 reg.".to_string());
+    };
+    let previous = selected_model_id();
+    crate::local_config::save_local_config(serde_json::json!({ "dinoModel": choice }))?;
+    let session = reload_session();
+    let mut message = session.message.clone();
+    let embeddings_stale = if previous == choice {
+        crate::catalogue::embeddings_need_extract(choice).unwrap_or(false)
+    } else {
+        match crate::catalogue::align_saved_embeddings(choice) {
+            Ok(stale) => stale,
+            Err(err) => {
+                message = format!("{message} {err}");
+                true
+            }
+        }
+    };
+    let mut status = model_status(choice, &session, embeddings_stale);
+    status.message = message;
+    Ok(status)
 }
 
 /// Whether the DINOv2 session loaded, plus its input and output names and shapes.
@@ -351,13 +448,27 @@ pub(crate) fn forward_nchw(data: Vec<f32>) -> Result<Vec<f32>, String> {
     let outputs = session
         .run(ort::inputs![tensor])
         .map_err(|err| format!("embed failed: {}", brief(&err.to_string())))?;
-    let (_shape, values) = outputs[0]
+    let (shape, values) = outputs[0]
         .try_extract_tensor::<f32>()
         .map_err(|err| format!("embed failed: {}", brief(&err.to_string())))?;
+    cls_vector(shape, values)
+}
+
+/// The register ONNX files return `last_hidden_state` as
+/// `[batch, patches + 5, hidden]`. Token 0 is the CLS vector: 384 for ViT-S
+/// and 768 for ViT-B. A rank-2 CLS output is returned whole.
+pub(crate) fn cls_vector(shape: &[i64], values: &[f32]) -> Result<Vec<f32>, String> {
     if values.is_empty() || values.iter().any(|value| !value.is_finite()) {
         return Err("DINOv2 returned an empty embedding.".to_string());
     }
-    Ok(values.to_vec())
+    let Some(width) = shape.last().copied().filter(|dim| *dim > 0) else {
+        return Ok(values.to_vec());
+    };
+    let width = width as usize;
+    if width == 0 || values.len() < width || values.len() % width != 0 {
+        return Err("DINOv2 returned an empty embedding.".to_string());
+    }
+    Ok(values[..width].to_vec())
 }
 
 #[cfg(test)]
@@ -1181,13 +1292,14 @@ fn embed_one(
     let outputs = session
         .run(ort::inputs![tensor])
         .map_err(|err| format!("embed failed: {}", brief(&err.to_string())))?;
-    let (_shape, values) = outputs[0]
+    let (shape, values) = outputs[0]
         .try_extract_tensor::<f32>()
         .map_err(|err| format!("embed failed: {}", brief(&err.to_string())))?;
+    let values = cls_vector(shape, values)?;
     if values.len() < 4 {
         return Err("embedding was shorter than 4 values".to_string());
     }
-    Ok(values.to_vec())
+    Ok(values)
 }
 
 fn crop_box(
@@ -1321,19 +1433,24 @@ mod tests {
         let manifest = root.join("crate");
         std::fs::create_dir_all(exe_dir.join("models")).unwrap();
         std::fs::create_dir_all(manifest.join("models")).unwrap();
-        let bundled = exe_dir.join("models").join(FILE_NAME);
-        let crate_copy = manifest.join("models").join(FILE_NAME);
+        let bundled = exe_dir.join("models").join(FILE_S_REG);
+        let crate_copy = manifest.join("models").join(FILE_S_REG);
         std::fs::write(&crate_copy, b"crate").unwrap();
+        let exe = exe_dir.join("ls-vision.exe");
         assert_eq!(
-            resolve_model_path(Some(&exe_dir.join("ls-vision.exe")), &manifest),
+            resolve_model_path(Some(&exe), &manifest, FILE_S_REG),
             crate_copy
         );
         std::fs::write(&bundled, b"bundled").unwrap();
         assert_eq!(
-            resolve_model_path(Some(&exe_dir.join("ls-vision.exe")), &manifest),
+            resolve_model_path(Some(&exe), &manifest, FILE_S_REG),
             bundled
         );
-        assert_eq!(resolve_model_path(None, &manifest), crate_copy);
+        assert_eq!(
+            resolve_model_path(Some(&exe), &manifest, FILE_B_REG),
+            manifest.join("models").join(FILE_B_REG)
+        );
+        assert_eq!(resolve_model_path(None, &manifest, FILE_S_REG), crate_copy);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1354,9 +1471,13 @@ mod tests {
         assert!(status.outputs.is_empty());
         assert_eq!(dinov2_status(), status);
 
-        let path = model_path();
+        let path = resolve_model_path(
+            std::env::current_exe().ok().as_deref(),
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            FILE_S_REG,
+        );
         if !path.is_file() {
-            eprintln!("skip: {FILE_NAME} is not in src-tauri/models");
+            eprintln!("skip: {FILE_S_REG} is not in src-tauri/models");
             return;
         }
         let status = load_at(&path);
@@ -1369,18 +1490,56 @@ mod tests {
         let input = status
             .inputs
             .iter()
-            .find(|port| port.name == "input")
-            .expect("input");
-        assert_eq!(input.shape, vec![1, 3, 224, 224]);
+            .find(|port| port.name == "pixel_values")
+            .expect("pixel_values");
+        assert_eq!(input.shape.len(), 4, "{:?}", input.shape);
         let output = status
             .outputs
             .iter()
-            .find(|port| port.name == "output")
-            .expect("output");
-        assert_eq!(output.shape, vec![1, 384]);
+            .find(|port| port.name == "last_hidden_state")
+            .expect("last_hidden_state");
+        assert_eq!(
+            output.shape.last().copied(),
+            Some(384),
+            "{:?}",
+            output.shape
+        );
+        let zeros = vec![0.0f32; 3 * 224 * 224];
+        let embedding = forward_nchw(zeros).unwrap();
+        assert_eq!(embedding.len(), 384, "ViT-S CLS width");
         assert_eq!(dinov2_status().inputs, status.inputs);
         assert_eq!(dinov2_status().outputs, status.outputs);
         assert!(dinov2_status().loaded);
+    }
+
+    #[test]
+    fn a_missing_dino_model_is_s_reg_and_b_reg_names_the_base_file() {
+        assert_eq!(normalize_model_id(None), MODEL_S_REG);
+        assert_eq!(normalize_model_id(Some("")), MODEL_S_REG);
+        assert_eq!(normalize_model_id(Some("nope")), MODEL_S_REG);
+        assert_eq!(normalize_model_id(Some(" s_reg ")), MODEL_S_REG);
+        assert_eq!(normalize_model_id(Some(MODEL_B_REG)), MODEL_B_REG);
+        assert_eq!(model_file_name(MODEL_S_REG), FILE_S_REG);
+        assert_eq!(model_file_name(MODEL_B_REG), FILE_B_REG);
+        assert_eq!(model_file_name("other"), FILE_S_REG);
+        assert!(parse_model_choice("s_reg").is_some());
+        assert!(parse_model_choice("b_reg").is_some());
+        assert!(parse_model_choice("vits").is_none());
+    }
+
+    #[test]
+    fn the_cls_token_is_the_first_vector_of_a_register_output() {
+        let values: Vec<f32> = (0..12).map(|value| value as f32).collect();
+        let cls = cls_vector(&[1, 3, 4], &values).unwrap();
+        assert_eq!(cls, vec![0.0, 1.0, 2.0, 3.0]);
+        let wide = cls_vector(&[1, 2, 6], &values).unwrap();
+        assert_eq!(wide, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
+        assert_eq!(
+            cls_vector(&[1, 4], &values[..4]).unwrap(),
+            values[..4].to_vec()
+        );
+        assert!(cls_vector(&[1, 5], &values).is_err());
+        assert!(cls_vector(&[1, 4], &[1.0, f32::NAN, 0.0, 1.0]).is_err());
     }
 
     #[test]

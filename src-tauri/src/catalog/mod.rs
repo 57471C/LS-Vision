@@ -126,7 +126,7 @@ fn catalogue_file() -> Result<PathBuf, String> {
 
 fn read_installed_file() -> Vec<CatalogEntry> {
     match catalogue_file() {
-        Ok(path) => read_catalogue(&path),
+        Ok(path) => read_catalogue_for_model(&path, &crate::dinov2::selected_model_id()),
         Err(err) => {
             eprintln!("warning: {err} Catalogue matching has no parts.");
             Vec::new()
@@ -135,7 +135,18 @@ fn read_installed_file() -> Vec<CatalogEntry> {
 }
 
 /// Parse one catalogue file. A missing, empty, or unreadable file is an empty list.
+/// Embeddings are returned even when they were extracted with another model.
+/// Matching uses [`read_catalogue_for_model`] so those vectors are left out.
 pub(crate) fn read_catalogue(path: &Path) -> Vec<CatalogEntry> {
+    read_catalogue_filtered(path, None)
+}
+
+/// Same as [`read_catalogue`], but vectors from another DINOv2 model are omitted.
+pub(crate) fn read_catalogue_for_model(path: &Path, active: &str) -> Vec<CatalogEntry> {
+    read_catalogue_filtered(path, Some(active))
+}
+
+fn read_catalogue_filtered(path: &Path, active: Option<&str>) -> Vec<CatalogEntry> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
@@ -177,6 +188,24 @@ pub(crate) fn read_catalogue(path: &Path) -> Vec<CatalogEntry> {
         );
         return Vec::new();
     }
+    if let Some(active) = active {
+        let has_vectors = file
+            .parts
+            .iter()
+            .any(|part| part.embeddings.iter().any(|values| !values.is_empty()));
+        if !crate::catalogue::embeddings_usable(
+            file.embedding_model.as_deref(),
+            file.embeddings_stale,
+            has_vectors,
+            active,
+        ) {
+            eprintln!(
+                "warning: catalogue embeddings at {} do not match DINOv2 model {active}. Matching skips them until the next extract.",
+                path.display()
+            );
+            return Vec::new();
+        }
+    }
     let entries = entries_from_parts(file.parts);
     if entries.is_empty() {
         eprintln!(
@@ -217,6 +246,10 @@ fn unit_embedding(values: &[f32]) -> Option<Vec<f32>> {
 struct StoredFile {
     #[serde(default)]
     version: Option<u32>,
+    #[serde(default, rename = "embeddingModel")]
+    embedding_model: Option<String>,
+    #[serde(default, rename = "embeddingsStale")]
+    embeddings_stale: bool,
     #[serde(default)]
     parts: Vec<StoredPart>,
 }
@@ -610,6 +643,52 @@ mod tests {
             .sum::<f32>()
             .sqrt();
         assert!((norm - 1.0).abs() < 1.0e-6, "{norm}");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn embeddings_from_another_model_are_left_out_of_matching() {
+        let path = std::env::temp_dir().join(format!(
+            "ls-vision-catalogue-model-{}.json",
+            std::process::id()
+        ));
+        let body = r#"{
+            "version": 1,
+            "embeddingModel": "s_reg",
+            "parts": [{
+                "ic": "FAST-1",
+                "description": "Bolt",
+                "type": "bolt",
+                "embeddings": [[1.0, 0.0]]
+            }]
+        }"#;
+        fs::write(&path, body).unwrap();
+        assert_eq!(read_catalogue_for_model(&path, "s_reg").len(), 1);
+        assert!(read_catalogue_for_model(&path, "b_reg").is_empty());
+        assert_eq!(read_catalogue(&path).len(), 1);
+
+        let stale = body.replace(
+            "\"embeddingModel\": \"s_reg\"",
+            "\"embeddingModel\": \"s_reg\", \"embeddingsStale\": true",
+        );
+        fs::write(&path, stale).unwrap();
+        assert!(read_catalogue_for_model(&path, "s_reg").is_empty());
+
+        fs::write(
+            &path,
+            r#"{
+                "version": 1,
+                "parts": [{
+                    "ic": "OLD-1",
+                    "description": "Washer",
+                    "type": "washer",
+                    "embeddings": [[1.0, 0.0]]
+                }]
+            }"#,
+        )
+        .unwrap();
+        assert!(read_catalogue_for_model(&path, "s_reg").is_empty());
+        assert_eq!(read_catalogue(&path).len(), 1);
         let _ = fs::remove_file(&path);
     }
 
