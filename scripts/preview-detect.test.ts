@@ -32,7 +32,10 @@ check(
 	full[0]?.index === 0 && full[1]?.index === 2,
 	JSON.stringify(full.map((box) => box.index)),
 );
-check("full frame has no slot", full.every((box) => box.slot === null));
+check(
+	"full frame has no slot",
+	full.every((box) => box.slot === null),
+);
 check("one object is not multi-slot", !multiSlot(full));
 
 const slotBody = [
@@ -50,7 +53,11 @@ const slotBody = [
 ];
 const slots = detectionsFromBody(slotBody);
 
-check("slots flatten in payload order", slots.length === 2, JSON.stringify(slots));
+check(
+	"slots flatten in payload order",
+	slots.length === 2,
+	JSON.stringify(slots),
+);
 check(
 	"slot numbers stay on the boxes",
 	slots[0]?.slot === 1 && slots[1]?.slot === 3,
@@ -75,6 +82,29 @@ check(
 );
 check("a slot array has no failure message", detectFailure(slotBody) === "");
 check("blank message is ignored", detectFailure({ message: "  " }) === "");
+const dinoBox = detectionsFromBody({
+	detections: [
+		{
+			ic: "BOLT",
+			confidence: 0.5,
+			bbox: [0, 0, 2, 2],
+			dinoMatches: [
+				{
+					ic: "ACH01",
+					description: " Hinge ",
+					partType: " hinge ",
+					score: 0.74,
+				},
+			],
+		},
+	],
+})[0]?.dinoMatches[0];
+check(
+	"dino matches ride on the box",
+	dinoBox?.description === "Hinge" &&
+		dinoBox?.partType === "hinge" &&
+		dinoBox?.ic === "ACH01",
+);
 
 if (failed > 0) {
 	console.error(`${failed} failed`);

@@ -25,7 +25,9 @@ use crate::inference::dino;
 
 mod matcher;
 
-pub(crate) use matcher::{MatchStatus, TwoPassMatch, bom_ic_set, classify, unrecognized_box};
+pub(crate) use matcher::{
+    DinoHit, MatchStatus, TwoPassMatch, bom_ic_set, classify, unrecognized_box,
+};
 
 /// A score below this is not a named part.
 pub(crate) const MATCH_THRESHOLD: f32 = 0.50;
@@ -233,6 +235,8 @@ struct StoredPart {
 
 /// Embed each box once, then run the two-pass matcher.
 /// An empty catalogue does not call DINOv2.
+/// `feedback_n` keeps that many closest item codes from the same query.
+/// Zero leaves the third list empty and does not rank a second time.
 pub(crate) fn match_hierarchy(
     entries: &[CatalogEntry],
     rgb: &[u8],
@@ -242,11 +246,12 @@ pub(crate) fn match_hierarchy(
     bom_ics: Option<&std::collections::HashSet<String>>,
     threshold: f32,
     include_candidates: bool,
-) -> Vec<(TwoPassMatch, CatalogMatch)> {
+    feedback_n: usize,
+) -> Vec<(TwoPassMatch, CatalogMatch, Vec<DinoHit>)> {
     if entries.is_empty() {
         return boxes
             .iter()
-            .map(|bbox| (unrecognized_box(*bbox), unrecognized()))
+            .map(|bbox| (unrecognized_box(*bbox), unrecognized(), Vec::new()))
             .collect();
     }
     let mut warned = false;
@@ -259,14 +264,14 @@ pub(crate) fn match_hierarchy(
                 Ok(crop) => crop,
                 Err(err) => {
                     warn_once(&mut warned, &err);
-                    return (unrecognized_box(*bbox), unrecognized());
+                    return (unrecognized_box(*bbox), unrecognized(), Vec::new());
                 }
             };
             let query = match dino::embed_rgb(&crop, crop_w, crop_h) {
                 Ok(query) => query,
                 Err(err) => {
                     warn_once(&mut warned, &err);
-                    return (unrecognized_box(*bbox), unrecognized());
+                    return (unrecognized_box(*bbox), unrecognized(), Vec::new());
                 }
             };
             let two_pass = classify(
@@ -277,7 +282,12 @@ pub(crate) fn match_hierarchy(
                 threshold,
                 include_candidates,
             );
-            (two_pass, score_query(entries, &query))
+            let hits = if feedback_n == 0 {
+                Vec::new()
+            } else {
+                matcher::top_hits(entries, &query, feedback_n)
+            };
+            (two_pass, score_query(entries, &query), hits)
         })
         .collect()
 }
@@ -606,7 +616,8 @@ mod tests {
     #[test]
     fn an_empty_catalogue_is_no_match_without_inference() {
         let rgb = [255u8, 0, 0];
-        let matched = match_hierarchy(&[], &rgb, 1, 1, &[[-5, -5, 9, 9]], None, 0.70, false);
+        let matched = match_hierarchy(&[], &rgb, 1, 1, &[[-5, -5, 9, 9]], None, 0.70, false, 3);
+        assert!(matched[0].2.is_empty());
         assert_eq!(matched.len(), 1);
         assert!(!matched[0].1.recognized);
         assert_eq!(matched[0].1.label, "No Match");

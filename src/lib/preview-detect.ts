@@ -2,6 +2,13 @@
 // of those objects. Indices follow the payload so a reference save still
 // matches the held embeddings.
 
+export type PreviewDinoMatch = {
+	ic: string;
+	description: string;
+	partType: string;
+	score: number;
+};
+
 export type PreviewBox = {
 	ic: string;
 	confidence: number;
@@ -9,9 +16,35 @@ export type PreviewBox = {
 	embed: boolean;
 	twoPass: unknown;
 	metrology: unknown;
+	dinoMatches: PreviewDinoMatch[];
 	slot: number | null;
 	index: number;
 };
+
+// Same shape as dino-feedback.readDinoMatches. This file stays free of
+// imports so the node payload test can load it directly.
+function readDinoMatches(value: unknown): PreviewDinoMatch[] {
+	if (!Array.isArray(value)) return [];
+	const matches: PreviewDinoMatch[] = [];
+	for (const item of value) {
+		if (!item || typeof item !== "object") continue;
+		const row = item as {
+			ic?: unknown;
+			description?: unknown;
+			partType?: unknown;
+			score?: unknown;
+		};
+		const ic = typeof row.ic === "string" ? row.ic.trim() : "";
+		if (!ic) continue;
+		if (typeof row.score !== "number" || !Number.isFinite(row.score)) continue;
+		const description =
+			typeof row.description === "string" ? row.description.trim() : "";
+		const partType =
+			typeof row.partType === "string" ? row.partType.trim() : "";
+		matches.push({ ic, description, partType, score: row.score });
+	}
+	return matches;
+}
 
 function finite(value: unknown): value is number {
 	return typeof value === "number" && Number.isFinite(value);
@@ -23,7 +56,11 @@ function slotNumber(value: unknown): number | null {
 	return value;
 }
 
-function boxFrom(item: unknown, slot: number | null, index: number): PreviewBox | null {
+function boxFrom(
+	item: unknown,
+	slot: number | null,
+	index: number,
+): PreviewBox | null {
 	if (!item || typeof item !== "object") return null;
 	const row = item as {
 		ic?: unknown;
@@ -32,6 +69,7 @@ function boxFrom(item: unknown, slot: number | null, index: number): PreviewBox 
 		embed?: unknown;
 		twoPass?: unknown;
 		metrology?: unknown;
+		dinoMatches?: unknown;
 	};
 	const bbox = Array.isArray(row.bbox) ? row.bbox : [];
 	if (bbox.length < 4) return null;
@@ -49,6 +87,7 @@ function boxFrom(item: unknown, slot: number | null, index: number): PreviewBox 
 		embed: row.embed === true,
 		twoPass: row.twoPass,
 		metrology: row.metrology,
+		dinoMatches: readDinoMatches(row.dinoMatches),
 		slot,
 		index,
 	};

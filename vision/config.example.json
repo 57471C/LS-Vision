@@ -39,6 +39,7 @@
 	"confidence": 0.45,
 	"detector": "auto",
 	"matchThreshold": 0.7,
+	"dinoTopN": 3,
 	"partRules": [],
 	"inferenceEp": "directml",
 	"useOpenVino": false,

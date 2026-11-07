@@ -38,6 +38,9 @@ const MAX_CONFIDENCE: f32 = 0.80;
 const DEFAULT_MATCH_THRESHOLD: f32 = 0.70;
 const MIN_MATCH_THRESHOLD: f32 = 0.50;
 const MAX_MATCH_THRESHOLD: f32 = 0.95;
+const DEFAULT_DINO_TOP_N: usize = 3;
+const MIN_DINO_TOP_N: usize = 1;
+const MAX_DINO_TOP_N: usize = 8;
 const IOU_THRESHOLD: f32 = 0.7;
 const MAX_DET: usize = 300;
 const MAX_NMS: usize = 30_000;
@@ -80,6 +83,14 @@ struct Detection {
     /// off, the box is unrecognized, or the crop could not be measured.
     #[serde(default, rename = "metrology", skip_serializing_if = "Option::is_none")]
     metrology: Option<crate::metrology::MetrologyResult>,
+    /// Closest catalogue descriptions after an RF-DETR preview detect.
+    /// Absent on the operator barcode path and on a YOLO detect.
+    #[serde(
+        default,
+        rename = "dinoMatches",
+        skip_serializing_if = "Option::is_none"
+    )]
+    dino_matches: Option<Vec<crate::catalog::DinoHit>>,
     /// YOLO class index. Not part of the detect payload. Class 3 is a label.
     #[serde(skip)]
     class_id: usize,
@@ -129,6 +140,7 @@ struct Inference {
     items: Vec<DetectedItem>,
     classes: Vec<String>,
     transform: LetterboxTransform,
+    kind: DetectorKind,
 }
 
 struct Candidate {
@@ -308,6 +320,22 @@ fn match_threshold(document: &Value) -> f32 {
 /// Settings > Training debug switch. Missing or any value other than true is off.
 fn catalog_debug(document: &Value) -> bool {
     document.get("catalogDebug").and_then(Value::as_bool) == Some(true)
+}
+
+/// Saved `dinoTopN`. Missing or invalid values use 3. Whole numbers clamp to 1–8.
+fn dino_top_n(document: &Value) -> usize {
+    let Some(raw) = document.get("dinoTopN") else {
+        return DEFAULT_DINO_TOP_N;
+    };
+    let number = raw.as_u64().or_else(|| {
+        raw.as_f64()
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .map(|value| value.trunc() as u64)
+    });
+    let Some(number) = number else {
+        return DEFAULT_DINO_TOP_N;
+    };
+    (number as usize).clamp(MIN_DINO_TOP_N, MAX_DINO_TOP_N)
 }
 
 /// `enabled` defaults to true when the field is missing or not a boolean.
@@ -998,6 +1026,7 @@ fn detections_from_output(
             catalog_match: None,
             two_pass: None,
             metrology: None,
+            dino_matches: None,
             class_id: item.class_id,
         });
         items.push(DetectedItem {
@@ -1681,6 +1710,7 @@ fn decoded_from_rfdetr(
             catalog_match: None,
             two_pass: None,
             metrology: None,
+            dino_matches: None,
             class_id: item.class_id,
         });
         items.push(DetectedItem {
@@ -1848,6 +1878,7 @@ fn infer_prepared(
             items: found.items,
             classes: listed_classes(model.names.clone()),
             transform,
+            kind: prepared.kind,
         })
     })
 }
@@ -1858,6 +1889,7 @@ fn detection_value(found: Inference, dinov2: Vec<String>, catalog: Vec<String>) 
         items,
         classes,
         transform,
+        kind: _,
     } = found;
     let response = DetectionResponse { items, transform };
     let mut value = serde_json::to_value(&response).unwrap_or_else(|_| json!({}));
@@ -1931,6 +1963,7 @@ fn detect_pixels(
     hold_references: bool,
     active_bom_ics: Option<Vec<String>>,
     confidence_override: Option<f32>,
+    dino_feedback: bool,
 ) -> Result<Value, String> {
     let root = match local_config::project_root() {
         Ok(root) => root,
@@ -1986,6 +2019,7 @@ fn detect_pixels(
                         crate::dinov2::hold_embeddings(held);
                         crate::dinov2::hold_frame(rgb, width, height);
                     }
+                    let feedback_n = feedback_count(dino_feedback, found.kind, document.as_ref());
                     let catalog = attach_catalog(
                         rgb,
                         width,
@@ -1994,6 +2028,7 @@ fn detect_pixels(
                         bom_ics.as_ref(),
                         cutoff,
                         include_candidates,
+                        feedback_n,
                     );
                     apply_metrology(document.as_ref(), rgb, width, height, &mut found.detections);
                     Ok(detection_value(found, dinov2, catalog))
@@ -2035,6 +2070,7 @@ fn detect_pixels(
                 if hold_references {
                     held_all.extend(held);
                 }
+                let feedback_n = feedback_count(dino_feedback, found.kind, document.as_ref());
                 let catalog = attach_catalog(
                     rgb,
                     width,
@@ -2043,6 +2079,7 @@ fn detect_pixels(
                     bom_ics.as_ref(),
                     cutoff,
                     include_candidates,
+                    feedback_n,
                 );
                 apply_metrology(document.as_ref(), rgb, width, height, &mut found.detections);
                 let mut row = detection_value(found, dinov2, catalog);
@@ -2160,8 +2197,18 @@ fn apply_metrology(
     }
 }
 
+/// Top-N catalogue list for an RF-DETR preview. The operator call and a YOLO
+/// decode both get zero, so `dinoMatches` stays off the payload.
+fn feedback_count(requested: bool, kind: DetectorKind, document: Option<&Value>) -> usize {
+    if !requested || kind != DetectorKind::RfDetr {
+        return 0;
+    }
+    document.map(dino_top_n).unwrap_or(DEFAULT_DINO_TOP_N)
+}
+
 /// Name each box from the imported catalogue. An empty catalogue is "No Match"
-/// and does not run DINOv2 again. The YOLO class on the box is left as it is.
+/// and does not run DINOv2 again. The detector class on the box is left as it is.
+/// `feedback_n` reuses that same embedding and keeps the closest descriptions.
 fn attach_catalog(
     rgb: &[u8],
     width: u32,
@@ -2170,6 +2217,7 @@ fn attach_catalog(
     bom_ics: Option<&std::collections::HashSet<String>>,
     threshold: f32,
     include_candidates: bool,
+    feedback_n: usize,
 ) -> Vec<String> {
     if detections.is_empty() {
         return Vec::new();
@@ -2185,9 +2233,10 @@ fn attach_catalog(
         bom_ics,
         threshold,
         include_candidates,
+        feedback_n,
     );
     let mut lines = Vec::with_capacity(detections.len());
-    for (detection, (two_pass, matched)) in detections.iter_mut().zip(matches) {
+    for (detection, (two_pass, matched, hits)) in detections.iter_mut().zip(matches) {
         let status = match two_pass.status {
             crate::catalog::MatchStatus::MatchedBom => "matched_bom",
             crate::catalog::MatchStatus::WrongPart => "wrong_part",
@@ -2200,6 +2249,9 @@ fn attach_catalog(
         ));
         detection.two_pass = Some(two_pass);
         detection.catalog_match = Some(matched);
+        if !hits.is_empty() {
+            detection.dino_matches = Some(hits);
+        }
     }
     lines
 }
@@ -2221,6 +2273,7 @@ fn detect_raw(
     hold_references: bool,
     active_bom_ics: Option<Vec<String>>,
     confidence_override: Option<f32>,
+    dino_feedback: bool,
 ) -> Result<Value, String> {
     let Some(frame) = frame else {
         return Ok(failure("No frame"));
@@ -2237,6 +2290,7 @@ fn detect_raw(
         hold_references,
         active_bom_ics,
         confidence_override,
+        dino_feedback,
     )
 }
 
@@ -2246,6 +2300,7 @@ fn detect_encoded(
     hold_references: bool,
     active_bom_ics: Option<Vec<String>>,
     confidence_override: Option<f32>,
+    dino_feedback: bool,
 ) -> Result<Value, String> {
     let bytes = match payload_bytes(text) {
         Ok(bytes) => bytes,
@@ -2263,6 +2318,7 @@ fn detect_encoded(
         hold_references,
         active_bom_ics,
         confidence_override,
+        dino_feedback,
     )
 }
 
@@ -2274,6 +2330,7 @@ pub async fn detect_image(
     hold_references: Option<bool>,
     active_bom_ics: Option<Vec<String>>,
     confidence: Option<f64>,
+    dino_feedback: Option<bool>,
 ) -> Result<Value, String> {
     // Test mode passes the chosen file. A live detect leaves this empty and
     // uses the raw frame stored by capture_snapshot. Saving references stores
@@ -2281,8 +2338,11 @@ pub async fn detect_image(
     // The preview asks to hold those vectors, then saves only the selected boxes.
     // The same call keeps this RGB frame so a marquee can embed one crop without YOLO.
     // An optional confidence is the preview cutoff. The operator call omits it.
+    // `dinoFeedback` asks for the top catalogue ICs on an RF-DETR preview.
+    // The operator barcode call omits it, so that payload stays the same.
     let capture_references = capture_references.unwrap_or(false);
     let hold_references = hold_references.unwrap_or(false);
+    let dino_feedback = dino_feedback.unwrap_or(false);
     let confidence = confidence.and_then(|value| {
         if value.is_finite() {
             Some(value as f32)
@@ -2298,6 +2358,7 @@ pub async fn detect_image(
                 hold_references,
                 active_bom_ics,
                 confidence,
+                dino_feedback,
             )
         })
         .await
@@ -2314,6 +2375,7 @@ pub async fn detect_image(
             hold_references,
             active_bom_ics,
             confidence,
+            dino_feedback,
         )
     })
     .await
@@ -2687,6 +2749,49 @@ mod tests {
         assert!((match_threshold(&json!({"matchThreshold": 0.10})) - 0.50).abs() < 0.0001);
         assert!((match_threshold(&json!({"matchThreshold": 0.99})) - 0.95).abs() < 0.0001);
         assert!((match_threshold(&json!({"matchThreshold": "nope"})) - 0.70).abs() < 0.0001);
+        assert_eq!(dino_top_n(&Value::Null), 3);
+        assert_eq!(dino_top_n(&json!({"dinoTopN": 5})), 5);
+        assert_eq!(dino_top_n(&json!({"dinoTopN": 0})), 1);
+        assert_eq!(dino_top_n(&json!({"dinoTopN": 40})), 8);
+        assert_eq!(dino_top_n(&json!({"dinoTopN": 3.9})), 3);
+        assert_eq!(dino_top_n(&json!({"dinoTopN": "nope"})), 3);
+        assert_eq!(feedback_count(false, DetectorKind::RfDetr, None), 0);
+        assert_eq!(feedback_count(true, DetectorKind::Yolo, None), 0);
+        assert_eq!(
+            feedback_count(true, DetectorKind::RfDetr, Some(&json!({"dinoTopN": 4}))),
+            4
+        );
+        assert_eq!(feedback_count(true, DetectorKind::RfDetr, None), 3);
+    }
+
+    #[test]
+    fn dino_matches_stay_off_the_payload_until_a_preview_attaches_them() {
+        let bare = Detection {
+            ic: "2ERGM22".to_string(),
+            confidence: 0.8,
+            bbox: [0, 0, 10, 10],
+            reference_match: None,
+            embed: None,
+            catalog_match: None,
+            two_pass: None,
+            metrology: None,
+            dino_matches: None,
+            class_id: 0,
+        };
+        let hidden = serde_json::to_value(&bare).unwrap();
+        assert!(hidden.get("dinoMatches").is_none());
+        let mut shown = bare;
+        shown.dino_matches = Some(vec![crate::catalog::DinoHit {
+            ic: "ACH01".to_string(),
+            description: Some("Hinge".to_string()),
+            part_type: Some("hinge".to_string()),
+            score: 0.74,
+        }]);
+        let value = serde_json::to_value(&shown).unwrap();
+        assert_eq!(value["dinoMatches"][0]["ic"], "ACH01");
+        assert_eq!(value["dinoMatches"][0]["description"], "Hinge");
+        assert_eq!(value["dinoMatches"][0]["partType"], "hinge");
+        assert!((value["dinoMatches"][0]["score"].as_f64().unwrap() - 0.74).abs() < 0.0001);
     }
 
     #[test]
