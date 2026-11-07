@@ -32,7 +32,7 @@ Independent bench stations (NUCs) that:
 - **Working distance**: ~1200 mm covering the full 590 mm × 1400 mm scannable bench area.
 - **Station PC**: ASUS NUC 16 Pro (RNUC16GDKX76C4N3) — Core Ultra X7 358H, Arc B390 iGPU, 32 GB RAM, 1 TB NVMe, Windows 11 Pro, dual 2.5 GbE.
 - Inference runs on the NUC (OpenVINO / ONNX Runtime targeting the Arc iGPU).
-- OpenVINO loads `onnxruntime_providers_openvino_plugin.dll`, or `onnxruntime_providers_openvino.dll`, from `openvino/` next to the exe, then from beside the exe, then from `resources/openvino`. `openvino.dll`, the Intel device plugins, and the TBB runtime (`tbb12.dll`, `tbbmalloc.dll`, `tbbmalloc_proxy.dll`, `tbbbind_2_5.dll`) have to sit in the same folder as that provider DLL. The installer maps `models/*` into `models/` and `openvino/*.dll` into the same directory as the exe. DINOv2 loads `models/dinov2_vits14.onnx` from that directory. ORT 1.31 does not read `ORT_OPENVINO_DLL`. The current crate is the OpenVINO prebuilt only, so DirectML is not listed and a CUDA choice still opens the CPU session.
+- OpenVINO loads `onnxruntime_providers_openvino_plugin.dll`, or `onnxruntime_providers_openvino.dll`, from `openvino/` next to the exe, then from beside the exe, then from `resources/openvino`. `openvino.dll`, the Intel device plugins, and the TBB runtime (`tbb12.dll`, `tbbmalloc.dll`, `tbbmalloc_proxy.dll`, `tbbbind_2_5.dll`) have to sit in the same folder as that provider DLL. The installer maps `models/dinov2_vits14_reg.onnx` and `models/dinov2_vitb14_reg.onnx` into `models/` and `openvino/*.dll` into the same directory as the exe. DINOv2 loads `models/dinov2_vits14_reg.onnx` or `models/dinov2_vitb14_reg.onnx` from that directory, chosen by `dinoModel`. ORT 1.31 does not read `ORT_OPENVINO_DLL`. The current crate is the OpenVINO prebuilt only, so DirectML is not listed and a CUDA choice still opens the CPU session.
 
 ### UI structure (Svelte)
 - **Operator view** (`src/routes/+page.svelte` and related)  
@@ -144,7 +144,7 @@ Train several options, compare on validation set (especially close variants), pi
 yolo export model=best.pt format=onnx
 ```
 
-Copy the `.onnx` file into the app data models folder with Settings > Training > Update model. YOLO weight files stay out of git and out of the installer. `src-tauri/models/dinov2_vits14.onnx` is gitignored and is bundled when it is present at build time.
+Copy the `.onnx` file into the app data models folder with Settings > Training > Update model. YOLO weight files stay out of git and out of the installer. `src-tauri/models/dinov2_vits14_reg.onnx` and `src-tauri/models/dinov2_vitb14_reg.onnx` are gitignored and are the only DINOv2 files listed in the installer resources. The non-register `dinov2_vits14.onnx` is not bundled.
 
 **Phase 1 (done on this branch).** `.onnx` detection runs in Rust through ONNX Runtime (`detect_image`). The operator page calls that command when the active model name ends in `.onnx`. An empty model selection uses `best.onnx` when that file is present, then `best.pt`. The detection JSON is `{ detections: [{ ic, confidence, bbox }], classes }`. `detect_image` reads the latest raw frame and does not return `image_base64`. The page still draws the boxes.
 

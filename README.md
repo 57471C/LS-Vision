@@ -31,7 +31,7 @@ npm install
 npm run tauri dev
 ```
 
-In Settings > Training, use Update model to copy an `.onnx` file into the app data models folder. Dev and the installed app share that folder. YOLO weight files are not stored in git and are not bundled. The installer does bundle `models/dinov2_vits14.onnx` and the OpenVINO DLLs in the same directory as the exe when those files are present at build time. Both stay gitignored. Training and export happen offline. The app loads `.onnx` files only. See [docs/Training-and-Models.md](docs/Training-and-Models.md).
+In Settings > Training, use Update model to copy an `.onnx` file into the app data models folder. Dev and the installed app share that folder. YOLO weight files are not stored in git and are not bundled. The installer bundles `models/dinov2_vits14_reg.onnx` and `models/dinov2_vitb14_reg.onnx` into `models/` next to the exe, and the OpenVINO DLLs into the same directory as the exe, when those files are present at build time. The non-register `dinov2_vits14.onnx` is not bundled. Settings > Training chooses `dinoModel` (`s_reg` or `b_reg`, default `s_reg`). Both stay gitignored. Training and export happen offline. The app loads `.onnx` files only. See [docs/Training-and-Models.md](docs/Training-and-Models.md).
 
 ## Project status
 

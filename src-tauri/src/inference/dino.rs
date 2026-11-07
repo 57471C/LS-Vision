@@ -1,8 +1,9 @@
 //! DINOv2 embedding for catalogue matching.
 //!
 //! A crop is stretched to 224×224 with bilinear interpolation, packed as
-//! float32 NCHW, and ImageNet-normalised. The forward pass uses the session
-//! opened at startup from `dinov2_vits14.onnx`. The returned vector is L2
+//! float32 NCHW, and ImageNet-normalised. The forward pass uses the DINOv2
+//! session selected by `dinoModel`. Catalogue extract opens that file before
+//! it calls this path. The returned vector is L2
 //! normalised so a later cosine similarity is a dot product.
 //!
 //! The BoM reference file still letterboxes its crops. This path is only for
@@ -45,7 +46,8 @@ pub(crate) fn preprocess(rgb: &[u8], width: u32, height: u32) -> Result<Vec<f32>
     Ok(data)
 }
 
-/// Embed one RGB crop. The vector length is 1.
+/// Embed one RGB crop with the loaded DINOv2 session.
+/// The vector length is that model's CLS width.
 pub(crate) fn embed_rgb(rgb: &[u8], width: u32, height: u32) -> Result<Vec<f32>, String> {
     let data = preprocess(rgb, width, height)?;
     let values = dinov2::forward_nchw(data)?;

@@ -41,6 +41,7 @@
 	"detector": "auto",
 	"matchThreshold": 0.7,
 	"dinoTopN": 3,
+	"dinoModel": "s_reg",
 	"partRules": [],
 	"inferenceEp": "directml",
 	"useOpenVino": false,

@@ -133,6 +133,10 @@ let cropPrompt: { token: number; classes: CropClassPrompt[] } | null = null;
 let cropChoices: Record<string, CropLimitAction> = {};
 let cropBusy = false;
 let cropCancel: HTMLButtonElement | null = null;
+let extractIc = "";
+let extractDone = 0;
+let extractTotal = 0;
+let stopExtractListen: (() => void) | null = null;
 
 let toastText = "";
 let toastKind: "ok" | "neutral" | "error" = "ok";
@@ -164,6 +168,14 @@ let dinoTopText = String(DINO_TOP_DEFAULT);
 let dinoTopNotice = "";
 let dinoTopGeneration = 0;
 let dinoTopChain: Promise<void> = Promise.resolve();
+const DINO_MODEL_S = "s_reg";
+const DINO_MODEL_B = "b_reg";
+let dinoModel = DINO_MODEL_S;
+let dinoModelSaved = DINO_MODEL_S;
+let dinoEmbeddingsStale = false;
+let dinoModelNotice = "";
+let savingDinoModel = false;
+let dinoModelGeneration = 0;
 const DETECTOR_OPTIONS = [
 	{ value: "auto", label: "Auto" },
 	{ value: "yolo", label: "YOLO" },
@@ -644,6 +656,7 @@ async function loadModel() {
 	await loadModelsFolder();
 	await loadConfidence();
 	await loadMatchThreshold();
+	await loadDinoModel();
 }
 
 function clampConfidence(value: number): number {
@@ -781,6 +794,92 @@ function queueMatchSave() {
 function normalizeDetector(value: unknown): string {
 	if (value === "yolo" || value === "rf-detr") return value;
 	return "auto";
+}
+
+function normalizeDinoModel(value: unknown): string {
+	return value === DINO_MODEL_B ? DINO_MODEL_B : DINO_MODEL_S;
+}
+
+function dinoFileName(model: string): string {
+	return model === DINO_MODEL_B
+		? "dinov2_vitb14_reg.onnx"
+		: "dinov2_vits14_reg.onnx";
+}
+
+function dinoSavedText(
+	fileName: string,
+	stale: boolean,
+	sessionMessage: string,
+): string {
+	let text = `Saved. DINOv2 model is ${fileName}.`;
+	if (stale) {
+		text +=
+			" Catalogue embeddings are marked stale. The next extract uses this model.";
+	}
+	if (sessionMessage && !sessionMessage.includes("session is ready")) {
+		text += ` ${sessionMessage}`;
+	}
+	return text;
+}
+
+async function loadDinoModel() {
+	const generation = dinoModelGeneration;
+	try {
+		const data = await invokeRust<{
+			model?: unknown;
+			message?: unknown;
+			embeddingsStale?: unknown;
+			loaded?: unknown;
+		}>("dino_model_status");
+		if (generation !== dinoModelGeneration || savingDinoModel) return;
+		dinoModel = normalizeDinoModel(data.model);
+		dinoModelSaved = dinoModel;
+		dinoEmbeddingsStale = data.embeddingsStale === true;
+		if (
+			data.loaded === false &&
+			typeof data.message === "string" &&
+			data.message
+		) {
+			dinoModelNotice = data.message;
+		}
+	} catch (err: unknown) {
+		if (generation !== dinoModelGeneration) return;
+		dinoModelNotice = invokeError(err, "Could not load the DINOv2 model");
+	}
+}
+
+function onDinoModelChange() {
+	const choice = dinoModel;
+	const generation = ++dinoModelGeneration;
+	const previous = dinoModelSaved;
+	savingDinoModel = true;
+	dinoModelNotice = "";
+	void invokeRust<{
+		model?: unknown;
+		message?: unknown;
+		embeddingsStale?: unknown;
+	}>("set_dino_model", { model: choice })
+		.then((data) => {
+			if (generation !== dinoModelGeneration) return;
+			dinoModel = normalizeDinoModel(data.model);
+			dinoModelSaved = dinoModel;
+			dinoEmbeddingsStale = data.embeddingsStale === true;
+			const sessionMessage =
+				typeof data.message === "string" ? data.message : "";
+			dinoModelNotice = dinoSavedText(
+				dinoFileName(dinoModel),
+				dinoEmbeddingsStale,
+				sessionMessage,
+			);
+		})
+		.catch((err: unknown) => {
+			if (generation !== dinoModelGeneration) return;
+			dinoModel = previous;
+			dinoModelNotice = invokeError(err, "Could not save the DINOv2 model");
+		})
+		.finally(() => {
+			if (generation === dinoModelGeneration) savingDinoModel = false;
+		});
 }
 
 function detectorSaved(choice: string): string {
@@ -1326,6 +1425,60 @@ function readCropPrompt(
 	return { token, classes };
 }
 
+function readExtractEvent(
+	payload: unknown,
+): { ic: string; done: number; total: number } | null {
+	if (!payload || typeof payload !== "object") return null;
+	const record = payload as Record<string, unknown>;
+	const done = record.done;
+	const total = record.total;
+	const ic = typeof record.ic === "string" ? record.ic : "";
+	if (typeof done !== "number" || typeof total !== "number") return null;
+	if (!Number.isFinite(done) || !Number.isFinite(total) || total <= 0)
+		return null;
+	return { ic, done, total };
+}
+
+function extractPercent(): number {
+	if (extractTotal <= 0) return 0;
+	const ratio = extractDone / extractTotal;
+	if (!Number.isFinite(ratio)) return 0;
+	return Math.max(0, Math.min(100, Math.round(ratio * 100)));
+}
+
+function stopExtractEvents() {
+	const stop = stopExtractListen;
+	stopExtractListen = null;
+	stop?.();
+}
+
+async function withExtractProgress(work: () => Promise<void>): Promise<void> {
+	extractIc = "";
+	extractDone = 0;
+	extractTotal = 0;
+	stopExtractEvents();
+	try {
+		const { listen } = await import("@tauri-apps/api/event");
+		stopExtractListen = await listen("catalogue-extract", (event) => {
+			const row = readExtractEvent(event.payload);
+			if (!row) return;
+			extractIc = row.ic;
+			extractDone = row.done;
+			extractTotal = row.total;
+		});
+	} catch {
+		stopExtractListen = null;
+	}
+	try {
+		await work();
+	} finally {
+		stopExtractEvents();
+		extractIc = "";
+		extractDone = 0;
+		extractTotal = 0;
+	}
+}
+
 function applyCatalogueResult(data: Record<string, unknown>) {
 	const message =
 		typeof data.message === "string" && data.message
@@ -1346,25 +1499,51 @@ function applyCatalogueResult(data: Record<string, unknown>) {
 
 async function runCatalogueImport(replace: boolean) {
 	updatingReferences = true;
+	const outcome: {
+		data: Record<string, unknown> | null;
+		failed: string;
+	} = { data: null, failed: "" };
 	try {
-		const data = await invokeRust<Record<string, unknown>>("import_catalogue", {
-			replace,
+		await withExtractProgress(async () => {
+			try {
+				const result = await invokeRust<Record<string, unknown>>(
+					"import_catalogue",
+					{ replace },
+				);
+				if (!result || typeof result !== "object" || Array.isArray(result)) {
+					outcome.failed = "Could not update the catalogue";
+					return;
+				}
+				outcome.data = result;
+			} catch (err: unknown) {
+				outcome.failed = invokeError(err, "Could not update the catalogue");
+			}
 		});
-		if (!data || typeof data !== "object" || Array.isArray(data)) {
+		if (outcome.failed) {
+			showToast(outcome.failed, "error");
+			return;
+		}
+		const data = outcome.data;
+		if (!data) {
 			showToast("Could not update the catalogue", "error");
 			return;
 		}
+		const message = typeof data.message === "string" ? data.message : "";
 		const prompt = readCropPrompt(data);
 		if (prompt) {
-			cropChoices = {};
-			cropPrompt = prompt;
-			await tick();
-			cropCancel?.focus();
+			if (message.startsWith("Catalogue loaded ")) {
+				showToast(message, "ok");
+				cropChoices = {};
+				cropPrompt = prompt;
+				if (catalogueOpen) catalogueEpoch += 1;
+				await tick();
+				cropCancel?.focus();
+				return;
+			}
+			showToast(message || "Could not update the catalogue", "error");
 			return;
 		}
 		applyCatalogueResult(data);
-	} catch (err: unknown) {
-		showToast(invokeError(err, "Could not update the catalogue"), "error");
 	} finally {
 		updatingReferences = false;
 		if (!cropPrompt) replaceCatalogue = false;
@@ -2792,6 +2971,7 @@ onMount(() => {
 	previewChannel.onmessage = onPreviewMessage;
 	window.addEventListener("focus", onWindowFocus);
 	void loadInference();
+	void loadDinoModel();
 	if (!unlocked) {
 		void loadModel();
 		return;
@@ -2801,6 +2981,7 @@ onMount(() => {
 });
 
 onDestroy(() => {
+	stopExtractEvents();
 	cancelCameraApply();
 	cancelConfidenceSave();
 	if (toastTimer) clearTimeout(toastTimer);
@@ -4021,6 +4202,44 @@ onDestroy(() => {
 								<p class="text-sm text-neutral-200">{inferenceNotice}</p>
 							{/if}
 						</form>
+						<form
+							class="flex flex-col gap-4 border border-neutral-700 bg-neutral-900 p-4 xl:col-start-2"
+							on:submit|preventDefault={() => undefined}
+						>
+							<fieldset class="flex flex-col gap-3">
+								<legend class="text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+									DINOv2
+								</legend>
+								<p class="text-sm text-neutral-200">
+									Current model
+									<span class="font-mono text-neutral-100">{dinoFileName(dinoModel)}</span>
+								</p>
+								<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+									Model
+									<select
+										class="border border-neutral-600 bg-neutral-950 px-3 py-2 font-mono text-base font-medium normal-case tracking-normal text-neutral-100 disabled:text-neutral-500"
+										bind:value={dinoModel}
+										on:change={onDinoModelChange}
+										disabled={savingDinoModel}
+										aria-label="DINOv2 model"
+									>
+										<option value={DINO_MODEL_S}>dinov2_vits14_reg.onnx</option>
+										<option value={DINO_MODEL_B}>dinov2_vitb14_reg.onnx</option>
+									</select>
+								</label>
+								<p class="text-sm text-neutral-400">
+									ViT-S/14 reg is the default. A missing value uses that file. Changing the model reloads the matcher. Catalogue embeddings from the other model are marked stale, and the next extract replaces them. S vectors are 384 long and B vectors are 768 long.
+								</p>
+								{#if dinoEmbeddingsStale}
+									<p class="text-sm text-neutral-200">
+										Catalogue embeddings are marked stale. The next extract uses this model.
+									</p>
+								{/if}
+								{#if dinoModelNotice}
+									<p class="text-sm text-neutral-200">{dinoModelNotice}</p>
+								{/if}
+							</fieldset>
+						</form>
 					{:else if section === "parts"}
 						<h2 id="settings-section-heading" class="text-lg font-semibold tracking-tight xl:col-span-2">
 							Parts
@@ -4034,6 +4253,24 @@ onDestroy(() => {
 							>
 								{updatingReferences ? "Updating..." : "Update references"}
 							</button>
+							{#if extractTotal > 0}
+								<div class="w-full max-w-md">
+									<p class="text-sm text-neutral-200">
+										{extractIc ? `Extracting ${extractIc}` : "Extracting catalogue"}
+										({extractDone} / {extractTotal})
+									</p>
+									<div
+										class="mt-1 h-2 w-full bg-neutral-800"
+										role="progressbar"
+										aria-valuemin="0"
+										aria-valuemax={extractTotal}
+										aria-valuenow={extractDone}
+										aria-label="Catalogue extract"
+									>
+										<div class="h-2 bg-blue-500" style="width: {extractPercent()}%"></div>
+									</div>
+								</div>
+							{/if}
 							<label class="flex items-center gap-3 text-sm font-medium text-neutral-100">
 								<input
 									type="checkbox"
@@ -4052,7 +4289,7 @@ onDestroy(() => {
 								View references
 							</button>
 							<p class="text-sm text-neutral-400">
-								Opens a .tar catalogue. Each JPEG in crops/ is embedded with DINOv2 and saved on this PC. Item codes in the tar are added or updated. Parts and crops already on this PC are kept, including ones an admin added. Fully replace catalogue removes anything that is not in the tar, after a confirmation. If a class has more crops than its limit, that replace pauses so you can truncate the class or keep the higher count. The checkbox applies to the next import only and is not saved.
+								Opens a .tar catalogue. Each JPEG in crops/ is embedded with DINOv2 and saved on this PC. Item codes in the tar are added or updated. Parts and crops already on this PC are kept, including ones an admin added. Fully replace catalogue removes anything that is not in the tar, after a confirmation. The page shows which item code is being extracted and how many crops are done. If a class has more crops than its limit, that list appears after catalogue.json has been written. Truncate removes the extra crops. Keep all raises the limit. A failed write shows the error and does not offer that choice. The checkbox applies to the next import only and is not saved.
 							</p>
 						</div>
 						<h3 class="text-base font-semibold tracking-tight xl:col-span-2">Part rules</h3>
@@ -4502,7 +4739,7 @@ onDestroy(() => {
 				Crops over the limit
 			</h2>
 			<p class="mt-2 text-sm text-neutral-200">
-				These classes have more crops than their limit. Truncate keeps the most recent crops, or a sample when the archive has no dates. Keep all raises the limit for that class. The catalogue stays as it is until you continue.
+				These classes have more crops than their limit. The catalogue is already saved. Truncate removes the extra crops, keeping the most recent, or a sample when the archive has no dates. Keep all raises the limit for that class. Cancel leaves this catalogue in place.
 			</p>
 			<div class="mt-3 flex flex-wrap gap-2">
 				<button
@@ -4590,7 +4827,7 @@ onDestroy(() => {
 					on:click={confirmCropLimits}
 					disabled={cropBusy || !choicesReady}
 				>
-					{cropBusy ? "Importing..." : "Continue"}
+					{cropBusy ? "Saving..." : "Continue"}
 				</button>
 			</div>
 		</div>

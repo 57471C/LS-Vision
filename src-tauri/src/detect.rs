@@ -3277,9 +3277,9 @@ mod tests {
         let root = manifest.parent().expect("project root");
         let model = root.join("vision").join("models").join("best.onnx");
         let image = root.join("vision").join("test-images").join("Example3.jpg");
-        let dino = manifest.join("models").join("dinov2_vits14.onnx");
+        let dino = manifest.join("models").join("dinov2_vits14_reg.onnx");
         if !model.is_file() || !image.is_file() || !dino.is_file() {
-            eprintln!("skip: best.onnx, Example3.jpg, or dinov2_vits14.onnx is missing");
+            eprintln!("skip: best.onnx, Example3.jpg, or dinov2_vits14_reg.onnx is missing");
             return;
         }
         crate::dinov2::load_at(&dino);
@@ -3361,9 +3361,9 @@ mod tests {
         let root = manifest.parent().expect("project root");
         let model = root.join("vision").join("models").join("best.onnx");
         let image = root.join("vision").join("test-images").join("Example3.jpg");
-        let dino = manifest.join("models").join("dinov2_vits14.onnx");
+        let dino = manifest.join("models").join("dinov2_vits14_reg.onnx");
         if !model.is_file() || !image.is_file() || !dino.is_file() {
-            eprintln!("skip: best.onnx, Example3.jpg, or dinov2_vits14.onnx is missing");
+            eprintln!("skip: best.onnx, Example3.jpg, or dinov2_vits14_reg.onnx is missing");
             return;
         }
         crate::dinov2::load_at(&dino);

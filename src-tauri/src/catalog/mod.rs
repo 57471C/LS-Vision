@@ -1,9 +1,9 @@
 //! In-memory catalogue used to name a YOLO box.
 //!
-//! Startup reads `vision/catalogue.json` into Tauri state. Each stored
-//! embedding is scaled to unit length. A missing or empty file logs a warning
-//! and leaves the list empty. Matching does not write the file and does not
-//! change its schema.
+//! Startup reads the DINOv2 catalogue from the results database into Tauri
+//! state. Each stored embedding is scaled to unit length. A missing or empty
+//! catalogue logs a warning and leaves the list empty. Matching reads only
+//! the rows for the loaded model and does not write the database.
 //!
 //! A box is given as fractions of the frame. Those fractions become pixels,
 //! then each edge is clamped to the frame. The crop is embedded with DINOv2
@@ -12,9 +12,12 @@
 //! catalogue, is "No Match".
 
 use std::collections::HashMap;
+#[cfg(test)]
 use std::fs;
+#[cfg(test)]
 use std::io;
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -32,6 +35,7 @@ pub(crate) use matcher::{
 /// A score below this is not a named part.
 pub(crate) const MATCH_THRESHOLD: f32 = 0.50;
 const RUNNERS_UP: usize = 3;
+#[cfg(test)]
 const CATALOGUE_VERSION: u32 = 1;
 
 /// One catalogue crop after its embedding has been L2-normalised.
@@ -75,7 +79,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 impl CatalogStore {
-    /// Read the catalogue beside `vision/config.local.json`.
+    /// Read the catalogue from the results database.
     pub fn open() -> Self {
         let store = Self::from_entries(read_installed_file());
         *lock(&INSTALLED) = Some(store.clone());
@@ -118,24 +122,26 @@ pub(crate) fn reload_installed() {
     store.replace(read_installed_file());
 }
 
-fn catalogue_file() -> Result<PathBuf, String> {
-    Ok(crate::local_config::project_root()?
-        .join("vision")
-        .join("catalogue.json"))
-}
-
 fn read_installed_file() -> Vec<CatalogEntry> {
-    match catalogue_file() {
-        Ok(path) => read_catalogue(&path),
-        Err(err) => {
-            eprintln!("warning: {err} Catalogue matching has no parts.");
-            Vec::new()
-        }
-    }
+    crate::catalogue::matching_entries(&crate::dinov2::selected_model_id())
 }
 
 /// Parse one catalogue file. A missing, empty, or unreadable file is an empty list.
+/// Embeddings are returned even when they were extracted with another model.
+/// Matching uses [`read_catalogue_for_model`] so those vectors are left out.
+#[cfg(test)]
 pub(crate) fn read_catalogue(path: &Path) -> Vec<CatalogEntry> {
+    read_catalogue_filtered(path, None)
+}
+
+/// Parse one catalogue file and omit vectors from another DINOv2 model.
+#[cfg(test)]
+pub(crate) fn read_catalogue_for_model(path: &Path, active: &str) -> Vec<CatalogEntry> {
+    read_catalogue_filtered(path, Some(active))
+}
+
+#[cfg(test)]
+fn read_catalogue_filtered(path: &Path, active: Option<&str>) -> Vec<CatalogEntry> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
@@ -177,6 +183,24 @@ pub(crate) fn read_catalogue(path: &Path) -> Vec<CatalogEntry> {
         );
         return Vec::new();
     }
+    if let Some(active) = active {
+        let has_vectors = file
+            .parts
+            .iter()
+            .any(|part| part.embeddings.iter().any(|values| !values.is_empty()));
+        if !crate::catalogue::embeddings_usable(
+            file.embedding_model.as_deref(),
+            file.embeddings_stale,
+            has_vectors,
+            active,
+        ) {
+            eprintln!(
+                "warning: catalogue embeddings at {} do not match DINOv2 model {active}. Matching skips them until the next extract.",
+                path.display()
+            );
+            return Vec::new();
+        }
+    }
     let entries = entries_from_parts(file.parts);
     if entries.is_empty() {
         eprintln!(
@@ -187,6 +211,7 @@ pub(crate) fn read_catalogue(path: &Path) -> Vec<CatalogEntry> {
     entries
 }
 
+#[cfg(test)]
 fn entries_from_parts(parts: Vec<StoredPart>) -> Vec<CatalogEntry> {
     let mut entries = Vec::new();
     for part in parts {
@@ -209,18 +234,25 @@ fn entries_from_parts(parts: Vec<StoredPart>) -> Vec<CatalogEntry> {
     entries
 }
 
+#[cfg(test)]
 fn unit_embedding(values: &[f32]) -> Option<Vec<f32>> {
     dino::l2_normalize(values).ok()
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 struct StoredFile {
     #[serde(default)]
     version: Option<u32>,
+    #[serde(default, rename = "embeddingModel")]
+    embedding_model: Option<String>,
+    #[serde(default, rename = "embeddingsStale")]
+    embeddings_stale: bool,
     #[serde(default)]
     parts: Vec<StoredPart>,
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 struct StoredPart {
     #[serde(default)]
@@ -614,6 +646,52 @@ mod tests {
     }
 
     #[test]
+    fn embeddings_from_another_model_are_left_out_of_matching() {
+        let path = std::env::temp_dir().join(format!(
+            "ls-vision-catalogue-model-{}.json",
+            std::process::id()
+        ));
+        let body = r#"{
+            "version": 1,
+            "embeddingModel": "s_reg",
+            "parts": [{
+                "ic": "FAST-1",
+                "description": "Bolt",
+                "type": "bolt",
+                "embeddings": [[1.0, 0.0]]
+            }]
+        }"#;
+        fs::write(&path, body).unwrap();
+        assert_eq!(read_catalogue_for_model(&path, "s_reg").len(), 1);
+        assert!(read_catalogue_for_model(&path, "b_reg").is_empty());
+        assert_eq!(read_catalogue(&path).len(), 1);
+
+        let stale = body.replace(
+            "\"embeddingModel\": \"s_reg\"",
+            "\"embeddingModel\": \"s_reg\", \"embeddingsStale\": true",
+        );
+        fs::write(&path, stale).unwrap();
+        assert!(read_catalogue_for_model(&path, "s_reg").is_empty());
+
+        fs::write(
+            &path,
+            r#"{
+                "version": 1,
+                "parts": [{
+                    "ic": "OLD-1",
+                    "description": "Washer",
+                    "type": "washer",
+                    "embeddings": [[1.0, 0.0]]
+                }]
+            }"#,
+        )
+        .unwrap();
+        assert!(read_catalogue_for_model(&path, "s_reg").is_empty());
+        assert_eq!(read_catalogue(&path).len(), 1);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
     fn an_empty_catalogue_is_no_match_without_inference() {
         let rgb = [255u8, 0, 0];
         let matched = match_hierarchy(&[], &rgb, 1, 1, &[[-5, -5, 9, 9]], None, 0.70, false, 3);
@@ -722,7 +800,7 @@ mod tests {
     #[test]
     fn a_known_part_snapshot_scores_above_0_80() {
         let _hold = crate::dinov2::lock_for_test();
-        let model = crate::dinov2::model_path();
+        let model = crate::dinov2::model_file_path(crate::dinov2::model_file_name("s_reg"));
         if !model.is_file() {
             eprintln!("skip: dinov2 model is missing");
             return;

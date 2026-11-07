@@ -1,3 +1,4 @@
+mod app_db;
 mod barcode;
 mod bom;
 mod bom_sql;
@@ -34,7 +35,7 @@ pub fn run() {
             // Optional. A missing file logs a warning and leaves YOLO detection alone.
             dinov2::load_on_startup();
             catalogue::load_on_startup();
-            // A missing catalogue.json warns and leaves the match list empty.
+            // A missing catalogue warns and leaves the match list empty.
             app.manage(catalog::CatalogStore::open());
             Ok(())
         })
@@ -69,6 +70,8 @@ pub fn run() {
             detect::benchmark_detect,
             detect::model_class_names,
             dinov2::dinov2_status,
+            dinov2::dino_model_status,
+            dinov2::set_dino_model,
             catalogue::import_catalogue,
             catalogue::finish_catalogue_replace,
             catalogue::cancel_catalogue_replace,

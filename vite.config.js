@@ -29,10 +29,13 @@ export default defineConfig(() => ({
 		watch: {
 			// 3. tell Vite to ignore watching `src-tauri`
 			// Settings writes vision/config.local.json. A watched change reloads the page.
+			// The results database is written beside the project. Ignore leftover crop folders too.
 			ignored: [
 				"**/src-tauri/**",
 				"**/vision/config.local.json",
 				"**/vision/bom-source.json",
+				"**/catalogue-crops/**",
+				"**/results.sqlite*",
 			],
 		},
 	},
