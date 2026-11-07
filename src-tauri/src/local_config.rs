@@ -201,6 +201,7 @@ fn default_config() -> Value {
         },
         "scanSeconds": 8,
         "barcodeScanDisabled": false,
+        "motionDelayMs": 400,
         "testMode": false,
         "skipResultSave": true,
         "metrology": {
@@ -867,6 +868,7 @@ mod tests {
         assert_eq!(document["trainingImageName"], "");
         assert_eq!(document["scanSeconds"], 8);
         assert_eq!(document["barcodeScanDisabled"], false);
+        assert_eq!(document["motionDelayMs"], 400);
         assert!(!config_file(project.root()).exists());
     }
 

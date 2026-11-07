@@ -11,6 +11,8 @@ import {
 	type TwoPassMatch,
 } from "$lib/catalog-match";
 // biome-ignore lint/correctness/noUnusedImports: the template uses this component
+import DetectingOverlay from "$lib/DetectingOverlay.svelte";
+// biome-ignore lint/correctness/noUnusedImports: the template uses this component
 import DimensionMarks from "$lib/DimensionMarks.svelte";
 import { type DetectRoi, overlayDetections, slotColor } from "$lib/detect-rois";
 // biome-ignore lint/correctness/noUnusedImports: the template uses this component
@@ -27,16 +29,17 @@ import {
 import {
 	type DimensionMark,
 	layoutDimensions,
+	metrologyReadout,
 	metrologySpans,
 	mismatchNote,
 	readMetrologyResult,
 } from "$lib/metrology";
+import { type Residual, residualStyle } from "$lib/operator/residual";
 import {
 	detectionCounts,
 	extraPartCount,
 	hasUnexpected,
 } from "$lib/operator/verdict";
-import DetectingOverlay from "$lib/DetectingOverlay.svelte";
 import { useOperator } from "$lib/stores/operator";
 
 const PREVIEW_CHANNEL = "ls-vision-camera-preview";
@@ -72,6 +75,7 @@ type Detection = {
 	catalogMatch?: CatalogMatch;
 	twoPass?: TwoPassMatch;
 	metrology?: unknown;
+	residual?: Residual;
 };
 
 type DetectionMark = {
@@ -97,6 +101,9 @@ type DetectionMark = {
 	noteY: number;
 	noteW: number;
 	noteH: number;
+	noteFill: string;
+	noteKind: string;
+	residual: string;
 	dimensions: DimensionMark[];
 };
 
@@ -145,6 +152,7 @@ function detectionMarks(
 	} | null,
 	bomParts: { ic: string }[] | null,
 	admin: boolean,
+	hoverKey: string,
 ): DetectionMark[] {
 	// Positions are CSS pixels of the still. The viewBox matches that size,
 	// so the stroke and the label font do not grow when the still is scaled.
@@ -191,8 +199,10 @@ function detectionMarks(
 		const w = (x2 - x1) * scale;
 		const h = (y2 - y1) * scale;
 		const pass = item.consumed ? undefined : item.twoPass;
-		const style = pass ? badgeStyle(pass) : null;
+		const residual = item.consumed ? null : residualStyle(item);
+		const style = residual ?? (pass ? badgeStyle(pass) : null);
 		const label = style?.label ?? overlayLabel(item.catalogMatch, item.ic);
+		const key = `${item.slot ?? 0}:${index}:${item.ic}:${x1}:${y1}`;
 		const labelW =
 			Math.ceil(label.length * LABEL_FONT * 0.62) + LABEL_PAD_X * 2;
 		const labelH = LABEL_FONT + LABEL_PAD_Y * 2;
@@ -203,7 +213,15 @@ function detectionMarks(
 			labelX = Math.max(originX, imageRight - labelW);
 		if (labelY + labelH > imageBottom)
 			labelY = Math.max(originY, imageBottom - labelH);
-		const note = item.consumed ? "" : mismatchNote(item.metrology);
+		const mismatch =
+			item.consumed || item.residual === "near_miss"
+				? ""
+				: mismatchNote(item.metrology);
+		const hover =
+			!item.consumed && !mismatch && hoverKey === key
+				? metrologyReadout(item.metrology)
+				: "";
+		const note = mismatch || hover;
 		const noteW = note
 			? Math.ceil(note.length * LABEL_FONT * 0.62) + LABEL_PAD_X * 2
 			: 0;
@@ -244,7 +262,7 @@ function detectionMarks(
 		);
 		const tint = item.slot ? slotColor(item.slot).stroke : "";
 		marks.push({
-			key: `${item.slot ?? 0}:${index}:${item.ic}:${x1}:${y1}`,
+			key,
 			ic: item.ic,
 			label,
 			color: style?.color || tint || colorForIc(item.ic),
@@ -271,6 +289,9 @@ function detectionMarks(
 			noteY,
 			noteW,
 			noteH,
+			noteFill: mismatch ? "#dc2626" : "#171717",
+			noteKind: mismatch ? "DIMENSION_MISMATCH" : hover ? "hover" : "",
+			residual: item.residual ?? "",
 			dimensions,
 		});
 	}
@@ -414,6 +435,74 @@ $: draftStyle = $operator.draftMark
 		};box-shadow:0 0 0 1px #0a0a0a;`
 	: "";
 $: bannerCount = (wrongParts ? 1 : 0) + (extraParts > 0 ? 1 : 0);
+
+let hoveredKey = "";
+let hoverSnapshot = "";
+
+$: snapshotMarks = detectionMarks(
+	$operator.snapshot,
+	$operator.paneWidth,
+	$operator.paneHeight,
+	$operator.frameWidth,
+	$operator.frameHeight,
+	overlayBoxes,
+	$zoom,
+	$operator.bom?.parts ?? null,
+	$operator.admin,
+	hoveredKey,
+);
+
+$: {
+	const token = $operator.snapshot?.takenAt ?? "";
+	if (token !== hoverSnapshot) {
+		hoverSnapshot = token;
+		hoveredKey = "";
+	}
+}
+
+function overlayPoint(event: PointerEvent): { x: number; y: number } | null {
+	const overlay = refs.paneFrame?.querySelector("[data-detection-overlay]");
+	if (!(overlay instanceof SVGSVGElement)) return null;
+	const rect = overlay.getBoundingClientRect();
+	const width = overlay.viewBox.baseVal.width || overlay.width.baseVal.value;
+	const height = overlay.viewBox.baseVal.height || overlay.height.baseVal.value;
+	if (rect.width < 1 || rect.height < 1 || width < 1 || height < 1) return null;
+	return {
+		x: ((event.clientX - rect.left) / rect.width) * width,
+		y: ((event.clientY - rect.top) / rect.height) * height,
+	};
+}
+
+function onSnapshotPointerMove(event: PointerEvent) {
+	if (!$operator.snapshot) {
+		hoveredKey = "";
+		return;
+	}
+	const point = overlayPoint(event);
+	if (!point) {
+		hoveredKey = "";
+		return;
+	}
+	let found = "";
+	for (let index = snapshotMarks.length - 1; index >= 0; index -= 1) {
+		const mark = snapshotMarks[index];
+		if (mark.child) continue;
+		if (
+			point.x >= mark.x &&
+			point.x <= mark.x + mark.w &&
+			point.y >= mark.y &&
+			point.y <= mark.y + mark.h
+		) {
+			found = mark.key;
+			break;
+		}
+	}
+	if (found !== hoveredKey) hoveredKey = found;
+}
+
+function onSnapshotPointerLeave() {
+	hoveredKey = "";
+}
 </script>
 
 <section class="flex min-h-0 min-w-0 flex-col overflow-hidden border border-neutral-700 bg-black">
@@ -470,7 +559,12 @@ $: bannerCount = (wrongParts ? 1 : 0) + (extraParts > 0 ? 1 : 0);
 			<p class="text-xs text-amber-200">Automatic stream is stopped</p>
 		{/if}
 	</div>
-	<div bind:this={refs.paneFrame} class="relative min-h-0 flex-1 overflow-hidden">
+	<div
+		bind:this={refs.paneFrame}
+		class="relative min-h-0 flex-1 overflow-hidden"
+		on:pointermove={onSnapshotPointerMove}
+		on:pointerleave={onSnapshotPointerLeave}
+	>
 		{#if $operator.snapshot || ($operator.feedOn && $cameraFeedOn)}
 			<div
 				class="absolute {$zoom ? '' : 'inset-0'}"
@@ -594,19 +688,19 @@ $: bannerCount = (wrongParts ? 1 : 0) + (extraParts > 0 ? 1 : 0);
 					{/if}
 				{/if}
 				{#if $operator.snapshot && $operator.paneWidth > 0 && $operator.paneHeight > 0 && overlayBoxes.length > 0}
-					{@const marks = detectionMarks($operator.snapshot, $operator.paneWidth, $operator.paneHeight, $operator.frameWidth, $operator.frameHeight, overlayBoxes, $zoom, $operator.bom?.parts ?? null, $operator.admin)}
 					{@const viewW = $zoom ? $zoom.width : $operator.frameWidth}
 					{@const viewH = $zoom ? $zoom.height : $operator.frameHeight}
-					{#if marks.length > 0 && viewW > 0 && viewH > 0}
+					{#if snapshotMarks.length > 0 && viewW > 0 && viewH > 0}
 						<svg
 							class="pointer-events-none absolute left-0 top-0 z-10"
+							data-detection-overlay
 							width={viewW}
 							height={viewH}
 							viewBox="0 0 {viewW} {viewH}"
 							preserveAspectRatio="none"
 							aria-hidden="true"
 						>
-							{#each marks as mark (mark.key)}
+							{#each snapshotMarks as mark (mark.key)}
 								{#if mark.child}
 									<rect
 										x={mark.x}
@@ -659,6 +753,7 @@ $: bannerCount = (wrongParts ? 1 : 0) + (extraParts > 0 ? 1 : 0);
 											stroke={mark.color}
 											stroke-width={BOX_STROKE}
 											stroke-dasharray={mark.dashed ? "8 5" : undefined}
+											data-residual={mark.residual || undefined}
 										/>
 									{/if}
 									<rect
@@ -685,8 +780,8 @@ $: bannerCount = (wrongParts ? 1 : 0) + (extraParts > 0 ? 1 : 0);
 											y={mark.noteY}
 											width={mark.noteW}
 											height={mark.noteH}
-											fill="#dc2626"
-											data-metrology="DIMENSION_MISMATCH"
+											fill={mark.noteFill}
+											data-metrology={mark.noteKind}
 										/>
 										<text
 											x={mark.noteX + LABEL_PAD_X}

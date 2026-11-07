@@ -24,12 +24,19 @@ import {
 	withAllSlotsDisabled,
 	withSlotEnabled,
 } from "$lib/detect-rois";
-import { readMetrologyResult, scaleMetrology } from "$lib/metrology";
+import {
+	METROLOGY_DEFAULTS,
+	readMetrology,
+	readMetrologyResult,
+	scaleMetrology,
+} from "$lib/metrology";
 import {
 	appendConsoleLine,
 	consoleStamp,
 	isCameraOpenError,
 } from "$lib/operator/console";
+import { readMotionDelayMs } from "$lib/operator/motion-delay";
+import { assignResiduals } from "$lib/operator/residual";
 import { detectionCounts, inspectionVerdict } from "$lib/operator/verdict";
 import { applyPartRules, parsePartRules } from "$lib/part-composition";
 import {
@@ -715,6 +722,54 @@ function attachSession(
 		};
 	}
 
+	async function motionDelay(): Promise<number> {
+		try {
+			const config = await readConfig();
+			return readMotionDelayMs(config.motionDelayMs);
+		} catch {
+			return readMotionDelayMs(undefined);
+		}
+	}
+
+	// The still is already frozen. This only waits before detect_image.
+	// Resume during the wait bumps detectGeneration and the detect is skipped.
+	async function settleBeforeDetect(generation: number): Promise<boolean> {
+		const delay = await motionDelay();
+		if (!pageAlive || generation !== detectGeneration) return false;
+		if (delay <= 0) return true;
+		op.detectState = "running";
+		await new Promise((resolve) => {
+			setTimeout(resolve, delay);
+		});
+		return pageAlive && generation === detectGeneration;
+	}
+
+	async function detectAfterSettle(generation: number | null) {
+		let token = generation;
+		if (token === null) {
+			detectGeneration += 1;
+			token = detectGeneration;
+		}
+		if (!(await settleBeforeDetect(token))) return;
+		void runDetect(token);
+	}
+
+	async function residualTolerances() {
+		try {
+			const config = await readConfig();
+			const settings = readMetrology(config.metrology);
+			return {
+				lengthMm: settings.lengthToleranceMm,
+				diameterMm: settings.diameterToleranceMm,
+			};
+		} catch {
+			return {
+				lengthMm: METROLOGY_DEFAULTS.lengthToleranceMm,
+				diameterMm: METROLOGY_DEFAULTS.diameterToleranceMm,
+			};
+		}
+	}
+
 	async function runDetect(
 		generation: number,
 		image?: string,
@@ -733,6 +788,9 @@ function attachSession(
 		try {
 			const payload = await requestDetections(image, captureReferences);
 			if (generation !== detectGeneration || !pageAlive) return;
+			const tolerances = await residualTolerances();
+			const bomParts = op.bom?.parts ?? [];
+			if (generation !== detectGeneration || !pageAlive) return;
 			if (Array.isArray(payload)) {
 				const parsed: { slot: number; detections: Detection[] }[] = [];
 				const flat: Detection[] = [];
@@ -749,8 +807,13 @@ function attachSession(
 						modelClassList(entry.classes),
 					);
 					if (generation !== detectGeneration || !pageAlive) return;
-					parsed.push({ slot, detections: composed.detections });
-					flat.push(...composed.detections);
+					const tagged = assignResiduals(
+						composed.detections,
+						bomParts,
+						tolerances,
+					);
+					parsed.push({ slot, detections: tagged });
+					flat.push(...tagged);
 					if (composed.checked) {
 						checked = true;
 						skipped += composed.skipped;
@@ -777,7 +840,11 @@ function attachSession(
 				);
 				if (generation !== detectGeneration || !pageAlive) return;
 				op.slotResults = [];
-				op.detections = composed.detections;
+				op.detections = assignResiduals(
+					composed.detections,
+					bomParts,
+					tolerances,
+				);
 				if (composed.checked) op.partRuleWarning = composed.skipped > 0;
 				noteDetectMessage(
 					typeof payload.message === "string" ? payload.message : "",
@@ -1197,12 +1264,7 @@ function attachSession(
 			storeBom(view);
 			await yieldToPaint();
 			const generation = holdPreviewStill(kitCode);
-			if (generation === null) {
-				detectGeneration += 1;
-				void runDetect(detectGeneration);
-			} else {
-				void runDetect(generation);
-			}
+			await detectAfterSettle(generation);
 		} catch {
 			// A missed poll leaves the last still and the last BoM result.
 		} finally {
@@ -1216,6 +1278,8 @@ function attachSession(
 		barcodeScanDisabled?: unknown;
 		testMode?: unknown;
 		skipResultSave?: unknown;
+		motionDelayMs?: unknown;
+		metrology?: unknown;
 		detectRoi?: unknown;
 		detectRois?: unknown;
 		partRules?: unknown;
@@ -2405,12 +2469,7 @@ function attachSession(
 				storeBom(view);
 				await yieldToPaint();
 				const generation = holdPreviewStill(kitCode);
-				if (generation === null) {
-					detectGeneration += 1;
-					void runDetect(detectGeneration);
-				} else {
-					void runDetect(generation);
-				}
+				await detectAfterSettle(generation);
 			} else {
 				op.barcode = code;
 				dropBom();

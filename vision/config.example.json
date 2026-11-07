@@ -21,6 +21,7 @@
 	},
 	"scanSeconds": 8,
 	"barcodeScanDisabled": false,
+	"motionDelayMs": 400,
 	"testMode": false,
 	"skipResultSave": true,
 	"metrology": {

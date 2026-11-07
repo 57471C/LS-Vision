@@ -27,6 +27,7 @@ import {
 	DINO_TOP_MIN,
 } from "$lib/dino-feedback";
 import { metrologyDocument, readMetrology } from "$lib/metrology";
+import { readMotionDelayMs } from "$lib/operator/motion-delay";
 import {
 	PART_LABEL_LIMIT,
 	PART_RULE_LIMIT,
@@ -74,6 +75,7 @@ let erpNotice = "";
 let savingErp = false;
 let scanSeconds = 8;
 let barcodeScanDisabled = false;
+let motionDelayMs = 400;
 let scanNotice = "";
 let savingScan = false;
 let testMode = false;
@@ -1465,6 +1467,7 @@ async function loadScan() {
 		const seconds = Number(data.scanSeconds);
 		if (Number.isInteger(seconds)) scanSeconds = seconds;
 		barcodeScanDisabled = data.barcodeScanDisabled === true;
+		motionDelayMs = readMotionDelayMs(data.motionDelayMs);
 	} catch (err: unknown) {
 		scanNotice = invokeError(err, "Could not load the scan interval");
 	}
@@ -1610,15 +1613,23 @@ async function saveScan() {
 		savingScan = false;
 		return;
 	}
+	const delay = Number(motionDelayMs);
+	if (!Number.isInteger(delay) || delay < 0 || delay > 2000) {
+		scanNotice = "Enter a whole number of milliseconds from 0 to 2000.";
+		savingScan = false;
+		return;
+	}
 	const disabled = barcodeScanDisabled;
 	try {
 		const current = await loadDocument();
 		current.scanSeconds = seconds;
 		current.barcodeScanDisabled = disabled;
+		current.motionDelayMs = delay;
 		const saved = await storeDocument(current);
 		const stored = Number(saved.scanSeconds);
 		if (Number.isInteger(stored)) scanSeconds = stored;
 		barcodeScanDisabled = saved.barcodeScanDisabled === true;
+		motionDelayMs = readMotionDelayMs(saved.motionDelayMs);
 		scanNotice = "Saved";
 	} catch (err: unknown) {
 		scanNotice = invokeError(err, "Could not save the scan interval");
@@ -3349,6 +3360,18 @@ onDestroy(() => {
 										required
 									/>
 								</label>
+								<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+									Motion delay (ms)
+									<input
+										type="number"
+										class="w-28 border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
+										bind:value={motionDelayMs}
+										min="0"
+										max="2000"
+										step="1"
+										required
+									/>
+								</label>
 								<label class="flex items-center gap-3 text-sm font-medium text-neutral-100">
 									<input
 										type="checkbox"
@@ -3361,6 +3384,7 @@ onDestroy(() => {
 								<p class="text-sm text-neutral-400">
 									How often the live feed checks for a barcode. The default is 8 seconds.
 									Disable stops the camera barcode read. The operator page then focuses the job card field so a code can be typed.
+									Motion delay is how long detection waits after a barcode is accepted. The default is 400. The frozen frame stays as it is.
 								</p>
 							</fieldset>
 							<button
