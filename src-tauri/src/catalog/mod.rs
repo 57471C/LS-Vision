@@ -1,9 +1,9 @@
 //! In-memory catalogue used to name a YOLO box.
 //!
-//! Startup reads `vision/catalogue.json` into Tauri state. Each stored
-//! embedding is scaled to unit length. A missing or empty file logs a warning
-//! and leaves the list empty. Matching does not write the file and does not
-//! change its schema.
+//! Startup reads the DINOv2 catalogue from the results database into Tauri
+//! state. Each stored embedding is scaled to unit length. A missing or empty
+//! catalogue logs a warning and leaves the list empty. Matching reads only
+//! the rows for the loaded model and does not write the database.
 //!
 //! A box is given as fractions of the frame. Those fractions become pixels,
 //! then each edge is clamped to the frame. The crop is embedded with DINOv2
@@ -12,9 +12,12 @@
 //! catalogue, is "No Match".
 
 use std::collections::HashMap;
+#[cfg(test)]
 use std::fs;
+#[cfg(test)]
 use std::io;
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -32,6 +35,7 @@ pub(crate) use matcher::{
 /// A score below this is not a named part.
 pub(crate) const MATCH_THRESHOLD: f32 = 0.50;
 const RUNNERS_UP: usize = 3;
+#[cfg(test)]
 const CATALOGUE_VERSION: u32 = 1;
 
 /// One catalogue crop after its embedding has been L2-normalised.
@@ -75,7 +79,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 impl CatalogStore {
-    /// Read the catalogue beside `vision/config.local.json`.
+    /// Read the catalogue from the results database.
     pub fn open() -> Self {
         let store = Self::from_entries(read_installed_file());
         *lock(&INSTALLED) = Some(store.clone());
@@ -118,32 +122,8 @@ pub(crate) fn reload_installed() {
     store.replace(read_installed_file());
 }
 
-fn catalogue_file() -> Result<PathBuf, String> {
-    Ok(crate::local_config::project_root()?
-        .join("vision")
-        .join("catalogue.json"))
-}
-
 fn read_installed_file() -> Vec<CatalogEntry> {
-    let active = crate::dinov2::selected_model_id();
-    let path = match catalogue_file() {
-        Ok(path) => path,
-        Err(err) => {
-            eprintln!("warning: {err} Catalogue matching has no parts.");
-            return Vec::new();
-        }
-    };
-    let entries = read_catalogue_for_model(&path, &active);
-    if let Some(width) = crate::dinov2::loaded_cls_width() {
-        if entries.iter().any(|entry| entry.embedding.len() != width) {
-            eprintln!(
-                "warning: catalogue embeddings at {} do not match DINOv2 model {active}. Matching skips them until the next extract.",
-                path.display()
-            );
-            return Vec::new();
-        }
-    }
-    entries
+    crate::catalogue::matching_entries(&crate::dinov2::selected_model_id())
 }
 
 /// Parse one catalogue file. A missing, empty, or unreadable file is an empty list.
@@ -155,10 +135,12 @@ pub(crate) fn read_catalogue(path: &Path) -> Vec<CatalogEntry> {
 }
 
 /// Parse one catalogue file and omit vectors from another DINOv2 model.
+#[cfg(test)]
 pub(crate) fn read_catalogue_for_model(path: &Path, active: &str) -> Vec<CatalogEntry> {
     read_catalogue_filtered(path, Some(active))
 }
 
+#[cfg(test)]
 fn read_catalogue_filtered(path: &Path, active: Option<&str>) -> Vec<CatalogEntry> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
@@ -229,6 +211,7 @@ fn read_catalogue_filtered(path: &Path, active: Option<&str>) -> Vec<CatalogEntr
     entries
 }
 
+#[cfg(test)]
 fn entries_from_parts(parts: Vec<StoredPart>) -> Vec<CatalogEntry> {
     let mut entries = Vec::new();
     for part in parts {
@@ -251,10 +234,12 @@ fn entries_from_parts(parts: Vec<StoredPart>) -> Vec<CatalogEntry> {
     entries
 }
 
+#[cfg(test)]
 fn unit_embedding(values: &[f32]) -> Option<Vec<f32>> {
     dino::l2_normalize(values).ok()
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 struct StoredFile {
     #[serde(default)]
@@ -267,6 +252,7 @@ struct StoredFile {
     parts: Vec<StoredPart>,
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 struct StoredPart {
     #[serde(default)]

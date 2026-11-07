@@ -4,14 +4,15 @@
 //! `catalogue.json` and JPEG crops under `crops/`. Each crop is embedded with
 //! the DINOv2 session for the current `dinoModel`. The extract opens that ONNX
 //! file and writes vectors of its CLS length. A model change marks stored
-//! vectors stale. The next extract replaces them, so embeddings from ViT-S and
-//! ViT-B are not stored together. The result is written to
-//! `vision/catalogue.json`, beside `vision/config.local.json`, and the JPEGs
-//! are copied under `vision/catalogue-crops/`. Startup loads that file.
+//! vectors stale. The next extract writes that model's rows. The matcher reads
+//! only the model it loaded, so ViT-S and ViT-B vectors are not mixed.
+//! Embeddings go into the `dino_catalogue` table of the results database.
+//! Part text and crop paths go into `app_config` in that same file. The JPEGs
+//! are copied under `vision/catalogue-crops/`. Startup loads the database.
 //! The default import updates item codes that are in the tar and adds new
 //! ones. Parts and crops that are only on this PC stay. Full replace writes
 //! the tar as the whole catalogue, including classes over their crop limit.
-//! The page shows that choice only after `catalogue.json` has been written.
+//! The page shows that choice only after that database write has succeeded.
 //! Truncate then removes the extra crops. Keep all stores the higher limit.
 //! Detection and the camera preview keep using `vision/dinov2-references.json`.
 //!
@@ -41,9 +42,8 @@
 //! its crop list is empty or none of the listed files are in the tar.
 //!
 //! The references dialog can delete, reassign, or reorder crops. That only
-//! changes the existing `crops` and `embeddings` arrays. Per-dimension
-//! tolerances are stored in `vision/catalogue-tolerances.json`, not in
-//! `catalogue.json`.
+//! changes the existing `crops` and `embeddings` rows. Per-dimension
+//! tolerances are stored in `app_config`, not in the part rows.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -205,6 +205,20 @@ pub(crate) fn align_embeddings_file(vision: &Path, active: &str) -> Result<bool,
     let Some(mut book) = load_book(vision)? else {
         return Ok(false);
     };
+    if let Some(switched) = book_for_model(vision, &book, active)? {
+        let same = book.embedding_model.as_deref() == Some(active)
+            && !book.embeddings_stale
+            && book.parts.len() == switched.parts.len()
+            && book
+                .parts
+                .iter()
+                .zip(&switched.parts)
+                .all(|(left, right)| left.embeddings == right.embeddings);
+        if !same {
+            persist_book(vision, &switched)?;
+        }
+        return Ok(false);
+    }
     let has_vectors = book_has_vectors(&book);
     let (model, stale) = aligned_stamp(&book, active);
     let skipped = stale && has_vectors;
@@ -213,8 +227,7 @@ pub(crate) fn align_embeddings_file(vision: &Path, active: &str) -> Result<bool,
     }
     book.embedding_model = model;
     book.embeddings_stale = stale;
-    let bytes = book_json(&book)?;
-    replace_file_bytes(&catalogue_path(vision), &bytes)?;
+    persist_book(vision, &book)?;
     if skipped {
         eprintln!(
             "DINOv2 catalogue embeddings are stale for model {active}. The next extract uses that model."
@@ -273,8 +286,7 @@ fn rewrite_catalogue_width(vision: &Path, width: usize) -> Result<(), String> {
     let total = book.parts.iter().map(|part| part.crops.len()).sum();
     reembed_book(vision, &mut book, &mut embed, &mut silent, &mut done, total)?;
     stamp_extracted(&mut book, &crate::dinov2::selected_model_id());
-    let bytes = book_json(&book)?;
-    replace_file_bytes(&catalogue_path(vision), &bytes)?;
+    persist_book(vision, &book)?;
     Ok(())
 }
 
@@ -296,14 +308,24 @@ fn vision_directory() -> Result<PathBuf, String> {
 }
 
 fn catalogue_path(vision: &Path) -> PathBuf {
+    crate::app_db::database_path(vision)
+}
+
+fn catalogue_file(vision: &Path) -> PathBuf {
     vision.join(CATALOGUE_FILE)
+}
+
+fn is_repo_vision(vision: &Path) -> bool {
+    crate::local_config::project_root()
+        .map(|root| vision == root.join("vision"))
+        .unwrap_or(false)
 }
 
 fn log_catalogue_path(path: &Path) {
     eprintln!("DINOv2 catalogue path: {}", path.display());
 }
 
-/// Load `vision/catalogue.json`. A missing file leaves memory as it is.
+/// Load the catalogue from the results database. A missing catalogue leaves memory as it is.
 /// A bad file is a warning and also leaves memory as it is.
 pub(crate) fn load_on_startup() {
     if cfg!(test) {
@@ -839,8 +861,7 @@ fn append_catalogue_crop(
         });
     }
     stamp_extracted(&mut book, &active);
-    let bytes = book_json(&book)?;
-    if let Err(err) = replace_file_bytes(&catalogue_path(vision), &bytes) {
+    if let Err(err) = persist_book(vision, &book) {
         if let Some(path) = crop_file(vision, &relative) {
             let _ = fs::remove_file(path);
         }
@@ -2125,7 +2146,54 @@ fn known_limits(vision: &Path) -> HashMap<String, usize> {
     limits
 }
 
+const CROP_LIMITS_KEY: &str = "catalogue.cropLimits";
+
+fn parse_limit_map(text: &str) -> Option<HashMap<String, usize>> {
+    let value: Value = serde_json::from_str(text).ok()?;
+    let map = value.get("limits")?.as_object()?;
+    let mut limits = HashMap::new();
+    for (ic, value) in map {
+        let Some(count) = value.as_u64().and_then(|count| usize::try_from(count).ok()) else {
+            continue;
+        };
+        if count > MAX_CROPS {
+            limits.insert(ic.clone(), count);
+        }
+    }
+    Some(limits)
+}
+
+fn limit_document(limits: &HashMap<String, usize>) -> Result<String, String> {
+    let mut map = Map::new();
+    let mut keys: Vec<&String> = limits.keys().collect();
+    keys.sort();
+    for key in keys {
+        map.insert(key.clone(), serde_json::json!(limits[key]));
+    }
+    let file = serde_json::json!({
+        "version": 1,
+        "limits": map,
+    });
+    let mut bytes = serde_json::to_vec_pretty(&file)
+        .map_err(|_| "Could not write the catalogue.".to_string())?;
+    bytes.push(b'\n');
+    String::from_utf8(bytes).map_err(|_| "Could not write the catalogue.".to_string())
+}
+
 fn read_limit_map(vision: &Path) -> HashMap<String, usize> {
+    match crate::app_db::get_text(vision, CROP_LIMITS_KEY) {
+        Ok(Some(text)) => {
+            return parse_limit_map(&text).unwrap_or_else(|| {
+                eprintln!("warning: DINOv2 crop limits are not a valid file.");
+                HashMap::new()
+            });
+        }
+        Ok(None) => {}
+        Err(err) => {
+            eprintln!("warning: DINOv2 crop limits were not read: {err}");
+            return HashMap::new();
+        }
+    }
     let path = vision.join(CROP_LIMITS_FILE);
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
@@ -2135,25 +2203,15 @@ fn read_limit_map(vision: &Path) -> HashMap<String, usize> {
             return HashMap::new();
         }
     };
-    let value: Value = match serde_json::from_str(&text) {
-        Ok(value) => value,
-        Err(_) => {
-            eprintln!("warning: DINOv2 crop limits are not valid JSON.");
-            return HashMap::new();
-        }
-    };
-    let Some(map) = value.get("limits").and_then(|item| item.as_object()) else {
+    let Some(limits) = parse_limit_map(&text) else {
         eprintln!("warning: DINOv2 crop limits are not a valid file.");
         return HashMap::new();
     };
-    let mut limits = HashMap::new();
-    for (ic, value) in map {
-        let Some(count) = value.as_u64().and_then(|count| usize::try_from(count).ok()) else {
-            continue;
-        };
-        if count > MAX_CROPS {
-            limits.insert(ic.clone(), count);
-        }
+    if let Ok(document) = limit_document(&limits)
+        && crate::app_db::put_text(vision, CROP_LIMITS_KEY, &document).is_ok()
+        && !cfg!(test)
+    {
+        let _ = fs::remove_file(&path);
     }
     limits
 }
@@ -2168,20 +2226,9 @@ fn record_crop_limits(vision: &Path, updates: &[(String, usize)]) -> Result<(), 
             limits.insert(ic.clone(), *count);
         }
     }
-    let mut map = Map::new();
-    let mut keys: Vec<&String> = limits.keys().collect();
-    keys.sort();
-    for key in keys {
-        map.insert(key.clone(), serde_json::json!(limits[key]));
-    }
-    let file = serde_json::json!({
-        "version": 1,
-        "limits": map,
-    });
-    let mut bytes = serde_json::to_vec_pretty(&file)
-        .map_err(|_| "Could not write the catalogue.".to_string())?;
-    bytes.push(b'\n');
-    replace_file_bytes(&vision.join(CROP_LIMITS_FILE), &bytes)
+    let document = limit_document(&limits)?;
+    crate::app_db::put_text(vision, CROP_LIMITS_KEY, &document)
+        .map_err(|err| format!("Could not write the catalogue: {err}"))
 }
 
 fn mtimes_differ(crops: &[ResolvedCrop]) -> bool {
@@ -2522,8 +2569,6 @@ fn commit_book(vision: &Path, built: &Built) -> Result<(), String> {
     let incoming = vision.join(format!("{CROPS_DIR}.incoming"));
     let dest = vision.join(CROPS_DIR);
     let backup = vision.join(format!("{CROPS_DIR}.previous"));
-    let json_path = catalogue_path(vision);
-    let json_tmp = vision.join("catalogue.json.tmp");
     let _ = fs::remove_dir_all(&incoming);
     let _ = fs::remove_dir_all(&backup);
     fs::create_dir_all(&incoming).map_err(|err| format!("Could not write the catalogue: {err}"))?;
@@ -2538,12 +2583,9 @@ fn commit_book(vision: &Path, built: &Built) -> Result<(), String> {
         }
         fs::write(&path, bytes).map_err(|err| format!("Could not write the catalogue: {err}"))?;
     }
-    let text = book_json(&built.book)?;
-    fs::write(&json_tmp, text).map_err(|err| format!("Could not write the catalogue: {err}"))?;
     let had_dest = dest.exists();
     if had_dest {
         fs::rename(&dest, &backup).map_err(|err| {
-            let _ = fs::remove_file(&json_tmp);
             let _ = fs::remove_dir_all(&incoming);
             format!("Could not write the catalogue: {err}")
         })?;
@@ -2552,11 +2594,10 @@ fn commit_book(vision: &Path, built: &Built) -> Result<(), String> {
         if had_dest && backup.exists() && !dest.exists() {
             let _ = fs::rename(&backup, &dest);
         }
-        let _ = fs::remove_file(&json_tmp);
         let _ = fs::remove_dir_all(&incoming);
         return Err(format!("Could not write the catalogue: {err}"));
     }
-    if let Err(err) = replace_file(&json_tmp, &json_path) {
+    if let Err(err) = persist_book(vision, &built.book) {
         let _ = fs::remove_dir_all(&dest);
         if had_dest && backup.exists() {
             let _ = fs::rename(&backup, &dest);
@@ -2567,6 +2608,7 @@ fn commit_book(vision: &Path, built: &Built) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
 fn book_json(book: &Book) -> Result<Vec<u8>, String> {
     let file = StoredFile {
         version: VERSION,
@@ -2591,22 +2633,6 @@ fn book_json(book: &Book) -> Result<Vec<u8>, String> {
         serde_json::to_vec(&file).map_err(|_| "Could not write the catalogue.".to_string())?;
     bytes.push(b'\n');
     Ok(bytes)
-}
-
-fn replace_file(tmp: &Path, path: &Path) -> Result<(), String> {
-    if fs::rename(tmp, path).is_ok() {
-        return Ok(());
-    }
-    if path.exists() {
-        fs::remove_file(path).map_err(|err| {
-            let _ = fs::remove_file(tmp);
-            format!("Could not replace the catalogue: {err}")
-        })?;
-    }
-    fs::rename(tmp, path).map_err(|err| {
-        let _ = fs::remove_file(tmp);
-        format!("Could not replace the catalogue: {err}")
-    })
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2652,9 +2678,317 @@ struct StoredPart {
     crop_limit: Option<usize>,
 }
 
-/// `Ok(None)` when the file is absent.
+/// Part text stored in `app_config`. Embeddings stay in `dino_catalogue`.
+#[derive(Serialize, Deserialize)]
+struct PartMeta {
+    ic: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default, rename = "type")]
+    kind: String,
+    #[serde(
+        default,
+        rename = "measurementMethod",
+        skip_serializing_if = "String::is_empty"
+    )]
+    measurement_method: String,
+    #[serde(default)]
+    dimensions: Value,
+    #[serde(default)]
+    crops: Vec<String>,
+    #[serde(default, rename = "cropLimit", skip_serializing_if = "Option::is_none")]
+    crop_limit: Option<usize>,
+}
+
+fn row_model_name(model: Option<&str>) -> &'static str {
+    match model {
+        Some("s_reg") => "s_reg",
+        Some("b_reg") => "b_reg",
+        _ => "legacy",
+    }
+}
+
+fn parts_metadata(book: &Book) -> Result<String, String> {
+    let parts: Vec<PartMeta> = book
+        .parts
+        .iter()
+        .map(|part| PartMeta {
+            ic: part.ic.clone(),
+            description: part.description.clone(),
+            kind: part.kind.clone(),
+            measurement_method: part.measurement_method.clone(),
+            dimensions: part.dimensions.clone(),
+            crops: part.crops.clone(),
+            crop_limit: part.crop_limit.filter(|limit| *limit > MAX_CROPS),
+        })
+        .collect();
+    serde_json::to_string(&parts).map_err(|_| "Could not write the catalogue.".to_string())
+}
+
+fn persist_book(vision: &Path, book: &Book) -> Result<(), String> {
+    if book.parts.len() > MAX_PARTS {
+        return Err("The catalogue has too many parts.".to_string());
+    }
+    let parts_json = parts_metadata(book)?;
+    let model = row_model_name(book.embedding_model.as_deref());
+    let mut rows = Vec::new();
+    let mut live = Vec::new();
+    for part in &book.parts {
+        if part.crops.len() != part.embeddings.len() {
+            return Err("Could not write the catalogue.".to_string());
+        }
+        for (crop, values) in part.crops.iter().zip(&part.embeddings) {
+            if !safe_crop_path(crop)
+                || values.is_empty()
+                || values.iter().any(|value| !value.is_finite())
+            {
+                return Err("Could not write the catalogue.".to_string());
+            }
+            live.push((part.ic.clone(), crop.clone()));
+            rows.push(crate::app_db::EmbeddingRow {
+                ic: part.ic.clone(),
+                source: crop.clone(),
+                values: values.clone(),
+            });
+        }
+    }
+    crate::app_db::write_catalogue(
+        vision,
+        &crate::app_db::CatalogueMeta {
+            embedding_model: book.embedding_model.clone(),
+            embeddings_stale: book.embeddings_stale,
+            parts_json,
+        },
+        model,
+        &rows,
+        &live,
+    )
+    .map_err(|err| format!("Could not write the catalogue: {err}"))
+}
+
+/// Vectors already stored for `active` replace the in-memory set.
+/// `None` means that model does not cover every saved crop.
+fn book_for_model(vision: &Path, book: &Book, active: &str) -> Result<Option<Book>, String> {
+    if active != "s_reg" && active != "b_reg" {
+        return Ok(None);
+    }
+    let rows = crate::app_db::embeddings_for_model(vision, active)
+        .map_err(|err| format!("Could not read the catalogue: {err}"))?;
+    let mut by_source = HashMap::new();
+    for row in rows {
+        by_source.insert((row.ic, row.source), row.values);
+    }
+    let mut parts = Vec::with_capacity(book.parts.len());
+    for part in &book.parts {
+        let mut embeddings = Vec::with_capacity(part.crops.len());
+        for crop in &part.crops {
+            let Some(values) = by_source.get(&(part.ic.clone(), crop.clone())) else {
+                return Ok(None);
+            };
+            if values.is_empty() || values.iter().any(|value| !value.is_finite()) {
+                return Ok(None);
+            }
+            embeddings.push(values.clone());
+        }
+        parts.push(Part {
+            ic: part.ic.clone(),
+            description: part.description.clone(),
+            kind: part.kind.clone(),
+            measurement_method: part.measurement_method.clone(),
+            dimensions: part.dimensions.clone(),
+            crops: part.crops.clone(),
+            embeddings,
+            crop_limit: part.crop_limit,
+        });
+    }
+    if book_has_vectors(book) && parts.iter().all(|part| part.embeddings.is_empty()) {
+        return Ok(None);
+    }
+    Ok(Some(Book {
+        parts,
+        embedding_model: Some(active.to_string()),
+        embeddings_stale: false,
+    }))
+}
+
+enum CatalogueMatch {
+    Missing,
+    Stale,
+    Ready(Book),
+}
+
+fn match_load(vision: &Path, active: &str) -> Result<CatalogueMatch, String> {
+    let Some(book) = load_book(vision)? else {
+        return Ok(CatalogueMatch::Missing);
+    };
+    if book_has_vectors(&book) && !model_matches(&book, active) {
+        return Ok(CatalogueMatch::Stale);
+    }
+    Ok(CatalogueMatch::Ready(book))
+}
+
+pub(crate) fn matching_entries(active: &str) -> Vec<crate::catalog::CatalogEntry> {
+    let vision = match vision_directory() {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("warning: {err} Catalogue matching has no parts.");
+            return Vec::new();
+        }
+    };
+    let path = catalogue_path(&vision);
+    let book = match match_load(&vision, active) {
+        Ok(CatalogueMatch::Missing) => {
+            eprintln!(
+                "warning: catalogue is missing at {}. Catalogue matching has no parts.",
+                path.display()
+            );
+            return Vec::new();
+        }
+        Ok(CatalogueMatch::Stale) => {
+            eprintln!(
+                "warning: catalogue embeddings at {} do not match DINOv2 model {active}. Matching skips them until the next extract.",
+                path.display()
+            );
+            return Vec::new();
+        }
+        Ok(CatalogueMatch::Ready(book)) => book,
+        Err(err) => {
+            eprintln!("warning: {err} Catalogue matching has no parts.");
+            return Vec::new();
+        }
+    };
+    if let Some(width) = crate::dinov2::loaded_cls_width()
+        && book_has_vectors(&book)
+        && !stored_widths_match(&book, width)
+    {
+        eprintln!(
+            "warning: catalogue embeddings at {} do not match DINOv2 model {active}. Matching skips them until the next extract.",
+            path.display()
+        );
+        return Vec::new();
+    }
+    let entries = entries_of(&book);
+    if entries.is_empty() {
+        eprintln!(
+            "warning: catalogue at {} has no parts. Catalogue matching has no parts.",
+            path.display()
+        );
+    }
+    entries
+}
+
+fn entries_of(book: &Book) -> Vec<crate::catalog::CatalogEntry> {
+    let mut entries = Vec::new();
+    for part in &book.parts {
+        for values in &part.embeddings {
+            let Ok(embedding) = crate::inference::dino::l2_normalize(values) else {
+                continue;
+            };
+            entries.push(crate::catalog::CatalogEntry {
+                ic: part.ic.clone(),
+                description: part.description.trim().to_string(),
+                part_type: part.kind.trim().to_string(),
+                embedding,
+            });
+        }
+    }
+    entries
+}
+
+/// `Ok(None)` when the database and the old JSON file are both absent.
 fn load_book(vision: &Path) -> Result<Option<Book>, String> {
-    let path = catalogue_path(vision);
+    if let Some(book) = load_book_db(vision)? {
+        return Ok(Some(book));
+    }
+    if cfg!(test) && is_repo_vision(vision) {
+        return Ok(None);
+    }
+    let Some(mut book) = load_book_file(vision)? else {
+        return Ok(None);
+    };
+    // An unstamped book was extracted by a model this app no longer selects.
+    if !matches!(book.embedding_model.as_deref(), Some("s_reg" | "b_reg")) {
+        book.embedding_model = None;
+        if book_has_vectors(&book) {
+            book.embeddings_stale = true;
+        }
+    }
+    persist_book(vision, &book)?;
+    if !cfg!(test) {
+        let _ = fs::remove_file(catalogue_file(vision));
+        let _ = fs::remove_file(vision.join("catalogue.json.tmp"));
+    }
+    Ok(Some(book))
+}
+
+fn load_book_db(vision: &Path) -> Result<Option<Book>, String> {
+    let Some(meta) = crate::app_db::read_catalogue_meta(vision)
+        .map_err(|err| format!("Could not read the catalogue: {err}"))?
+    else {
+        return Ok(None);
+    };
+    let stored: Vec<PartMeta> = serde_json::from_str(&meta.parts_json)
+        .map_err(|_| "Could not read the catalogue.".to_string())?;
+    if stored.len() > MAX_PARTS {
+        return Err("The catalogue has too many parts.".to_string());
+    }
+    let model = row_model_name(meta.embedding_model.as_deref());
+    let rows = crate::app_db::embeddings_for_model(vision, model)
+        .map_err(|err| format!("Could not read the catalogue: {err}"))?;
+    let mut by_source = HashMap::new();
+    for row in rows {
+        by_source.insert((row.ic, row.source), row.values);
+    }
+    let mut parts = Vec::with_capacity(stored.len());
+    for part in stored {
+        parts.push(part_from_meta(part, &by_source)?);
+    }
+    Ok(Some(Book {
+        parts,
+        embedding_model: meta.embedding_model,
+        embeddings_stale: meta.embeddings_stale,
+    }))
+}
+
+fn part_from_meta(
+    part: PartMeta,
+    by_source: &HashMap<(String, String), Vec<f32>>,
+) -> Result<Part, String> {
+    let invalid = || "Could not read the catalogue.".to_string();
+    let ic = clean_ic(&part.ic).map_err(|_| invalid())?;
+    let crop_limit = part.crop_limit.filter(|limit| *limit > MAX_CROPS);
+    let allowed = crop_limit.unwrap_or(MAX_CROPS);
+    if part.crops.len() > allowed {
+        return Err(invalid());
+    }
+    let mut embeddings = Vec::with_capacity(part.crops.len());
+    for crop in &part.crops {
+        if !safe_crop_path(crop) {
+            return Err(invalid());
+        }
+        let Some(values) = by_source.get(&(ic.clone(), crop.clone())) else {
+            return Err(invalid());
+        };
+        if values.is_empty() || values.iter().any(|value| !value.is_finite()) {
+            return Err(invalid());
+        }
+        embeddings.push(values.clone());
+    }
+    Ok(Part {
+        ic,
+        description: part.description.trim().to_string(),
+        kind: part.kind.trim().to_string(),
+        measurement_method: clean_method(&part.measurement_method),
+        dimensions: part.dimensions,
+        crops: part.crops,
+        embeddings,
+        crop_limit,
+    })
+}
+
+/// `Ok(None)` when the old JSON file is absent.
+fn load_book_file(vision: &Path) -> Result<Option<Book>, String> {
+    let path = catalogue_file(vision);
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -2735,8 +3069,7 @@ fn remove_part(vision: &Path, ic: &str) -> Result<(), String> {
         return Err("That part is not in the catalogue.".to_string());
     };
     let removed = book.parts.remove(index);
-    let bytes = book_json(&book)?;
-    replace_file_bytes(&catalogue_path(vision), &bytes)?;
+    persist_book(vision, &book)?;
     *lock(&CATALOGUE) = book;
     crate::catalog::reload_installed();
     drop_tolerance(vision, ic);
@@ -2752,8 +3085,7 @@ fn remove_part(vision: &Path, ic: &str) -> Result<(), String> {
 }
 
 fn store_book(vision: &Path, book: Book) -> Result<(), String> {
-    let bytes = book_json(&book)?;
-    replace_file_bytes(&catalogue_path(vision), &bytes)?;
+    persist_book(vision, &book)?;
     *lock(&CATALOGUE) = book;
     crate::catalog::reload_installed();
     Ok(())
@@ -2956,18 +3288,38 @@ struct ToleranceFile {
     parts: HashMap<String, HashMap<String, f64>>,
 }
 
+const TOLERANCES_KEY: &str = "catalogue.tolerances";
+
 fn tolerances_path(vision: &Path) -> PathBuf {
     vision.join(TOLERANCES_FILE)
 }
 
+fn parse_tolerances(text: &str) -> Option<HashMap<String, HashMap<String, f64>>> {
+    serde_json::from_str::<ToleranceFile>(text)
+        .ok()
+        .map(|file| file.parts)
+}
+
 fn read_tolerances(vision: &Path) -> HashMap<String, HashMap<String, f64>> {
+    match crate::app_db::get_text(vision, TOLERANCES_KEY) {
+        Ok(Some(text)) => return parse_tolerances(&text).unwrap_or_default(),
+        Ok(None) => {}
+        Err(err) => {
+            eprintln!("warning: DINOv2 tolerances were not read: {err}");
+            return HashMap::new();
+        }
+    }
     let text = match fs::read_to_string(tolerances_path(vision)) {
         Ok(text) => text,
         Err(_) => return HashMap::new(),
     };
-    serde_json::from_str::<ToleranceFile>(&text)
-        .map(|file| file.parts)
-        .unwrap_or_default()
+    let Some(parts) = parse_tolerances(&text) else {
+        return HashMap::new();
+    };
+    if write_tolerances(vision, &parts).is_ok() && !cfg!(test) {
+        let _ = fs::remove_file(tolerances_path(vision));
+    }
+    parts
 }
 
 fn write_tolerances(
@@ -2978,20 +3330,10 @@ fn write_tolerances(
         version: 1,
         parts: parts.clone(),
     };
-    let mut bytes =
-        serde_json::to_vec(&file).map_err(|_| "Could not save the tolerance.".to_string())?;
-    bytes.push(b'\n');
-    replace_file_bytes(&tolerances_path(vision), &bytes)
-}
-
-fn replace_file_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let tmp = path.with_extension("json.tmp");
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|err| format!("Could not write the catalogue: {err}"))?;
-    }
-    fs::write(&tmp, bytes).map_err(|err| format!("Could not write the catalogue: {err}"))?;
-    replace_file(&tmp, path)
+    let text =
+        serde_json::to_string(&file).map_err(|_| "Could not save the tolerance.".to_string())?;
+    crate::app_db::put_text(vision, TOLERANCES_KEY, &text)
+        .map_err(|err| format!("Could not save the tolerance: {err}"))
 }
 
 fn views_from(book: &Book, vision: &Path) -> Vec<CatalogueView> {
@@ -3305,6 +3647,24 @@ mod tests {
         dir
     }
 
+    fn stored_catalogue(dir: &Path) -> Vec<u8> {
+        book_json(&load_book(dir).unwrap().unwrap()).unwrap()
+    }
+
+    fn stored_limits(dir: &Path) -> Value {
+        let text = crate::app_db::get_text(dir, "catalogue.cropLimits")
+            .unwrap()
+            .expect("crop limits");
+        serde_json::from_str(&text).unwrap()
+    }
+
+    fn keep_only_model(dir: &Path, model: &str) {
+        let connection = rusqlite::Connection::open(catalogue_path(dir)).unwrap();
+        connection
+            .execute("DELETE FROM dino_catalogue WHERE model != ?1", [model])
+            .unwrap();
+    }
+
     fn tiny_jpeg() -> Vec<u8> {
         let image = turbojpeg::Image {
             pixels: &[255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0][..],
@@ -3481,7 +3841,7 @@ mod tests {
             ("crops/a.jpg", jpeg.as_slice()),
         ]);
         import_tar_bytes(&first, &dir, false, &mut stub_embed).unwrap();
-        let before = fs::read(catalogue_path(&dir)).unwrap();
+        let before = stored_catalogue(&dir);
         let second = pack(&[
             (
                 "pack/catalogue.json",
@@ -3494,7 +3854,7 @@ mod tests {
         })
         .unwrap_err();
         assert!(err.contains("DINOv2 model is not loaded"), "{err}");
-        assert_eq!(fs::read(catalogue_path(&dir)).unwrap(), before);
+        assert_eq!(stored_catalogue(&dir), before);
         assert!(!dir.join("catalogue-crops.incoming").exists());
         let book = load_book(&dir).unwrap().unwrap();
         assert_eq!(book.parts[0].ic, "KEEP");
@@ -3654,7 +4014,7 @@ mod tests {
         );
         assert_eq!(load_book(&dir).unwrap().unwrap().parts[0].crops.len(), 2);
 
-        let entries = crate::catalog::read_catalogue(&dir.join("catalogue.json"));
+        let entries = entries_of(&load_book(&dir).unwrap().unwrap());
         assert_eq!(entries.len(), 2);
         assert!(entries.iter().all(|entry| entry.ic == "FAST-1"));
         let query = entries[0].embedding.clone();
@@ -3748,8 +4108,8 @@ mod tests {
         let mut book = load_book(&dir).unwrap().unwrap();
         book.embedding_model = Some("s_reg".to_string());
         book.embeddings_stale = false;
-        let bytes = book_json(&book).unwrap();
-        replace_file_bytes(&catalogue_path(&dir), &bytes).unwrap();
+        persist_book(&dir, &book).unwrap();
+        keep_only_model(&dir, "s_reg");
 
         assert!(align_embeddings_file(&dir, "b_reg").unwrap());
         let stale = load_book(&dir).unwrap().unwrap();
@@ -3785,8 +4145,7 @@ mod tests {
                 .all(|values| values != &original)
         );
         stamp_extracted(&mut next, "b_reg");
-        let bytes = book_json(&next).unwrap();
-        replace_file_bytes(&catalogue_path(&dir), &bytes).unwrap();
+        persist_book(&dir, &next).unwrap();
         let saved = load_book(&dir).unwrap().unwrap();
         assert!(!saved.embeddings_stale);
         assert_eq!(saved.embedding_model.as_deref(), Some("b_reg"));
@@ -3794,6 +4153,38 @@ mod tests {
         assert!(!model_matches(&saved, "s_reg"));
         assert!(model_matches(&saved, "b_reg"));
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_matcher_uses_rows_for_the_selected_model() {
+        let dir = temp_dir("model-rows");
+        let jpeg = tiny_jpeg();
+        let short = vec![1.0_f32, 0.0];
+        append_catalogue_crop(&dir, "FAST-1", &jpeg, &short).unwrap();
+        let mut book = load_book(&dir).unwrap().unwrap();
+        book.embedding_model = Some("b_reg".to_string());
+        book.embeddings_stale = false;
+        persist_book(&dir, &book).unwrap();
+        match match_load(&dir, "b_reg").unwrap() {
+            CatalogueMatch::Ready(loaded) => {
+                assert!(!loaded.embeddings_stale);
+                assert_eq!(loaded.embedding_model.as_deref(), Some("b_reg"));
+                assert_eq!(loaded.parts[0].embeddings, vec![short]);
+            }
+            CatalogueMatch::Missing => panic!("missing catalogue"),
+            CatalogueMatch::Stale => panic!("b_reg rows were stale"),
+        }
+        assert!(matches!(
+            match_load(&dir, "s_reg").unwrap(),
+            CatalogueMatch::Stale
+        ));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_legacy_catalogue_file_is_not_treated_as_the_selected_model() {
+        let dir = temp_dir("legacy-file");
         let legacy = serde_json::json!({
             "version": 1,
             "parts": [{
@@ -3802,6 +4193,7 @@ mod tests {
                 "embeddings": [[1.0, 0.0]]
             }]
         });
+        let _ = fs::remove_file(catalogue_path(&dir));
         fs::write(
             dir.join("catalogue.json"),
             serde_json::to_vec(&legacy).unwrap(),
@@ -3836,7 +4228,7 @@ mod tests {
         let dir = temp_dir("missing");
         let listed = catalogue_list_from(&dir).unwrap();
         assert!(listed.parts.is_empty());
-        assert!(listed.path.ends_with("catalogue.json"));
+        assert!(listed.path.ends_with("results.sqlite"));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3906,15 +4298,17 @@ mod tests {
                 "embeddings": []
             }]
         });
+        let plain_dir = temp_dir("method-plain");
         fs::write(
-            dir.join("catalogue.json"),
+            plain_dir.join("catalogue.json"),
             serde_json::to_vec(&plain).unwrap(),
         )
         .unwrap();
-        let plain_book = load_book(&dir).unwrap().unwrap();
+        let plain_book = load_book(&plain_dir).unwrap().unwrap();
         assert!(plain_book.parts[0].measurement_method.is_empty());
         let plain_json: Value = serde_json::from_slice(&book_json(&plain_book).unwrap()).unwrap();
         assert!(plain_json["parts"][0].get("measurementMethod").is_none());
+        let _ = fs::remove_dir_all(&plain_dir);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -4064,7 +4458,7 @@ mod tests {
             ("crops/keep.jpg", jpeg.as_slice()),
         ]);
         import_tar_bytes(&first, &dir, true, &mut stub_embed).unwrap();
-        let before = fs::read(catalogue_path(&dir)).unwrap();
+        let before = stored_catalogue(&dir);
         let crop = dir.join(&load_book(&dir).unwrap().unwrap().parts[0].crops[0]);
         fs::remove_file(&crop).unwrap();
         let second = pack(&[
@@ -4076,7 +4470,7 @@ mod tests {
         ]);
         let err = import_tar_bytes(&second, &dir, false, &mut stub_embed).unwrap_err();
         assert!(err.contains("Could not read the catalogue"), "{err}");
-        assert_eq!(fs::read(catalogue_path(&dir)).unwrap(), before);
+        assert_eq!(stored_catalogue(&dir), before);
         assert!(!dir.join("catalogue-crops.incoming").exists());
         let _ = fs::remove_dir_all(&dir);
     }
@@ -4088,7 +4482,7 @@ mod tests {
         for _ in 0..MAX_CROPS {
             append_catalogue_crop(&dir, "FAST-1", &jpeg, &[1.0, 0.0]).unwrap();
         }
-        let before = fs::read(catalogue_path(&dir)).unwrap();
+        let before = stored_catalogue(&dir);
         let packed = pack(&[
             (
                 "catalogue.json",
@@ -4098,7 +4492,7 @@ mod tests {
         ]);
         let err = import_tar_bytes(&packed, &dir, false, &mut stub_embed).unwrap_err();
         assert!(err.contains("too many crops"), "{err}");
-        assert_eq!(fs::read(catalogue_path(&dir)).unwrap(), before);
+        assert_eq!(stored_catalogue(&dir), before);
         assert_eq!(
             load_book(&dir).unwrap().unwrap().parts[0].crops.len(),
             MAX_CROPS
@@ -4124,7 +4518,7 @@ mod tests {
             serde_json::to_vec(&stored).unwrap(),
         )
         .unwrap();
-        let before = fs::read(catalogue_path(&dir)).unwrap();
+        let before = stored_catalogue(&dir);
         let jpeg = tiny_jpeg();
         let packed = pack(&[
             (
@@ -4135,7 +4529,7 @@ mod tests {
         ]);
         let err = import_tar_bytes(&packed, &dir, false, &mut stub_embed).unwrap_err();
         assert!(err.contains("too many parts"), "{err}");
-        assert_eq!(fs::read(catalogue_path(&dir)).unwrap(), before);
+        assert_eq!(stored_catalogue(&dir), before);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -4153,11 +4547,11 @@ mod tests {
             ("crops/keep.jpg", jpeg.as_slice()),
         ]);
         import_tar_bytes(&first, &dir, true, &mut stub_embed).unwrap();
-        let before = fs::read(catalogue_path(&dir)).unwrap();
+        let before = stored_catalogue(&dir);
         let count = MAX_CROPS + 6;
         let bytes = oversized_tar("ACH01", count, true, &jpeg);
         let draft = inspect_replace(&bytes, &dir).unwrap();
-        assert_eq!(fs::read(catalogue_path(&dir)).unwrap(), before);
+        assert_eq!(stored_catalogue(&dir), before);
         assert!(!dir.join(CROP_LIMITS_FILE).exists());
         assert_eq!(draft.prompts.len(), 1);
         assert_eq!(draft.prompts[0].ic, "ACH01");
@@ -4169,7 +4563,7 @@ mod tests {
         assert!(draft.prompts[0].thumbs.len() <= PROMPT_THUMBS);
         let err = commit_replace(&dir, &draft, &[], &mut stub_embed).unwrap_err();
         assert!(err.contains("Choose a crop limit"), "{err}");
-        assert_eq!(fs::read(catalogue_path(&dir)).unwrap(), before);
+        assert_eq!(stored_catalogue(&dir), before);
 
         let report = commit_replace(
             &dir,
@@ -4215,7 +4609,7 @@ mod tests {
             ("crops/keep.jpg", jpeg.as_slice()),
         ]);
         import_tar_bytes(&first, &dir, true, &mut stub_embed).unwrap();
-        let before = fs::read(catalogue_path(&dir)).unwrap();
+        let before = stored_catalogue(&dir);
         let wide = oversized_tar("ACH01", 30, true, &jpeg);
         let draft = inspect_replace(&wide, &dir).unwrap();
         let err = commit_replace(
@@ -4226,7 +4620,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("DINOv2 model is not loaded"), "{err}");
-        assert_eq!(fs::read(catalogue_path(&dir)).unwrap(), before);
+        assert_eq!(stored_catalogue(&dir), before);
         assert!(!dir.join(CROP_LIMITS_FILE).exists());
 
         let report = commit_replace(
@@ -4245,8 +4639,7 @@ mod tests {
         let ach = book.parts.iter().find(|part| part.ic == "ACH01").unwrap();
         assert_eq!(ach.crops.len(), 30);
         assert_eq!(ach.crop_limit, Some(30));
-        let limits: Value =
-            serde_json::from_slice(&fs::read(dir.join(CROP_LIMITS_FILE)).unwrap()).unwrap();
+        let limits: Value = stored_limits(&dir);
         assert_eq!(limits["limits"]["ACH01"], serde_json::json!(30));
 
         let within = oversized_tar("ACH01", 28, true, &jpeg);
@@ -4258,8 +4651,7 @@ mod tests {
         let ach = book.parts.iter().find(|part| part.ic == "ACH01").unwrap();
         assert_eq!(ach.crops.len(), 28);
         assert_eq!(ach.crop_limit, Some(30));
-        let limits: Value =
-            serde_json::from_slice(&fs::read(dir.join(CROP_LIMITS_FILE)).unwrap()).unwrap();
+        let limits: Value = stored_limits(&dir);
         assert_eq!(limits["limits"]["ACH01"], serde_json::json!(30));
 
         let larger = oversized_tar("ACH01", 40, true, &jpeg);
@@ -4329,15 +4721,15 @@ mod tests {
         let mut seeded = load_book(&dir).unwrap().unwrap();
         seeded.embeddings_stale = true;
         seeded.embedding_model = None;
-        replace_file_bytes(&catalogue_path(&dir), &book_json(&seeded).unwrap()).unwrap();
-        let before = fs::read(catalogue_path(&dir)).unwrap();
+        persist_book(&dir, &seeded).unwrap();
+        let before = stored_catalogue(&dir);
         assert!(load_book(&dir).unwrap().unwrap().embeddings_stale);
 
         let count = MAX_CROPS + 6;
         let wide = oversized_tar("ACH01", count, true, &jpeg);
         let mut draft = inspect_replace(&wide, &dir).unwrap();
         assert_eq!(draft.prompts.len(), 1);
-        assert_eq!(fs::read(catalogue_path(&dir)).unwrap(), before);
+        assert_eq!(stored_catalogue(&dir), before);
 
         let err = write_full_replace(
             &dir,
@@ -4347,7 +4739,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("Could not embed"), "{err}");
-        assert_eq!(fs::read(catalogue_path(&dir)).unwrap(), before);
+        assert_eq!(stored_catalogue(&dir), before);
         assert!(load_book(&dir).unwrap().unwrap().embeddings_stale);
         assert!(!model_matches(
             &load_book(&dir).unwrap().unwrap(),
@@ -4358,7 +4750,7 @@ mod tests {
         let err = apply_crop_choice(&dir, &draft, &[("ACH01".to_string(), CropAction::Truncate)])
             .unwrap_err();
         assert!(err.contains("Could not update the catalogue"), "{err}");
-        assert_eq!(fs::read(catalogue_path(&dir)).unwrap(), before);
+        assert_eq!(stored_catalogue(&dir), before);
 
         let mut n = 0u32;
         let mut ticks = Vec::new();
@@ -4478,8 +4870,7 @@ mod tests {
                 .iter()
                 .all(|values| values.len() == 768 && values[0] == 4.0)
         );
-        let limits: Value =
-            serde_json::from_slice(&fs::read(dir.join(CROP_LIMITS_FILE)).unwrap()).unwrap();
+        let limits: Value = stored_limits(&dir);
         assert_eq!(limits["limits"]["ACH01"], serde_json::json!(count));
         let _ = fs::remove_dir_all(&dir);
     }
@@ -4496,11 +4887,11 @@ mod tests {
             ("crops/keep.jpg", jpeg.as_slice()),
         ]);
         import_tar_bytes(&first, &dir, true, &mut stub_embed).unwrap();
-        let before = fs::read(catalogue_path(&dir)).unwrap();
+        let before = stored_catalogue(&dir);
         let bytes = oversized_tar("ACH01", MAX_CROPS + 1, false, &jpeg);
         let err = import_tar_bytes(&bytes, &dir, false, &mut stub_embed).unwrap_err();
         assert!(err.contains("too many crops"), "{err}");
-        assert_eq!(fs::read(catalogue_path(&dir)).unwrap(), before);
+        assert_eq!(stored_catalogue(&dir), before);
         assert_eq!(load_book(&dir).unwrap().unwrap().parts[0].ic, "KEEP");
         assert!(!dir.join(CROP_LIMITS_FILE).exists());
 
@@ -4527,7 +4918,7 @@ mod tests {
         let duplicate = pack_owned(&files);
         let err = import_tar_bytes(&duplicate, &dir, false, &mut stub_embed).unwrap_err();
         assert!(err.contains("too many crops"), "{err}");
-        assert_eq!(fs::read(catalogue_path(&dir)).unwrap(), before);
+        assert_eq!(stored_catalogue(&dir), before);
         let draft = inspect_replace(&duplicate, &dir).unwrap();
         assert_eq!(draft.prompts.len(), 1);
         assert_eq!(draft.prompts[0].count, 25);
@@ -4546,7 +4937,7 @@ mod tests {
             ("crops/keep.jpg", jpeg.as_slice()),
         ]);
         import_tar_bytes(&first, &dir, true, &mut stub_embed).unwrap();
-        let before = fs::read(catalogue_path(&dir)).unwrap();
+        let before = stored_catalogue(&dir);
         let bad = pack(&[("catalogue.json", b"{"), ("crops/a.jpg", jpeg.as_slice())]);
         let err = inspect_replace(&bad, &dir).unwrap_err();
         assert!(err.contains("not valid JSON"), "{err}");
@@ -4567,7 +4958,7 @@ mod tests {
         let outside = pack_owned(&files);
         let err = inspect_replace(&outside, &dir).unwrap_err();
         assert!(err.contains("outside crops"), "{err}");
-        assert_eq!(fs::read(catalogue_path(&dir)).unwrap(), before);
+        assert_eq!(stored_catalogue(&dir), before);
         assert!(!dir.join(CROP_LIMITS_FILE).exists());
         let _ = fs::remove_dir_all(&dir);
     }
@@ -4630,9 +5021,9 @@ mod tests {
                 .all(|row| row.tolerance_mm.is_none())
         );
 
-        let before = fs::read(catalogue_path(&dir)).unwrap();
+        let before = stored_catalogue(&dir);
         set_tolerance(&dir, "2BBMNM08", "h", Some(0.25)).unwrap();
-        assert_eq!(fs::read(catalogue_path(&dir)).unwrap(), before);
+        assert_eq!(stored_catalogue(&dir), before);
         assert!(!String::from_utf8_lossy(&before).contains("tolerance"));
         let saved = catalogue_list_from(&dir).unwrap();
         let height = saved.parts[0]
@@ -4643,7 +5034,7 @@ mod tests {
         assert_eq!(height.tolerance_mm, Some(0.25));
         assert!(set_tolerance(&dir, "2BBMNM08", "nope", Some(1.0)).is_err());
         assert!(set_tolerance(&dir, "2BBMNM08", "h", Some(1001.0)).is_err());
-        assert_eq!(fs::read(catalogue_path(&dir)).unwrap(), before);
+        assert_eq!(stored_catalogue(&dir), before);
 
         let book = load_book(&dir).unwrap().unwrap();
         let unique = listed.parts[0]

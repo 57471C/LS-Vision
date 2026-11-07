@@ -2,6 +2,8 @@
 //!
 //! The row lives in SQLite. The detection snapshot is recompressed to a JPEG
 //! next to that database. The row stores a relative path, not the image bytes.
+//! The same file holds `dino_catalogue` and `app_config`. This module leaves
+//! the `results` columns as they are.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -154,6 +156,7 @@ fn open_db(root: &Path) -> Result<Connection, String> {
         .map_err(db_err)?;
     ensure_job_card_column(&connection)?;
     ensure_slot_column(&connection)?;
+    crate::app_db::ensure_schema(&connection)?;
     Ok(connection)
 }
 

@@ -1,6 +1,7 @@
-//! Read and write `vision/config.local.json`, and list weight files in the app data models folder.
-//! These commands do not load a model or open a camera. Detection loads the saved `.onnx` file in Rust.
-//! The active filename stays in `vision/config.local.json`. The weight file lives under the Tauri app data directory.
+//! Read and write backend settings, and list weight files in the app data models folder.
+//! Settings live in the `app_config` table of the results database. These commands do not
+//! load a model or open a camera. Detection loads the saved `.onnx` file in Rust.
+//! The active filename stays in that table. The weight file lives under the Tauri app data directory.
 
 use std::fs;
 use std::io::Read;
@@ -269,22 +270,59 @@ fn read_json_object(path: &Path, label: &str) -> Result<Option<Value>, String> {
     }
 }
 
+/// Tests that pass the repo root keep reading `vision/config.local.json`.
+/// A temp project, and the running app, use the results database.
+fn config_in_database(root: &Path) -> bool {
+    if !cfg!(test) {
+        return true;
+    }
+    match project_root() {
+        Ok(project) => root != project,
+        Err(_) => true,
+    }
+}
+
 pub(crate) fn load_document(root: &Path) -> Result<Value, String> {
+    if config_in_database(root)
+        && let Some(value) = crate::app_db::load_config(root)?
+    {
+        return Ok(value);
+    }
     let config_path = config_file(root);
     if let Some(value) = read_json_object(&config_path, "vision/config.local.json")? {
+        store_imported_config(root, &value)?;
         return Ok(value);
     }
     // bom-source.json is used only when config.local.json is absent.
     if let Some(value) = read_json_object(&legacy_file(root), "vision/bom-source.json")? {
+        store_imported_config(root, &value)?;
         return Ok(value);
     }
     Ok(default_config())
 }
 
-fn write_json_file(path: &Path, value: &Value) -> Result<(), String> {
-    if !value.is_object() {
+/// The running app copies an existing JSON file into the database once.
+/// Tests keep reading the file they planted until a save.
+fn store_imported_config(root: &Path, value: &Value) -> Result<(), String> {
+    if cfg!(test) || !config_in_database(root) {
+        return Ok(());
+    }
+    crate::app_db::save_config(root, value)
+}
+
+pub(crate) fn save_document(root: &Path, config: &Value) -> Result<(), String> {
+    if !config.is_object() {
         return Err("Config must be a JSON object.".to_string());
     }
+    #[cfg(test)]
+    if !config_in_database(root) {
+        return write_json_file(&config_file(root), config);
+    }
+    crate::app_db::save_config(root, config)
+}
+
+#[cfg(test)]
+fn write_json_file(path: &Path, value: &Value) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| "Could not write vision/config.local.json.".to_string())?;
@@ -301,6 +339,7 @@ fn write_json_file(path: &Path, value: &Value) -> Result<(), String> {
     replace_file(&tmp, path)
 }
 
+#[cfg(test)]
 fn replace_file(tmp: &Path, path: &Path) -> Result<(), String> {
     if fs::rename(tmp, path).is_ok() {
         return Ok(());
@@ -317,10 +356,6 @@ fn replace_file(tmp: &Path, path: &Path) -> Result<(), String> {
             "Could not replace vision/config.local.json: {err}. The new copy is still vision/config.local.json.tmp."
         )
     })
-}
-
-pub(crate) fn save_document(root: &Path, config: &Value) -> Result<(), String> {
-    write_json_file(&config_file(root), config)
 }
 
 /// Objects merge. Arrays, nulls, and other values replace. A key that the
@@ -357,13 +392,14 @@ fn merge_value(base: &mut Value, patch: &Value) {
     }
 }
 
-/// Write `config` onto the file that is already there. A missing file is
-/// written as given, so the first save does not invent default keys.
+/// Write `config` onto the settings that are already stored. A missing
+/// document is written as given, so the first save does not invent default keys.
 fn save_merged(root: &Path, config: Value) -> Result<Value, String> {
     if !config.is_object() {
         return Err("Config must be a JSON object.".to_string());
     }
-    let merged = if config_file(root).is_file() {
+    let have_stored = crate::app_db::has_config(root)? || config_file(root).is_file();
+    let merged = if have_stored {
         merge_config(load_document(root)?, &config)?
     } else {
         config
@@ -919,13 +955,11 @@ mod tests {
         map.insert("zebra".to_string(), Value::from(1));
         map.insert("alpha".to_string(), Value::from("kept"));
         save_document(project.root(), &Value::Object(map)).unwrap();
-        let text = fs::read_to_string(config_file(project.root())).unwrap();
-        let zebra = text.find("zebra").unwrap();
-        let alpha = text.find("alpha").unwrap();
-        assert!(zebra < alpha);
-        assert!(text.ends_with('\n'));
-        assert!(!text.contains('\r'));
-        assert_eq!(load_document(project.root()).unwrap()["alpha"], "kept");
+        let document = load_document(project.root()).unwrap();
+        let keys: Vec<_> = document.as_object().unwrap().keys().cloned().collect();
+        assert_eq!(keys, vec!["zebra".to_string(), "alpha".to_string()]);
+        assert_eq!(document["alpha"], "kept");
+        assert!(!config_file(project.root()).exists());
     }
 
     #[test]
@@ -1020,7 +1054,7 @@ mod tests {
         assert_eq!(document["source"], "api");
         assert_eq!(document["api"]["key"], "hidden");
         assert_eq!(document["model"], "kit.onnx");
-        assert!(config_file(project.root()).is_file());
+        assert!(!config_file(project.root()).exists());
         assert!(legacy_file(project.root()).is_file());
     }
 

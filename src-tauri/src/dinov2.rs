@@ -353,8 +353,9 @@ pub fn dino_model_status() -> DinoModelStatus {
 }
 
 /// Save `dinoModel` and reload the matcher.
-/// A different model marks catalogue embeddings stale. The next extract
-/// replaces them, so vectors from S and B are not stored together.
+/// Rows for both models can stay in the database. The matcher reads only the
+/// selected model. A model with no saved rows is marked stale until the next
+/// extract writes that model's embeddings.
 #[tauri::command]
 pub fn set_dino_model(model: String) -> Result<DinoModelStatus, String> {
     let Some(choice) = parse_model_choice(&model) else {
@@ -364,15 +365,16 @@ pub fn set_dino_model(model: String) -> Result<DinoModelStatus, String> {
     crate::local_config::save_local_config(serde_json::json!({ "dinoModel": choice }))?;
     let session = reload_session();
     let mut message = session.message.clone();
-    let embeddings_stale = if previous == choice {
-        crate::catalogue::embeddings_need_extract(choice).unwrap_or(false)
-    } else {
-        match crate::catalogue::align_saved_embeddings(choice) {
-            Ok(stale) => stale,
-            Err(err) => {
-                message = format!("{message} {err}");
-                true
-            }
+    if previous != choice {
+        if let Err(err) = crate::catalogue::align_saved_embeddings(choice) {
+            message = format!("{message} {err}");
+        }
+    }
+    let embeddings_stale = match crate::catalogue::embeddings_need_extract(choice) {
+        Ok(stale) => stale,
+        Err(err) => {
+            message = format!("{message} {err}");
+            true
         }
     };
     let mut status = model_status(choice, &session, embeddings_stale);
