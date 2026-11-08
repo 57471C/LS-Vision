@@ -2,7 +2,7 @@
 // biome-ignore-all lint/correctness/noUnusedVariables: Biome 2.4 does not treat Svelte template references as uses
 // biome-ignore-all lint/correctness/noUnusedImports: Biome 2.4 does not treat Svelte template references as uses
 
-import { onDestroy, onMount, tick } from "svelte";
+import { flushSync, onDestroy, onMount, tick } from "svelte";
 import ClassPicker from "$lib/ClassPicker.svelte";
 import {
 	activateCamera,
@@ -1439,12 +1439,12 @@ function readExtractEvent(
 	return { ic, done, total };
 }
 
-function extractPercent(): number {
-	if (extractTotal <= 0) return 0;
-	const ratio = extractDone / extractTotal;
-	if (!Number.isFinite(ratio)) return 0;
-	return Math.max(0, Math.min(100, Math.round(ratio * 100)));
-}
+// The fill has to read the counters here. A helper called from the style
+// attribute does not subscribe, so the bar stays at 0% while the label moves.
+$: extractRatio =
+	extractTotal > 0
+		? Math.max(0, Math.min(100, Math.round((extractDone / extractTotal) * 100)))
+		: 0;
 
 function stopExtractEvents() {
 	const stop = stopExtractListen;
@@ -1462,9 +1462,13 @@ async function withExtractProgress(work: () => Promise<void>): Promise<void> {
 		stopExtractListen = await listen("catalogue-extract", (event) => {
 			const row = readExtractEvent(event.payload);
 			if (!row) return;
-			extractIc = row.ic;
-			extractDone = row.done;
-			extractTotal = row.total;
+			// The replace path embeds every crop before it returns. Flush each
+			// event so the bar moves while that command is still running.
+			flushSync(() => {
+				extractIc = row.ic;
+				extractDone = row.done;
+				extractTotal = row.total;
+			});
 		});
 	} catch {
 		stopExtractListen = null;
@@ -1473,9 +1477,6 @@ async function withExtractProgress(work: () => Promise<void>): Promise<void> {
 		await work();
 	} finally {
 		stopExtractEvents();
-		extractIc = "";
-		extractDone = 0;
-		extractTotal = 0;
 	}
 }
 
@@ -1546,6 +1547,9 @@ async function runCatalogueImport(replace: boolean) {
 		applyCatalogueResult(data);
 	} finally {
 		updatingReferences = false;
+		extractIc = "";
+		extractDone = 0;
+		extractTotal = 0;
 		if (!cropPrompt) replaceCatalogue = false;
 	}
 }
@@ -3474,8 +3478,9 @@ onDestroy(() => {
 						<h2 id="settings-section-heading" class="text-lg font-semibold tracking-tight xl:col-span-2">
 							Capture
 						</h2>
+						<div class="contents xl:flex xl:min-w-0 xl:flex-col xl:gap-4">
 						<form
-							class="flex flex-col gap-4 border border-neutral-700 bg-neutral-900 p-4"
+							class="order-1 flex flex-col gap-4 border border-neutral-700 bg-neutral-900 p-4"
 							on:submit|preventDefault={saveTestMode}
 						>
 							<fieldset class="flex flex-col gap-3">
@@ -3520,68 +3525,7 @@ onDestroy(() => {
 						</form>
 
 						<form
-							class="flex flex-col gap-4 border border-neutral-700 bg-neutral-900 p-4"
-							method="dialog"
-							novalidate
-							on:submit|preventDefault={saveScan}
-						>
-							<fieldset class="flex flex-col gap-3">
-								<legend class="text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
-									Barcode scan
-								</legend>
-								<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
-									Interval (seconds)
-									<input
-										type="number"
-										class="w-28 border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
-										bind:value={scanSeconds}
-										min="1"
-										max="60"
-										step="1"
-										required
-									/>
-								</label>
-								<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
-									Motion delay (ms)
-									<input
-										type="number"
-										class="w-28 border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
-										bind:value={motionDelayMs}
-										min="0"
-										max="2000"
-										step="1"
-										required
-									/>
-								</label>
-								<label class="flex items-center gap-3 text-sm font-medium text-neutral-100">
-									<input
-										type="checkbox"
-										class="h-5 w-5 accent-blue-500"
-										bind:checked={barcodeScanDisabled}
-										disabled={savingScan}
-									/>
-									Disable
-								</label>
-								<p class="text-sm text-neutral-400">
-									How often the live feed checks for a barcode. The default is 8 seconds.
-									Disable stops the camera barcode read. The operator page then focuses the job card field so a code can be typed.
-									Motion delay is how long detection waits after a barcode is accepted. The default is 400. The frozen frame stays as it is.
-								</p>
-							</fieldset>
-							<button
-								type="submit"
-								class="inline-flex min-h-11 w-fit items-center border border-blue-500 bg-blue-600 px-4 text-sm font-semibold text-white disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
-								disabled={savingScan}
-							>
-								{savingScan ? "Saving..." : "Save"}
-							</button>
-							{#if scanNotice}
-								<p class="text-sm text-neutral-200">{scanNotice}</p>
-							{/if}
-						</form>
-
-						<form
-							class="flex flex-col gap-4 border border-neutral-700 bg-neutral-900 p-4"
+							class="order-3 flex flex-col gap-4 border border-neutral-700 bg-neutral-900 p-4"
 							method="dialog"
 							novalidate
 							on:submit|preventDefault={saveRoi}
@@ -3718,9 +3662,72 @@ onDestroy(() => {
 								<p class="text-sm text-neutral-200">{roiNotice}</p>
 							{/if}
 						</form>
+						</div>
+
+						<div class="contents xl:flex xl:min-w-0 xl:flex-col xl:gap-4">
+						<form
+							class="order-2 flex flex-col gap-4 border border-neutral-700 bg-neutral-900 p-4"
+							method="dialog"
+							novalidate
+							on:submit|preventDefault={saveScan}
+						>
+							<fieldset class="flex flex-col gap-3">
+								<legend class="text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+									Barcode scan
+								</legend>
+								<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+									Interval (seconds)
+									<input
+										type="number"
+										class="w-28 border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
+										bind:value={scanSeconds}
+										min="1"
+										max="60"
+										step="1"
+										required
+									/>
+								</label>
+								<label class="flex flex-col gap-1 text-[11px] font-semibold uppercase tracking-widest text-neutral-400">
+									Motion delay (ms)
+									<input
+										type="number"
+										class="w-28 border border-neutral-600 bg-neutral-950 px-3 py-2 text-base font-medium normal-case tracking-normal text-neutral-100"
+										bind:value={motionDelayMs}
+										min="0"
+										max="2000"
+										step="1"
+										required
+									/>
+								</label>
+								<label class="flex items-center gap-3 text-sm font-medium text-neutral-100">
+									<input
+										type="checkbox"
+										class="h-5 w-5 accent-blue-500"
+										bind:checked={barcodeScanDisabled}
+										disabled={savingScan}
+									/>
+									Disable
+								</label>
+								<p class="text-sm text-neutral-400">
+									How often the live feed checks for a barcode. The default is 8 seconds.
+									Disable stops the camera barcode read. The operator page then focuses the job card field so a code can be typed.
+									Motion delay is how long detection waits after a barcode is accepted. The default is 400. The frozen frame stays as it is.
+								</p>
+							</fieldset>
+							<button
+								type="submit"
+								class="inline-flex min-h-11 w-fit items-center border border-blue-500 bg-blue-600 px-4 text-sm font-semibold text-white disabled:border-neutral-700 disabled:bg-neutral-800 disabled:text-neutral-500"
+								disabled={savingScan}
+							>
+								{savingScan ? "Saving..." : "Save"}
+							</button>
+							{#if scanNotice}
+								<p class="text-sm text-neutral-200">{scanNotice}</p>
+							{/if}
+						</form>
 
 						<form
-							class="flex flex-col gap-4 border border-neutral-700 bg-neutral-900 p-4"
+							class="order-4 flex flex-col gap-4 border border-neutral-700 bg-neutral-900 p-4"
 							method="dialog"
 							novalidate
 							on:submit|preventDefault={saveBarcodeRoi}
@@ -3810,9 +3817,10 @@ onDestroy(() => {
 								<p class="text-sm text-neutral-200">{barcodeNotice}</p>
 							{/if}
 						</form>
+						</div>
 
 						<form
-							class="flex flex-col gap-4 border border-neutral-700 bg-neutral-900 p-4 xl:col-span-2"
+							class="order-5 flex flex-col gap-4 border border-neutral-700 bg-neutral-900 p-4 xl:col-span-2"
 							on:submit|preventDefault={saveMetrology}
 						>
 							<fieldset class="flex flex-col gap-3">
@@ -4143,6 +4151,7 @@ onDestroy(() => {
 								<p class="break-all text-sm {modelNoticeClass(modelNotice)}">{modelNotice}</p>
 							{/if}
 						</form>
+						<div class="contents xl:flex xl:min-w-0 xl:flex-col xl:gap-4">
 						<form
 							class="flex flex-col gap-4 border border-neutral-700 bg-neutral-900 p-4"
 							on:submit|preventDefault={() => undefined}
@@ -4203,7 +4212,7 @@ onDestroy(() => {
 							{/if}
 						</form>
 						<form
-							class="flex flex-col gap-4 border border-neutral-700 bg-neutral-900 p-4 xl:col-start-2"
+							class="flex flex-col gap-4 border border-neutral-700 bg-neutral-900 p-4"
 							on:submit|preventDefault={() => undefined}
 						>
 							<fieldset class="flex flex-col gap-3">
@@ -4240,6 +4249,7 @@ onDestroy(() => {
 								{/if}
 							</fieldset>
 						</form>
+						</div>
 					{:else if section === "parts"}
 						<h2 id="settings-section-heading" class="text-lg font-semibold tracking-tight xl:col-span-2">
 							Parts
@@ -4253,21 +4263,25 @@ onDestroy(() => {
 							>
 								{updatingReferences ? "Updating..." : "Update references"}
 							</button>
-							{#if extractTotal > 0}
+							{#if updatingReferences || extractTotal > 0}
 								<div class="w-full max-w-md">
 									<p class="text-sm text-neutral-200">
-										{extractIc ? `Extracting ${extractIc}` : "Extracting catalogue"}
-										({extractDone} / {extractTotal})
+										{#if extractTotal > 0}
+											{extractIc ? `Extracting ${extractIc}` : "Extracting catalogue"}
+											({extractDone} / {extractTotal})
+										{:else}
+											Reading catalogue
+										{/if}
 									</p>
 									<div
 										class="mt-1 h-2 w-full bg-neutral-800"
 										role="progressbar"
 										aria-valuemin="0"
-										aria-valuemax={extractTotal}
+										aria-valuemax={extractTotal > 0 ? extractTotal : 1}
 										aria-valuenow={extractDone}
 										aria-label="Catalogue extract"
 									>
-										<div class="h-2 bg-blue-500" style="width: {extractPercent()}%"></div>
+										<div class="h-2 bg-blue-500" style:width="{extractRatio}%"></div>
 									</div>
 								</div>
 							{/if}

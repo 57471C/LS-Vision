@@ -552,8 +552,16 @@ fn install_picked_catalogue(
     }
     let bytes =
         fs::read(&source).map_err(|err| format!("Could not read the tar archive: {err}"))?;
+    // A full replace embeds every crop from memory. That loop can keep every
+    // core busy, so the webview does not paint `catalogue-extract` until this
+    // command returns and the page clears the bar. Pause after each new count.
+    let mut painted = 0usize;
     let mut progress = |ic: &str, done: usize, total: usize| {
         emit_extract(&app, ic, done, total);
+        if replace && done != painted {
+            painted = done;
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     };
     if !replace {
         let mut embed = embed_jpeg;
