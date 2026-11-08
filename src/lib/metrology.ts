@@ -238,6 +238,14 @@ export function scaleMetrology(
 	};
 }
 
+// Out-of-spec arrows stay on the still. A pass draws only while that box is hovered.
+export function measurementArrowsVisible(
+	status: string | undefined,
+	hovered: boolean,
+): boolean {
+	return status === "DIMENSION_MISMATCH" || hovered;
+}
+
 // Empty unless this box failed the length or diameter check.
 export function mismatchNote(value: unknown): string {
 	const result = readMetrologyResult(value);

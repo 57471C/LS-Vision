@@ -29,6 +29,7 @@ import {
 import {
 	type DimensionMark,
 	layoutDimensions,
+	measurementArrowsVisible,
 	metrologyReadout,
 	metrologySpans,
 	mismatchNote,
@@ -242,24 +243,32 @@ function detectionMarks(
 		];
 		if (note) avoids.push({ x: noteX, y: noteY, w: noteW, h: noteH });
 		if (item.slot) avoids.push({ x, y, w: 14, h: 14 });
-		const dimensions = layoutDimensions(
-			metrologySpans(item.metrology).map((span) => ({
-				...span,
-				x1: originX + span.x1 * scale,
-				y1: originY + span.y1 * scale,
-				x2: originX + span.x2 * scale,
-				y2: originY + span.y2 * scale,
-			})),
-			readMetrologyResult(item.metrology)?.status === "DIMENSION_MISMATCH",
-			avoids,
-			{
-				x: originX,
-				y: originY,
-				w: paneWidth * scale,
-				h: paneHeight * scale,
-			},
-			1,
-		);
+		const measured = readMetrologyResult(item.metrology);
+		const outOfSpec = measured?.status === "DIMENSION_MISMATCH";
+		// The same spans drive the hover sizes and the out-of-spec lines.
+		const dimensions = measurementArrowsVisible(
+			measured?.status,
+			hoverKey === key,
+		)
+			? layoutDimensions(
+					metrologySpans(item.metrology).map((span) => ({
+						...span,
+						x1: originX + span.x1 * scale,
+						y1: originY + span.y1 * scale,
+						x2: originX + span.x2 * scale,
+						y2: originY + span.y2 * scale,
+					})),
+					outOfSpec,
+					avoids,
+					{
+						x: originX,
+						y: originY,
+						w: paneWidth * scale,
+						h: paneHeight * scale,
+					},
+					1,
+				)
+			: [];
 		const tint = item.slot ? slotColor(item.slot).stroke : "";
 		marks.push({
 			key,
@@ -449,7 +458,7 @@ $: snapshotMarks = detectionMarks(
 	$zoom,
 	$operator.bom?.parts ?? null,
 	$operator.admin,
-	hoveredKey,
+	$operator.detectState === "done" ? hoveredKey : "",
 );
 
 $: {

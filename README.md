@@ -41,7 +41,7 @@ Recent additions:
 
 - A DINO catalogue import stores structured millimetres and each class's length and diameter rules. The overlay, the BoM line, and View references show the generated size, such as `M8x20` or `130x37 mm`. Metrology uses those fields. A Dimensions string is not parsed.
 - Settings and the DINOv2 catalogue, including crop images, are stored in the results database (`results/results.sqlite`). Settings > Training chooses the DINOv2 model (`s_reg` or `b_reg`). The installer bundles both register models.
-- After a barcode is accepted, the operator page waits a motion delay (default 400 ms) before detection. The overlay marks surplus, near-miss, and rogue parts for display only. Hovering a box shows its measured sizes.
+- After a barcode is accepted, the operator page waits a motion delay (default 400 ms) before detection. The overlay marks surplus, near-miss, and rogue parts for display only. Hovering a finished detection box shows its measurement arrows and measured sizes. Out-of-spec arrows stay visible.
 - While detection runs, the operator camera and the camera preview show a green Detecting mark.
 - Settings > Training > Decoder is Auto, YOLO, or RF-DETR. Auto reads the file name and the ONNX outputs. An RF-DETR export is stretched and ImageNet-normalised. A YOLO graph keeps the letterbox decoder.
 - Settings > Camera > Preview, while admin is unlocked, draws a marquee on the detected still and saves that crop to the DINOv2 catalogue. A short press on a box still selects it. Crosshairs is optional, off by default, and shows the pointer in pixels and millimetres.

@@ -3,6 +3,7 @@
 
 import {
 	layoutDimensions,
+	measurementArrowsVisible,
 	METROLOGY_DEFAULTS,
 	metrologyDocument,
 	metrologyReadout,
@@ -224,6 +225,19 @@ check(
 	metrologyReadout(undefined) === "",
 );
 check("a washer draws each method span", washerMarks.length === 3);
+check(
+	"an out-of-spec box keeps its arrows",
+	measurementArrowsVisible("DIMENSION_MISMATCH", false),
+);
+check(
+	"an in-spec box draws arrows only while hovered",
+	!measurementArrowsVisible("pass", false) &&
+		measurementArrowsVisible("pass", true),
+);
+check(
+	"a box with no measurement draws no arrows",
+	!measurementArrowsVisible(undefined, false),
+);
 check(
 	"diameter labels keep the symbol and thickness does not",
 	washerMarks.some((mark) => mark.text === "Ø 8.0 mm") &&
