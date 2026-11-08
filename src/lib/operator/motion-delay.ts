@@ -1,4 +1,4 @@
-// Operator pause after a barcode is accepted and before detect_image.
+// Operator pause after a barcode or a typed job card is accepted, before detect_image.
 // Settings > Capture stores motionDelayMs. A missing value is 400.
 // The barcode read and the frozen frame do not use this number.
 
