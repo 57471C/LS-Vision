@@ -1,6 +1,6 @@
 # Settings
 
-Settings are stored in the `app_config` table of the results database (`results/results.sqlite` under LocalAppData, or Documents when that folder is missing). The unlock password is `admin` and is not saved. Unlock is per browser tab.
+Settings are stored in the `app_config` table of the results database (`results/results.sqlite` under LocalAppData, or Documents when that folder is missing). The first launch copies an existing `vision/config.local.json` into that table when it has no settings. Later saves stay in the database. The unlock password is `admin` and is not saved. Unlock is per browser tab.
 
 ## Camera
 
@@ -13,6 +13,7 @@ Settings are stored in the `app_config` table of the results database (`results/
 ## Capture
 
 - **Test mode**: after a kit IC loads, the operator page asks for an image file instead of reading the camera.
+- **Do not save Pass / Fail results**: on by default (`skipResultSave`). When it is on, or when Test mode is on, the inspection row and the JPEG are not written.
 - **Barcode scan**: whole seconds from 1 to 60. The default is 8. This is the operator countdown. **Disable** (`barcodeScanDisabled`, default false) stops the camera barcode read, hides the barcode ROI on the operator camera, and focuses the code field. **Motion delay (ms)** is `motionDelayMs`, default 400, from 0 to 2000. After a barcode is accepted, the operator page waits that long before detection. A missing value is 400. The frozen frame stays as it is. Save writes the interval, the checkbox, and the delay together.
 - **Part detection**: up to four regions (`detectRois`, each `x`, `y`, `w`, `h` as fractions from 0 to 1, plus `enabled`). The Slot dropdown chooses which region the fields edit. Blank leaves the fields idle. An empty slot is skipped. With no slots saved, detection uses the full image. `detectRoi` is slot 1. Save writes the selected slot. A new box starts enabled. Clear removes that slot and packs the rest to the front, so the saved list has no gap. The fields then show whatever region now sits in the selected slot. The four squares flip `enabled` and save it immediately. Grey has no box, green is on, and red is off. Detection skips a slot that is off.
 - **Barcode**: a region of the frame (`barcodeRoi`: `x`, `y`, `width`, `height` as fractions from 0 to 1). The operator crop uses the same object. With no region, decode uses the full frame. The operator page can also draw this region on the live feed when Settings is unlocked.
@@ -60,5 +61,6 @@ Example: parent `Hinge_Plate`, child `P02_Logo`, condition `contains`, result `2
 - **Description endpoint**: optional path stored as `api.descriptionPath`. The default is `/VisionAppApi/ListInventoryDescription`. Leave it blank to show an unexpected code by itself. The Not in BoM list uses the description stored on the matching catalogue part. A catalogue item code with no description there, and not on the loaded BoM, is posted with the API base URL and API key. The returned description is shown on that list. An unrecognized box is shown as its part type and is not posted.
 - Results endpoint, optional and blank by default. Example: `/VisionAppApi/SubmitResult`. A saved inspection is posted to the API base URL plus this path, with the API key. Leave it blank to keep the result on this PC only. Test mode does not post.
 - ERP button name and URL. Empty name and URL hides the operator button.
+- Pass and fail rows are stored in this same database when Capture allows the save. Operators open them from `/results`. Delete is available while admin is unlocked and removes the row and the JPEG.
 
 The operator page reloads the barcode ROI, Test mode, scan interval, BoM source, and ERP button when the window focuses.

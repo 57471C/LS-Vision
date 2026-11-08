@@ -2,7 +2,7 @@
 
 Desktop application for verifying fastener kits on the bench using computer vision.
 
-Built with Tauri 2, SvelteKit, TypeScript, and Rust. Version 0.5.1. Inference is ONNX Runtime in the Rust process. The camera, barcode decode, and BoM lookup run there too.
+Built with Tauri 2, SvelteKit, TypeScript, and Rust. Version 0.5.2. Inference is ONNX Runtime in the Rust process. The camera, barcode decode, and BoM lookup run there too.
 
 ## What it does
 
@@ -35,10 +35,12 @@ In Settings > Training, use Update model to copy an `.onnx` file into the app da
 
 ## Project status
 
-Version 0.5.1 runs inference, the camera, barcode decode, and BoM lookup in the Tauri process. A `.pt` model shows a warning instead of detecting.
+Version 0.5.2 runs inference, the camera, barcode decode, and BoM lookup in the Tauri process. A `.pt` model shows a warning instead of detecting.
 
 Recent additions:
 
+- A DINO catalogue import stores structured millimetres and each class's length and diameter rules. The overlay, the BoM line, and View references show the generated size, such as `M8x20` or `130x37 mm`. Metrology uses those fields. A Dimensions string is not parsed.
+- Settings and the DINOv2 catalogue, including crop images, are stored in the results database (`results/results.sqlite`). Settings > Training chooses the DINOv2 model (`s_reg` or `b_reg`). The installer bundles both register models.
 - After a barcode is accepted, the operator page waits a motion delay (default 400 ms) before detection. The overlay marks surplus, near-miss, and rogue parts for display only. Hovering a box shows its measured sizes.
 - While detection runs, the operator camera and the camera preview show a green Detecting mark.
 - Settings > Training > Decoder is Auto, YOLO, or RF-DETR. Auto reads the file name and the ONNX outputs. An RF-DETR export is stretched and ImageNet-normalised. A YOLO graph keeps the letterbox decoder.

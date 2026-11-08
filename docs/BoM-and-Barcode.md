@@ -2,7 +2,7 @@
 
 ## Barcode
 
-- The kit label is read from `barcodeRoi` when that region is saved. Otherwise the full frame is used. Settings > Capture > Barcode scan > Disable (`barcodeScanDisabled` in `vision/config.local.json`) stops that camera read and hides the ROI outline. The operator code field is focused so the job card can be typed. Enter still looks up that field. Unchecking Disable resumes the camera read and the outline.
+- The kit label is read from `barcodeRoi` when that region is saved. Otherwise the full frame is used. Settings > Capture > Barcode scan > Disable (`barcodeScanDisabled` in `app_config`) stops that camera read and hides the ROI outline. The operator code field is focused so the job card can be typed. Enter still looks up that field. Unchecking Disable resumes the camera read and the outline.
 - Settings > Capture edits the region as fractions of the frame (left, top, width, height). The operator page can draw the same region on the live feed.
 - Decode order: native QR detector, then ZXing (QR), both on the preview JPEG, then Rust `decode_barcode` on the raw frame (QR and Code 39). When that crop's long edge is over 1920 pixels, Rust halves it until it fits and reads the smaller image first. A 4K symbol is missed at full size.
 - One trailing slash is removed, so `6PBBK001/` matches `6PBBK001`.
@@ -20,7 +20,7 @@ The source is selected in Settings:
 Settings > Database has an optional description endpoint. It uses the same API base URL and `X-Api-Key`. It does not change the BoM lookup. The default path is `/VisionAppApi/ListInventoryDescription`. A blank path turns the lookup off.
 
 The Not in BoM list shows the description stored on the matching catalogue part. A catalogue item code with no description there, and not on the loaded BoM, is posted as `{ "icList": ["..."] }` to that path. `Des` from the response fills that gap and is stored with the saved result. An unrecognized box is shown as `Unknown {part type}` and is not posted. If the path is blank, the base URL or key is missing, or the call fails, the list shows the code only.
-- **MSSQL**: two parameterised queries from `vision/bom_queries.sql`, or `vision/bom_queries.example.sql` when the local file is absent. Windows Authentication is the default. SQL Server authentication stores the username and password in `vision/config.local.json`.
+- **MSSQL**: two parameterised queries from `vision/bom_queries.sql`, or `vision/bom_queries.example.sql` when the local file is absent. Windows Authentication is the default. SQL Server authentication stores the username and password in `app_config`.
 
 The usual query shape is the kit name from `IR` where `ic = @kitIC`, then parts from `bm` joined to `IR`, excluding labour (`3%`) and packaging (`2P%`).
 
