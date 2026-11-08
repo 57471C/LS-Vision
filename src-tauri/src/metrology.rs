@@ -16,8 +16,10 @@
 //! the thresholds, and the millimetre conversion stay as they are.
 //!
 //! `measurementMethod` on the catalogue part selects bolt, nut, washer,
-//! cable tie, or spring sizes. `custom` and a missing method keep the generic
-//! length and diameter. YOLO class index 3 is a label and is not measured.
+//! cable tie, or spring sizes. Expected millimetres come from the structured
+//! catalogue fields. A Dimensions string is not parsed. `custom` and a missing
+//! method keep the generic length and diameter. YOLO class index 3 is a label
+//! and is not measured. Bolt head AF is stored when present and is not a gauge.
 //! The global length and diameter tolerances still apply. The Ø symbol is only
 //! used when the size is a diameter.
 
@@ -202,148 +204,38 @@ fn clamp_u8(value: Option<&Value>, fallback: u8) -> u8 {
     rounded as u8
 }
 
-#[derive(Clone, Copy)]
-enum Axis {
-    Diameter,
-    InnerDiameter,
-    Length,
-}
-
-/// Catalogue dimensions for one item code. A string such as `M6x40` is read
-/// as diameter then length. An object uses `diameterMm` and `lengthMm`.
-/// A list of `{ "name", "mm" }` uses OD for the diameter and h or length
-/// for the length, which is how the imported catalogue stores them.
-pub(crate) fn expected_from(description: &str, dimensions: &Value) -> ExpectedSize {
-    let mut diameter = None;
-    let mut length = None;
-    match dimensions {
-        Value::Object(map) => absorb_map(map, &mut diameter, &mut length),
-        Value::Array(items) => {
-            for item in items {
-                if let Some(map) = item.as_object() {
-                    absorb_map(map, &mut diameter, &mut length);
-                }
-            }
+/// Expected millimetres from the structured catalogue fields. A Dimensions
+/// string and a part description are not parsed. Diameter is the thread or
+/// the outer diameter. Length is the length, or the height when that is the
+/// recorded long size.
+pub(crate) fn expected_from(method: &str, kind: &str, dimensions: &Value) -> ExpectedSize {
+    let rules = crate::part_size::measurement_rules(dimensions);
+    let pairs = crate::part_size::pairs(method, dimensions);
+    // Washer thickness is the length rule, and it is not the long side of the
+    // generic caliper. The washer gauge still reads that rule.
+    let length_mm = match rules.length {
+        crate::part_size::RuleSide::Ready(mm) if rules.length_key != Some("thicknessmm") => {
+            Some(mm)
         }
-        Value::String(text) => {
-            if let Some((next_diameter, next_length)) = parse_size_text(text) {
-                diameter = Some(next_diameter);
-                length = Some(next_length);
-            }
-        }
-        _ => {}
-    }
-    if diameter.is_none() && length.is_none() {
-        if let Some((next_diameter, next_length)) = parse_size_text(description) {
-            diameter = Some(next_diameter);
-            length = Some(next_length);
-        }
-    }
+        crate::part_size::RuleSide::Ready(_) | crate::part_size::RuleSide::Missing => None,
+        crate::part_size::RuleSide::Unset => find_mm(&pairs, &["lengthmm", "heightmm"]),
+    };
+    let diameter_mm = match rules.diameter {
+        crate::part_size::RuleSide::Ready(mm) => Some(mm),
+        crate::part_size::RuleSide::Missing => None,
+        crate::part_size::RuleSide::Unset => find_mm(&pairs, &["threadmm", "odmm"]),
+    };
     ExpectedSize {
-        diameter_mm: diameter,
-        length_mm: length,
-        description: description.trim().to_string(),
+        diameter_mm,
+        length_mm,
+        description: crate::part_size::canonical(method, kind, dimensions),
     }
-}
-
-fn absorb_map(map: &Map<String, Value>, diameter: &mut Option<f64>, length: &mut Option<f64>) {
-    if let Some(name) = map.get("name").and_then(Value::as_str) {
-        if let Some(number) = map
-            .get("mm")
-            .and_then(positive_number)
-            .or_else(|| map.get("value").and_then(positive_number))
-        {
-            keep_axis(name, number, diameter, length);
-        }
-    }
-    for (key, value) in map {
-        if key.eq_ignore_ascii_case("name") || key.eq_ignore_ascii_case("mm") {
-            continue;
-        }
-        if let Some(number) = positive_number(value) {
-            keep_axis(key, number, diameter, length);
-        }
-    }
-}
-
-fn keep_axis(name: &str, number: f64, diameter: &mut Option<f64>, length: &mut Option<f64>) {
-    match dimension_axis(name) {
-        Some(Axis::Diameter) if diameter.is_none() => *diameter = Some(number),
-        Some(Axis::InnerDiameter) if diameter.is_none() => *diameter = Some(number),
-        Some(Axis::Length) if length.is_none() => *length = Some(number),
-        _ => {}
-    }
-}
-
-fn dimension_axis(name: &str) -> Option<Axis> {
-    let lower: String = name
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .flat_map(|ch| ch.to_lowercase())
-        .collect();
-    match lower.as_str() {
-        "diametermm" | "diameter" | "dia" | "od" | "outsidediameter" => Some(Axis::Diameter),
-        "id" | "innerdiameter" | "insidediameter" => Some(Axis::InnerDiameter),
-        "lengthmm" | "length" | "len" | "l" | "h" | "height" | "heightmm" | "thickness" => {
-            Some(Axis::Length)
-        }
-        _ => None,
-    }
-}
-
-fn positive_number(value: &Value) -> Option<f64> {
-    if let Some(number) = value.as_f64() {
-        return finite_positive(number);
-    }
-    if let Some(text) = value.as_str() {
-        return leading_number(text.trim());
-    }
-    None
-}
-
-fn finite_positive(number: f64) -> Option<f64> {
-    if number.is_finite() && number > 0.0 {
-        Some(number)
-    } else {
-        None
-    }
-}
-
-/// `M6x40`, `6 x 40`, or `6×40 mm`. The first number is the diameter.
-fn parse_size_text(text: &str) -> Option<(f64, f64)> {
-    let lower = text.trim().to_ascii_lowercase();
-    let index = lower.find(['x', '×'])?;
-    let left = lower[..index].trim().trim_start_matches('m').trim();
-    let right = lower[index + lower[index..].chars().next()?.len_utf8()..].trim();
-    Some((leading_number(left)?, leading_number(right)?))
-}
-
-fn leading_number(text: &str) -> Option<f64> {
-    let text = text.trim();
-    if text.is_empty() {
-        return None;
-    }
-    let mut end = 0;
-    let mut dot = false;
-    for (index, ch) in text.char_indices() {
-        if ch.is_ascii_digit() {
-            end = index + 1;
-            continue;
-        }
-        if ch == '.' && !dot {
-            dot = true;
-            end = index + 1;
-            continue;
-        }
-        break;
-    }
-    if end == 0 {
-        return None;
-    }
-    finite_positive(text[..end].parse().ok()?)
 }
 
 fn expected_label(expected: &ExpectedSize) -> String {
+    if !expected.description.is_empty() {
+        return expected.description.clone();
+    }
     match (expected.diameter_mm, expected.length_mm) {
         (Some(diameter), Some(length)) => {
             format!("M{}x{}", compact_number(diameter), compact_number(length))
@@ -508,10 +400,6 @@ pub(crate) fn measure_boxes(
                 return None;
             }
             let part = crate::catalogue::part_dimensions(&item.ic);
-            let description = part
-                .as_ref()
-                .map(|part| part.description.clone())
-                .unwrap_or_default();
             let dimensions = part
                 .as_ref()
                 .map(|part| part.dimensions.clone())
@@ -519,6 +407,10 @@ pub(crate) fn measure_boxes(
             let method = part
                 .as_ref()
                 .map(|part| part.measurement_method.clone())
+                .unwrap_or_default();
+            let kind = part
+                .as_ref()
+                .map(|part| part.kind.clone())
                 .unwrap_or_default();
             let tolerances = crate::catalogue::tolerances_for(&item.ic);
             let mut local = settings.clone();
@@ -531,7 +423,7 @@ pub(crate) fn measure_boxes(
                 local.diameter_tolerance_mm = mm;
             }
             let result = if method.is_empty() || method == "custom" {
-                let expected = expected_from(&description, &dimensions);
+                let expected = expected_from(&method, &kind, &dimensions);
                 measure_rgb(rgb, width, height, item.bbox, &local, mm, &expected)
             } else {
                 measure_method_for(
@@ -541,9 +433,10 @@ pub(crate) fn measure_boxes(
                     item.bbox,
                     &settings,
                     mm,
-                    &description,
+                    "",
                     &dimensions,
                     &method,
+                    &kind,
                     &tolerances,
                 )
             };
@@ -672,6 +565,7 @@ fn measure_method(
         description,
         dimensions,
         method,
+        "",
         &HashMap::new(),
     )
 }
@@ -683,9 +577,10 @@ fn measure_method_for(
     bbox: [i32; 4],
     settings: &MetrologySettings,
     mm_per_px: f64,
-    description: &str,
+    _description: &str,
     dimensions: &Value,
     method: &str,
+    kind: &str,
     tolerances: &HashMap<String, f64>,
 ) -> Option<MetrologyResult> {
     if !(mm_per_px.is_finite() && mm_per_px > 0.0) {
@@ -697,13 +592,14 @@ fn measure_method_for(
         .map_err(|err| eprintln!("metrology: {err}"))
         .ok()?;
     let axes = axes_of(hit.rect)?;
-    let pairs = named_sizes(description, dimensions);
+    let pairs = named_sizes(method, dimensions);
+    let rules = crate::part_size::measurement_rules(dimensions);
     let gauges = match method {
-        "bolt" => bolt_gauges(&crop, crop_w, crop_h, settings, &axes, &pairs),
-        "nut" => Some(nut_gauges(&axes, &pairs)),
-        "washer" => washer_gauges(&crop, crop_w, crop_h, settings, &axes, &pairs),
-        "cable_tie" => Some(cable_gauges(&axes, &pairs)),
-        "spring" => Some(spring_gauges(&axes, &pairs)),
+        "bolt" => bolt_gauges(&crop, crop_w, crop_h, settings, &axes, &pairs, &rules),
+        "nut" => Some(nut_gauges(&axes, &pairs, &rules)),
+        "washer" => washer_gauges(&crop, crop_w, crop_h, settings, &axes, &pairs, &rules),
+        "cable_tie" => Some(cable_gauges(&axes, &pairs, &rules)),
+        "spring" => Some(spring_gauges(&axes, &pairs, &rules)),
         _ => None,
     };
     let origin_x = f64::from(x1);
@@ -714,7 +610,7 @@ fn measure_method_for(
             origin_x,
             origin_y,
             mm_per_px,
-            &method_label(method, &pairs),
+            &crate::part_size::canonical(method, kind, dimensions),
             settings,
             &pairs,
             tolerances,
@@ -733,7 +629,7 @@ fn measure_method_for(
         origin_x,
         origin_y,
         mm_per_px,
-        &expected_from(description, dimensions),
+        &expected_from(method, kind, dimensions),
         &local,
     )
 }
@@ -777,69 +673,20 @@ fn line_len(line: [f64; 4]) -> f64 {
     (dx * dx + dy * dy).sqrt()
 }
 
-fn named_sizes(description: &str, dimensions: &Value) -> Vec<(String, f64)> {
-    let mut pairs = Vec::new();
-    absorb_named(dimensions, &mut pairs);
-    let from_text = match dimensions {
-        Value::String(text) => parse_size_text(text),
-        _ => None,
-    };
-    let from_text = from_text.or_else(|| {
-        if pairs.is_empty() {
-            parse_size_text(description)
-        } else {
-            None
-        }
-    });
-    if let Some((diameter, length)) = from_text {
-        pairs.push(("diameter".to_string(), diameter));
-        pairs.push(("length".to_string(), length));
-    }
-    pairs
+fn named_sizes(method: &str, dimensions: &Value) -> Vec<(String, f64)> {
+    crate::part_size::pairs(method, dimensions)
 }
 
-fn absorb_named(dimensions: &Value, pairs: &mut Vec<(String, f64)>) {
-    match dimensions {
-        Value::Object(map) => {
-            for (key, value) in map {
-                if let Some(number) = positive_number(value) {
-                    pairs.push((norm_key(key), number));
-                }
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                let Some(map) = item.as_object() else {
-                    continue;
-                };
-                if let Some(name) = map.get("name").and_then(Value::as_str) {
-                    if let Some(number) = map
-                        .get("mm")
-                        .and_then(positive_number)
-                        .or_else(|| map.get("value").and_then(positive_number))
-                    {
-                        pairs.push((norm_key(name), number));
-                    }
-                }
-                for (key, value) in map {
-                    if key.eq_ignore_ascii_case("name") || key.eq_ignore_ascii_case("mm") {
-                        continue;
-                    }
-                    if let Some(number) = positive_number(value) {
-                        pairs.push((norm_key(key), number));
-                    }
-                }
-            }
-        }
-        _ => {}
+fn rule_or(
+    side: crate::part_size::RuleSide,
+    pairs: &[(String, f64)],
+    aliases: &[&str],
+) -> Option<f64> {
+    match side {
+        crate::part_size::RuleSide::Ready(mm) => Some(mm),
+        crate::part_size::RuleSide::Missing => None,
+        crate::part_size::RuleSide::Unset => find_mm(pairs, aliases),
     }
-}
-
-fn norm_key(name: &str) -> String {
-    name.chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .flat_map(|ch| ch.to_lowercase())
-        .collect()
 }
 
 fn find_mm(pairs: &[(String, f64)], keys: &[&str]) -> Option<f64> {
@@ -858,11 +705,13 @@ fn bolt_gauges(
     settings: &MetrologySettings,
     axes: &Axes,
     pairs: &[(String, f64)],
+    rules: &crate::part_size::MeasurementRules,
 ) -> Option<Vec<Gauge>> {
     let mask = part_mask(rgb, width, height, settings).ok()?;
     let stations = width_profile(&mask, width, height, axes);
     let split = bolt_split(&stations, axes)?;
-    let length = find_mm(
+    let length = rule_or(
+        rules.length,
         pairs,
         &[
             "lengthunderhead",
@@ -875,9 +724,11 @@ fn bolt_gauges(
             "l",
         ],
     );
-    let diameter = find_mm(
+    let diameter = rule_or(
+        rules.diameter,
         pairs,
         &[
+            "threadmm",
             "threaddiameter",
             "threaddia",
             "nominaldiameter",
@@ -1094,8 +945,16 @@ fn point_on(axes: &Axes, t: f64, offset: f64) -> (f64, f64) {
     (x, y)
 }
 
-fn nut_gauges(axes: &Axes, pairs: &[(String, f64)]) -> Vec<Gauge> {
-    let expected = find_mm(pairs, &["acrossflats", "widthacrossflats", "af", "flats"]);
+fn nut_gauges(
+    axes: &Axes,
+    pairs: &[(String, f64)],
+    rules: &crate::part_size::MeasurementRules,
+) -> Vec<Gauge> {
+    let expected = rule_or(
+        rules.diameter,
+        pairs,
+        &["afmm", "acrossflats", "widthacrossflats", "af", "flats"],
+    );
     vec![Gauge {
         kind: "across_flats",
         px: axes.short_px,
@@ -1113,6 +972,7 @@ fn washer_gauges(
     settings: &MetrologySettings,
     axes: &Axes,
     pairs: &[(String, f64)],
+    rules: &crate::part_size::MeasurementRules,
 ) -> Option<Vec<Gauge>> {
     let mask = part_mask(rgb, width, height, settings).ok()?;
     let long = scan_axis(&mask, width, height, axes.long)?;
@@ -1133,9 +993,11 @@ fn washer_gauges(
     if od_px < 1.0 {
         return None;
     }
-    let od_expected = find_mm(
+    let od_expected = rule_or(
+        rules.diameter,
         pairs,
         &[
+            "odmm",
             "outerdiameter",
             "od",
             "outsidediameter",
@@ -1144,8 +1006,12 @@ fn washer_gauges(
             "dia",
         ],
     );
-    let id_expected = find_mm(pairs, &["innerdiameter", "id", "insidediameter"]);
-    let thickness_expected = find_mm(pairs, &["thickness", "thk", "height", "heightmm", "h"]);
+    let id_expected = find_mm(pairs, &["idmm", "innerdiameter", "id", "insidediameter"]);
+    let thickness_expected = rule_or(
+        rules.length,
+        pairs,
+        &["thicknessmm", "thickness", "thk", "height", "heightmm", "h"],
+    );
     let mut gauges = vec![Gauge {
         kind: "outer_diameter",
         px: od_px,
@@ -1228,8 +1094,13 @@ fn scan_axis(mask: &[u8], width: i32, height: i32, line: [f64; 4]) -> Option<Axi
     })
 }
 
-fn cable_gauges(axes: &Axes, pairs: &[(String, f64)]) -> Vec<Gauge> {
-    let length = find_mm(
+fn cable_gauges(
+    axes: &Axes,
+    pairs: &[(String, f64)],
+    rules: &crate::part_size::MeasurementRules,
+) -> Vec<Gauge> {
+    let length = rule_or(
+        rules.length,
         pairs,
         &[
             "length",
@@ -1240,7 +1111,11 @@ fn cable_gauges(axes: &Axes, pairs: &[(String, f64)]) -> Vec<Gauge> {
             "l",
         ],
     );
-    let width = find_mm(pairs, &["strapwidth", "width", "bandwidth"]);
+    let width = rule_or(
+        rules.diameter,
+        pairs,
+        &["widthmm", "strapwidth", "width", "bandwidth"],
+    );
     vec![
         Gauge {
             kind: "length",
@@ -1261,8 +1136,13 @@ fn cable_gauges(axes: &Axes, pairs: &[(String, f64)]) -> Vec<Gauge> {
     ]
 }
 
-fn spring_gauges(axes: &Axes, pairs: &[(String, f64)]) -> Vec<Gauge> {
-    let height = find_mm(
+fn spring_gauges(
+    axes: &Axes,
+    pairs: &[(String, f64)],
+    rules: &crate::part_size::MeasurementRules,
+) -> Vec<Gauge> {
+    let height = rule_or(
+        rules.length,
         pairs,
         &[
             "freeheight",
@@ -1275,9 +1155,11 @@ fn spring_gauges(axes: &Axes, pairs: &[(String, f64)]) -> Vec<Gauge> {
             "l",
         ],
     );
-    let diameter = find_mm(
+    let diameter = rule_or(
+        rules.diameter,
         pairs,
         &[
+            "odmm",
             "outerdiameter",
             "coildiameter",
             "od",
@@ -1333,189 +1215,33 @@ fn centered_line(line: [f64; 4], length_px: f64) -> [f64; 4] {
     ]
 }
 
-fn method_label(method: &str, pairs: &[(String, f64)]) -> String {
-    match method {
-        "bolt" => {
-            let length = find_mm(
-                pairs,
-                &[
-                    "lengthunderhead",
-                    "underheadlength",
-                    "shanklength",
-                    "griplength",
-                    "length",
-                    "lengthmm",
-                    "len",
-                    "l",
-                ],
-            );
-            let diameter = find_mm(
-                pairs,
-                &[
-                    "threaddiameter",
-                    "threaddia",
-                    "nominaldiameter",
-                    "diameter",
-                    "diametermm",
-                    "dia",
-                ],
-            );
-            expected_label(&ExpectedSize {
-                diameter_mm: diameter,
-                length_mm: length,
-                description: String::new(),
-            })
-        }
-        "nut" => find_mm(pairs, &["acrossflats", "widthacrossflats", "af", "flats"])
-            .map(|across| format!("{} mm", compact_number(across)))
-            .unwrap_or_default(),
-        "washer" => {
-            let outer = find_mm(
-                pairs,
-                &[
-                    "outerdiameter",
-                    "od",
-                    "outsidediameter",
-                    "diameter",
-                    "diametermm",
-                    "dia",
-                ],
-            );
-            let inner = find_mm(pairs, &["innerdiameter", "id", "insidediameter"]);
-            match (outer, inner) {
-                (Some(outer), Some(inner)) => {
-                    format!("Ø{} × Ø{} mm", compact_number(outer), compact_number(inner))
-                }
-                (Some(outer), None) => format!("Ø{} mm", compact_number(outer)),
-                (None, Some(inner)) => format!("Ø{} mm", compact_number(inner)),
-                (None, None) => String::new(),
-            }
-        }
-        "cable_tie" => {
-            let length = find_mm(
-                pairs,
-                &[
-                    "length",
-                    "totallength",
-                    "overalllength",
-                    "lengthmm",
-                    "len",
-                    "l",
-                ],
-            );
-            let width = find_mm(pairs, &["strapwidth", "width", "bandwidth"]);
-            match (length, width) {
-                (Some(length), Some(width)) => {
-                    format!("{} × {} mm", compact_number(length), compact_number(width))
-                }
-                (Some(length), None) => format!("{} mm", compact_number(length)),
-                (None, Some(width)) => format!("{} mm", compact_number(width)),
-                (None, None) => String::new(),
-            }
-        }
-        "spring" => {
-            let height = find_mm(
-                pairs,
-                &[
-                    "freeheight",
-                    "height",
-                    "heightmm",
-                    "h",
-                    "length",
-                    "lengthmm",
-                    "len",
-                    "l",
-                ],
-            );
-            let diameter = find_mm(
-                pairs,
-                &[
-                    "outerdiameter",
-                    "coildiameter",
-                    "od",
-                    "diameter",
-                    "diametermm",
-                    "dia",
-                ],
-            );
-            match (height, diameter) {
-                (Some(height), Some(diameter)) => format!(
-                    "{} × Ø{} mm",
-                    compact_number(height),
-                    compact_number(diameter)
-                ),
-                (Some(height), None) => format!("{} mm", compact_number(height)),
-                (None, Some(diameter)) => format!("Ø{} mm", compact_number(diameter)),
-                (None, None) => String::new(),
-            }
-        }
-        _ => String::new(),
-    }
-}
-
 fn generic_tolerance_overrides(
     dimensions: &Value,
     tolerances: &HashMap<String, f64>,
 ) -> (Option<f64>, Option<f64>) {
-    let mut diameter_key = None;
-    let mut length_key = None;
-    match dimensions {
-        Value::Object(map) => note_tolerance_map(map, &mut diameter_key, &mut length_key),
-        Value::Array(items) => {
-            for item in items {
-                if let Some(map) = item.as_object() {
-                    note_tolerance_map(map, &mut diameter_key, &mut length_key);
-                }
-            }
-        }
-        Value::String(text) => {
-            if parse_size_text(text).is_some() {
-                diameter_key = Some("diameter".to_string());
-                length_key = Some("length".to_string());
-            }
-        }
-        _ => {}
-    }
-    (
-        length_key.and_then(|key| tolerances.get(&key).copied()),
-        diameter_key.and_then(|key| tolerances.get(&key).copied()),
-    )
-}
-
-fn note_tolerance_map(
-    map: &Map<String, Value>,
-    diameter: &mut Option<String>,
-    length: &mut Option<String>,
-) {
-    if let Some(name) = map.get("name").and_then(Value::as_str) {
-        let numbered = map
-            .get("mm")
-            .and_then(positive_number)
-            .or_else(|| map.get("value").and_then(positive_number))
-            .is_some();
-        if numbered {
-            note_tolerance_key(name, diameter, length);
-        }
-    }
-    for (key, value) in map {
-        if key.eq_ignore_ascii_case("name") || key.eq_ignore_ascii_case("mm") {
-            continue;
-        }
-        if positive_number(value).is_some() {
-            note_tolerance_key(key, diameter, length);
-        }
-    }
-}
-
-fn note_tolerance_key(name: &str, diameter: &mut Option<String>, length: &mut Option<String>) {
-    let key = norm_key(name);
-    match dimension_axis(name) {
-        Some(Axis::Diameter) | Some(Axis::InnerDiameter) if diameter.is_none() => {
-            *diameter = Some(key);
-        }
-        Some(Axis::Length) if length.is_none() => *length = Some(key),
-        _ => {}
-    }
+    let rules = crate::part_size::measurement_rules(dimensions);
+    let pairs = crate::part_size::pairs("", dimensions);
+    let length = if rules.length == crate::part_size::RuleSide::Unset {
+        ["lengthmm", "heightmm"]
+            .into_iter()
+            .find(|key| pairs.iter().any(|(name, _)| name == key))
+            .and_then(|key| tolerances.get(key).copied())
+    } else {
+        rules
+            .length_key
+            .and_then(|key| tolerances.get(key).copied())
+    };
+    let diameter = if rules.diameter == crate::part_size::RuleSide::Unset {
+        ["threadmm", "odmm"]
+            .into_iter()
+            .find(|key| pairs.iter().any(|(name, _)| name == key))
+            .and_then(|key| tolerances.get(key).copied())
+    } else {
+        rules
+            .diameter_key
+            .and_then(|key| tolerances.get(key).copied())
+    };
+    (length, diameter)
 }
 
 fn picked_tolerance(
@@ -1543,6 +1269,7 @@ fn tolerance_keys(kind: &str) -> &'static [&'static str] {
             "l",
         ],
         "thread_diameter" => &[
+            "threadmm",
             "threaddiameter",
             "threaddia",
             "nominaldiameter",
@@ -1550,8 +1277,9 @@ fn tolerance_keys(kind: &str) -> &'static [&'static str] {
             "diametermm",
             "dia",
         ],
-        "across_flats" => &["acrossflats", "widthacrossflats", "af", "flats"],
+        "across_flats" => &["afmm", "acrossflats", "widthacrossflats", "af", "flats"],
         "outer_diameter" => &[
+            "odmm",
             "outerdiameter",
             "od",
             "outsidediameter",
@@ -1559,8 +1287,8 @@ fn tolerance_keys(kind: &str) -> &'static [&'static str] {
             "diametermm",
             "dia",
         ],
-        "inner_diameter" => &["innerdiameter", "id", "insidediameter"],
-        "thickness" => &["thickness", "thk", "height", "heightmm", "h"],
+        "inner_diameter" => &["idmm", "innerdiameter", "id", "insidediameter"],
+        "thickness" => &["thicknessmm", "thickness", "thk", "height", "heightmm", "h"],
         "length" => &[
             "length",
             "totallength",
@@ -1569,7 +1297,7 @@ fn tolerance_keys(kind: &str) -> &'static [&'static str] {
             "len",
             "l",
         ],
-        "width" => &["strapwidth", "width", "bandwidth"],
+        "width" => &["widthmm", "strapwidth", "width", "bandwidth"],
         "free_height" => &[
             "freeheight",
             "height",
@@ -1581,6 +1309,7 @@ fn tolerance_keys(kind: &str) -> &'static [&'static str] {
             "l",
         ],
         "coil_diameter" => &[
+            "odmm",
             "outerdiameter",
             "coildiameter",
             "od",
@@ -2156,22 +1885,24 @@ mod tests {
 
     #[test]
     fn catalogue_size_reads_m6x40() {
-        let from_object = expected_from("bolt", &json!({ "diameterMm": 6, "lengthMm": 40 }));
+        let from_object = expected_from("bolt", "", &json!({ "diameterMm": 6, "lengthMm": 40 }));
         assert_eq!(from_object.diameter_mm, Some(6.0));
         assert_eq!(from_object.length_mm, Some(40.0));
         assert_eq!(expected_label(&from_object), "M6x40");
 
-        let from_text = expected_from("", &json!("M6x40"));
-        assert_eq!(from_text.diameter_mm, Some(6.0));
-        assert_eq!(from_text.length_mm, Some(40.0));
+        let from_text = expected_from("", "", &json!("M6x40"));
+        assert_eq!(from_text.diameter_mm, None);
+        assert_eq!(from_text.length_mm, None);
+        assert!(expected_label(&from_text).is_empty());
 
-        let from_description = expected_from("M6.5x12 bolt", &Value::Null);
-        assert_eq!(from_description.diameter_mm, Some(6.5));
-        assert_eq!(from_description.length_mm, Some(12.0));
-        assert_eq!(expected_label(&from_description), "M6.5x12");
+        let from_description = expected_from("", "", &Value::Null);
+        assert_eq!(from_description.diameter_mm, None);
+        assert_eq!(from_description.length_mm, None);
+        assert!(expected_label(&from_description).is_empty());
 
         let from_list = expected_from(
-            "Grommet Rubber Buffer M22",
+            "",
+            "other",
             &json!([{ "name": "h", "mm": 8.35 }, { "name": "OD", "mm": 22 }]),
         );
         assert_eq!(from_list.diameter_mm, Some(22.0));
@@ -2179,8 +1910,57 @@ mod tests {
     }
 
     #[test]
+    fn measurement_rules_choose_the_expected_sides() {
+        let bolt = expected_from(
+            "",
+            "bolt",
+            &json!({
+                "thread": "M6",
+                "thread_mm": 6.0,
+                "length_mm": 30.0,
+                "af_mm": 10.0,
+                "length_rule": "length_mm",
+                "diameter_rule": "thread"
+            }),
+        );
+        assert_eq!(bolt.length_mm, Some(30.0));
+        assert_eq!(bolt.diameter_mm, Some(6.0));
+        assert_eq!(expected_label(&bolt), "M6x30");
+
+        let nut = expected_from(
+            "",
+            "nut",
+            &json!({
+                "af_mm": 13.0,
+                "height_mm": 7.85,
+                "od_mm": 99.0,
+                "length_rule": "height_mm",
+                "diameter_rule": "af_mm"
+            }),
+        );
+        assert_eq!(nut.diameter_mm, Some(13.0));
+        assert_eq!(nut.length_mm, Some(7.85));
+        assert_eq!(expected_label(&nut), "AF: 13mm, H: 7.85mm");
+
+        let washer = expected_from(
+            "",
+            "washer",
+            &json!({
+                "od_mm": 25.4,
+                "id_mm": 9.8,
+                "thickness_mm": 3.1,
+                "length_rule": "thickness_mm",
+                "diameter_rule": "od_mm"
+            }),
+        );
+        assert_eq!(washer.diameter_mm, Some(25.4));
+        assert_eq!(washer.length_mm, None);
+        assert_eq!(expected_label(&washer), "25.4 × 9.8 × 3.1 mm");
+    }
+
+    #[test]
     fn mismatch_note_names_the_expected_size() {
-        let expected = expected_from("", &json!({ "diameterMm": 6, "lengthMm": 40 }));
+        let expected = expected_from("", "", &json!({ "diameterMm": 6, "lengthMm": 40 }));
         let result = judge(25.2, 6.0, &expected, 1.5, 0.8);
         assert_eq!(result.status, MetrologyStatus::DimensionMismatch);
         assert_eq!(result.note, "Expected M6x40, measured 25.2 mm");
@@ -2257,7 +2037,7 @@ mod tests {
         let width = 220_u32;
         let height = 140_u32;
         let rgb = white_on_black(width, height, 40, 50, 100, 30);
-        let expected = expected_from("bolt", &json!({ "diameterMm": 3, "lengthMm": 10 }));
+        let expected = expected_from("bolt", "", &json!({ "diameterMm": 3, "lengthMm": 10 }));
         let result = measure_rgb(
             &rgb,
             width,
@@ -2334,7 +2114,7 @@ mod tests {
         let width = 220_u32;
         let height = 140_u32;
         let rgb = white_on_black(width, height, 40, 50, 100, 30);
-        let expected = expected_from("", &json!({ "diameterMm": 6, "lengthMm": 40 }));
+        let expected = expected_from("", "", &json!({ "diameterMm": 6, "lengthMm": 40 }));
         let mut settings = sample_settings(ThresholdMode::Otsu);
         settings.length_tolerance_mm = 1.5;
         settings.diameter_tolerance_mm = 0.8;
@@ -2784,7 +2564,7 @@ mod tests {
         assert_eq!(tight.status, MetrologyStatus::DimensionMismatch);
         let (length, diameter) = generic_tolerance_overrides(
             &json!({ "h": 6.5, "OD": 13 }),
-            &tolerances_from(&[("h", 0.2), ("od", 0.4)]),
+            &tolerances_from(&[("heightmm", 0.2), ("odmm", 0.4)]),
         );
         assert_eq!(length, Some(0.2));
         assert_eq!(diameter, Some(0.4));

@@ -69,6 +69,16 @@ check(
 	badgeLabel(matched),
 );
 check(
+	"a BoM match badge keeps the catalogue size beside the IC",
+	badgeLabel(
+		pass("matched_bom", {
+			resolvedIc: "2BB08C2HZ",
+			size: "M8x20",
+			score: 0.91,
+		}),
+	) === "2BB08C2HZ M8x20 - 91%",
+);
+check(
 	"a foreign part badge names that IC",
 	badgeLabel(foreign) === "WRONG PART: 2ERGM22 (91%)",
 	badgeLabel(foreign),

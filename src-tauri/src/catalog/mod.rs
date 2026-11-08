@@ -44,6 +44,8 @@ pub(crate) struct CatalogEntry {
     pub ic: String,
     pub description: String,
     pub part_type: String,
+    /// Generated size, for example `M6x30` or `130x37 mm`. Empty when the part has no numbers.
+    pub size: String,
     pub embedding: Vec<f32>,
 }
 
@@ -54,6 +56,8 @@ pub struct CatalogCandidate {
     pub ic: String,
     pub description: String,
     pub part_type: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub size: String,
     pub score: f32,
 }
 
@@ -227,6 +231,7 @@ fn entries_from_parts(parts: Vec<StoredPart>) -> Vec<CatalogEntry> {
                 ic: ic.to_string(),
                 description: part.description.trim().to_string(),
                 part_type: part.part_type.trim().to_string(),
+                size: String::new(),
                 embedding,
             });
         }
@@ -395,6 +400,7 @@ pub(crate) fn score_query(entries: &[CatalogEntry], query: &[f32]) -> CatalogMat
                 ic: entry.ic.clone(),
                 description: entry.description.clone(),
                 part_type: entry.part_type.clone(),
+                size: entry.size.clone(),
                 score,
             },
         );
@@ -578,6 +584,7 @@ mod tests {
             ic: ic.to_string(),
             description: description.to_string(),
             part_type: part_type.to_string(),
+            size: String::new(),
             embedding,
         }
     }

@@ -2785,6 +2785,7 @@ mod tests {
             ic: "ACH01".to_string(),
             description: Some("Hinge".to_string()),
             part_type: Some("hinge".to_string()),
+            size: None,
             score: 0.74,
         }]);
         let value = serde_json::to_value(&shown).unwrap();

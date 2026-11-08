@@ -30,6 +30,9 @@ pub struct TwoPassMatch {
     pub resolved_ic: Option<String>,
     pub description: Option<String>,
     pub part_type: Option<String>,
+    /// Generated catalogue size. Omitted when the part has no numbers.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub size: String,
     pub score: f32,
     pub in_bom: bool,
     /// Top two global item codes. Omitted unless Settings > Training debug is on.
@@ -82,6 +85,7 @@ pub(crate) fn classify(
         part_type: nearest
             .as_ref()
             .and_then(|candidate| blank_to_none(&candidate.part_type)),
+        size: String::new(),
         score: nearest
             .as_ref()
             .map(|candidate| candidate.score)
@@ -98,6 +102,7 @@ pub(crate) fn unrecognized_box(bbox: [i32; 4]) -> TwoPassMatch {
         resolved_ic: None,
         description: None,
         part_type: None,
+        size: String::new(),
         score: 0.0,
         in_bom: false,
         candidates: None,
@@ -117,6 +122,7 @@ fn named(
         resolved_ic: Some(candidate.ic.clone()),
         description: blank_to_none(&candidate.description),
         part_type: blank_to_none(&candidate.part_type),
+        size: candidate.size.clone(),
         score: candidate.score,
         in_bom,
         candidates,
@@ -142,6 +148,8 @@ pub struct DinoHit {
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub part_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
     pub score: f32,
 }
 
@@ -158,6 +166,7 @@ pub(crate) fn top_hits(entries: &[CatalogEntry], query: &[f32], n: usize) -> Vec
             ic: candidate.ic,
             description: blank_to_none(&candidate.description),
             part_type: blank_to_none(&candidate.part_type),
+            size: blank_to_none(&candidate.size),
             score: candidate.score,
         })
         .collect()
@@ -185,6 +194,7 @@ fn rank(entries: &[CatalogEntry], query: &[f32]) -> Vec<CatalogCandidate> {
                 ic: entry.ic.clone(),
                 description: entry.description.clone(),
                 part_type: entry.part_type.clone(),
+                size: entry.size.clone(),
                 score,
             },
         );
@@ -220,6 +230,7 @@ mod tests {
             ic: ic.to_string(),
             description: description.to_string(),
             part_type: part_type.to_string(),
+            size: String::new(),
             embedding,
         }
     }
