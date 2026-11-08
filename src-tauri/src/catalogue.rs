@@ -24,19 +24,26 @@
 //!     {
 //!       "ic": "2BBMNM08",
 //!       "description": "M8 nut",
-//!       "type": "fastener",
+//!       "type": "nut",
 //!       "measurementMethod": "nut",
-//!       "dimensions": { "acrossFlats": 13, "thickness": 6.5 },
+//!       "thread": "M8",
+//!       "af_mm": 13,
+//!       "height_mm": 6.5,
 //!       "crops": ["crops/2BBMNM08.jpg"]
 //!     }
 //!   ]
 //! }
 //! ```
 //!
-//! `ic`, `description` (`des`), `type` (`partType`), `dimensions`, and `crops`
-//! (`images` or `files`) are read. `measurementMethod` is optional. Expected
-//! sizes for that method may sit in `dimensions` or beside it. A top-level
-//! array is also accepted.
+//! `ic`, `description` (`des`), `type` (`partType`), and `crops`
+//! (`images` or `files`) are read. `measurementMethod` is optional. Sizes are
+//! the structured fields `thread`, `length_mm`, `af_mm`, `width_mm`,
+//! `height_mm`, `od_mm`, `id_mm`, and `thickness_mm`, or a `{ name, mm }` list
+//! such as `Length under head` and `Thread diameter`. `length_rule` and
+//! `diameter_rule`, including the copy under `measurement_rules`, name which
+//! of those fields is the length and which is the diameter. The rule note is
+//! kept with the part. A Dimensions string is display text and is not stored
+//! as a measurement. The page shows the size generated from the ruled fields.
 //! A crop path is `crops/<file>.jpg` or `crops/<IC>/<file>.jpg`. The folder
 //! after `crops/` groups those images under that IC. An IC is left out when
 //! its crop list is empty or none of the listed files are in the tar.
@@ -1224,20 +1231,14 @@ fn source_part(map: &Map<String, Value>, enforce_crop_limit: bool) -> Result<Sou
         &field_string(map, &["type", "partType", "part_type"]),
         &format!("Type for {ic}"),
     )?;
-    let mut dimensions = map
-        .get("dimensions")
-        .or_else(|| map.get("dimension"))
-        .or_else(|| map.get("size"))
-        .cloned()
-        .unwrap_or(Value::Null);
-    fold_expected(&mut dimensions, map);
-    if dimensions.to_string().len() > MAX_TEXT {
-        return Err(format!("Dimensions for {ic} are too long."));
-    }
     let measurement_method = clean_method(&field_string(
         map,
         &["measurementMethod", "measurement_method"],
     ));
+    let dimensions = crate::part_size::from_part(&measurement_method, &kind, map);
+    if dimensions.to_string().len() > MAX_TEXT {
+        return Err(format!("Dimensions for {ic} are too long."));
+    }
     let crops = crop_list(map, &ic, enforce_crop_limit)?;
     Ok(SourcePart {
         ic,
@@ -1265,72 +1266,6 @@ fn clean_method(raw: &str) -> String {
         "spring" => "spring".to_string(),
         "custom" => "custom".to_string(),
         _ => String::new(),
-    }
-}
-
-const EXPECTED_KEYS: &[&str] = &[
-    "lengthUnderHead",
-    "threadDiameter",
-    "acrossFlats",
-    "height",
-    "outerDiameter",
-    "innerDiameter",
-    "thickness",
-    "freeHeight",
-    "strapWidth",
-    "lengthMm",
-    "diameterMm",
-    "length",
-    "diameter",
-    "width",
-    "OD",
-    "ID",
-    "h",
-];
-
-/// Copy expected sizes that were written beside `dimensions` into that value
-/// so a later save keeps them.
-fn fold_expected(dimensions: &mut Value, map: &Map<String, Value>) {
-    let mut extras = Map::new();
-    for key in EXPECTED_KEYS {
-        let Some(value) = map.get(*key) else {
-            continue;
-        };
-        if !size_value(value) {
-            continue;
-        }
-        extras.insert((*key).to_string(), value.clone());
-    }
-    if extras.is_empty() {
-        return;
-    }
-    match dimensions {
-        Value::Null => *dimensions = Value::Object(extras),
-        Value::Object(existing) => {
-            for (key, value) in extras {
-                existing.entry(key).or_insert(value);
-            }
-        }
-        Value::Array(items) => {
-            for (key, value) in extras {
-                items.push(serde_json::json!({ "name": key, "mm": value }));
-            }
-        }
-        _ => {}
-    }
-}
-
-fn size_value(value: &Value) -> bool {
-    match value {
-        Value::Number(number) => number
-            .as_f64()
-            .is_some_and(|number| number.is_finite() && number > 0.0),
-        Value::String(text) => text
-            .trim()
-            .parse::<f64>()
-            .ok()
-            .is_some_and(|number| number.is_finite() && number > 0.0),
-        _ => false,
     }
 }
 
@@ -2583,6 +2518,7 @@ fn book_json(book: &Book) -> Result<Vec<u8>, String> {
                 crops: part.crops.clone(),
                 embeddings: part.embeddings.clone(),
                 crop_limit: part.crop_limit.filter(|limit| *limit > MAX_CROPS),
+                extra: Map::new(),
             })
             .collect(),
     };
@@ -2633,6 +2569,10 @@ struct StoredPart {
     embeddings: Vec<Vec<f32>>,
     #[serde(default, rename = "cropLimit", skip_serializing_if = "Option::is_none")]
     crop_limit: Option<usize>,
+    /// Sizes written beside `dimensions` on an older file. They are folded in
+    /// on load and are not written back.
+    #[serde(default, flatten, skip_serializing_if = "Map::is_empty")]
+    extra: Map<String, Value>,
 }
 
 /// Part text stored in `app_config`. Embeddings stay in `dino_catalogue`.
@@ -2855,6 +2795,11 @@ fn entries_of(book: &Book) -> Vec<crate::catalog::CatalogEntry> {
                 ic: part.ic.clone(),
                 description: part.description.trim().to_string(),
                 part_type: part.kind.trim().to_string(),
+                size: crate::part_size::canonical(
+                    &part.measurement_method,
+                    &part.kind,
+                    &part.dimensions,
+                ),
                 embedding,
             });
         }
@@ -2941,12 +2886,14 @@ fn part_from_meta(
         }
         embeddings.push(values.clone());
     }
+    let kind = part.kind.trim().to_string();
+    let measurement_method = clean_method(&part.measurement_method);
     Ok(Part {
         ic,
         description: part.description.trim().to_string(),
-        kind: part.kind.trim().to_string(),
-        measurement_method: clean_method(&part.measurement_method),
-        dimensions: part.dimensions,
+        kind: kind.clone(),
+        measurement_method: measurement_method.clone(),
+        dimensions: crate::part_size::normalize(&measurement_method, &kind, &part.dimensions),
         crops: part.crops,
         embeddings,
         crop_limit,
@@ -3006,12 +2953,16 @@ fn stored_part(part: StoredPart, path: &Path) -> Result<Part, String> {
             return Err(invalid());
         }
     }
+    let kind = part.kind.trim().to_string();
+    let measurement_method = clean_method(&part.measurement_method);
+    let mut sizes = part.extra;
+    sizes.insert("dimensions".to_string(), part.dimensions);
     Ok(Part {
         ic,
         description: part.description.trim().to_string(),
-        kind: part.kind.trim().to_string(),
-        measurement_method: clean_method(&part.measurement_method),
-        dimensions: part.dimensions,
+        kind: kind.clone(),
+        measurement_method: measurement_method.clone(),
+        dimensions: crate::part_size::from_part(&measurement_method, &kind, &sizes),
         crops: part.crops,
         embeddings: part.embeddings,
         crop_limit,
@@ -3315,7 +3266,11 @@ fn views_from(book: &Book, vision: &Path) -> Vec<CatalogueView> {
                 ic: part.ic.clone(),
                 description: part.description.clone(),
                 kind: part.kind.clone(),
-                dimensions: dimensions_text(&part.dimensions),
+                dimensions: crate::part_size::canonical(
+                    &part.measurement_method,
+                    &part.kind,
+                    &part.dimensions,
+                ),
                 thumbs,
                 crops,
                 sizes,
@@ -3332,62 +3287,14 @@ struct SizeRow {
 }
 
 fn size_rows(dimensions: &Value) -> Vec<SizeRow> {
-    let mut rows = Vec::new();
-    match dimensions {
-        Value::Object(map) => {
-            for (key, value) in map {
-                if let Some(text) = number_text(value) {
-                    push_size(&mut rows, key, &text);
-                }
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                let Some(map) = item.as_object() else {
-                    continue;
-                };
-                let Some(name) = map.get("name").and_then(Value::as_str) else {
-                    continue;
-                };
-                let Some(text) = map
-                    .get("mm")
-                    .and_then(number_text)
-                    .or_else(|| map.get("value").and_then(number_text))
-                else {
-                    continue;
-                };
-                push_size(&mut rows, name.trim(), &text);
-            }
-        }
-        Value::String(text) => {
-            if let Some((diameter, length)) = split_size(text) {
-                push_size(&mut rows, "diameter", &diameter);
-                push_size(&mut rows, "length", &length);
-            } else if let Some(number) = number_text(dimensions) {
-                push_size(&mut rows, "size", &number);
-            }
-        }
-        Value::Number(_) => {
-            if let Some(number) = number_text(dimensions) {
-                push_size(&mut rows, "size", &number);
-            }
-        }
-        _ => {}
-    }
-    rows
-}
-
-fn push_size(rows: &mut Vec<SizeRow>, label: &str, value: &str) {
-    let label = label.trim();
-    let key = norm_size_key(label);
-    if label.is_empty() || key.is_empty() || rows.iter().any(|row| row.key == key) {
-        return;
-    }
-    rows.push(SizeRow {
-        key,
-        label: label.to_string(),
-        value: value.to_string(),
-    });
+    crate::part_size::rows(dimensions)
+        .into_iter()
+        .map(|(key, label, value)| SizeRow {
+            key: key.to_string(),
+            label: label.to_string(),
+            value,
+        })
+        .collect()
 }
 
 fn norm_size_key(name: &str) -> String {
@@ -3395,54 +3302,6 @@ fn norm_size_key(name: &str) -> String {
         .filter(|ch| ch.is_ascii_alphanumeric())
         .flat_map(|ch| ch.to_lowercase())
         .collect()
-}
-
-fn number_text(value: &Value) -> Option<String> {
-    match value {
-        Value::Number(number) => Some(number.to_string()),
-        Value::String(text) => leading_number_text(text),
-        _ => None,
-    }
-}
-
-fn leading_number_text(text: &str) -> Option<String> {
-    let text = text.trim();
-    if text.is_empty() {
-        return None;
-    }
-    let mut end = 0;
-    let mut dot = false;
-    let mut digits = false;
-    for (index, ch) in text.char_indices() {
-        if ch.is_ascii_digit() {
-            digits = true;
-            end = index + 1;
-            continue;
-        }
-        if ch == '.' && !dot && digits {
-            dot = true;
-            end = index + 1;
-            continue;
-        }
-        break;
-    }
-    if !digits {
-        return None;
-    }
-    let number: f64 = text[..end].parse().ok()?;
-    if !number.is_finite() || number <= 0.0 {
-        return None;
-    }
-    Some(text[..end].trim_end_matches('.').to_string())
-}
-
-fn split_size(text: &str) -> Option<(String, String)> {
-    let lower = text.trim().to_ascii_lowercase();
-    let index = lower.find(['x', '×'])?;
-    let left = lower[..index].trim().trim_start_matches('m').trim();
-    let mark = lower[index..].chars().next()?.len_utf8();
-    let right = lower[index + mark..].trim();
-    Some((leading_number_text(left)?, leading_number_text(right)?))
 }
 
 fn crop_preview(image: Option<&crate::app_db::StoredCrop>) -> (String, String) {
@@ -3482,12 +3341,12 @@ fn oldest_stamp(
     oldest
 }
 
-/// Description, dimensions, and measurement method for one catalogue item code.
+/// Structured dimensions and measurement method for one catalogue item code.
 /// Detection reads these when metrology is on. The catalogue file is unchanged.
 pub(crate) struct CatalogueSize {
-    pub description: String,
     pub dimensions: Value,
     pub measurement_method: String,
+    pub kind: String,
 }
 
 pub(crate) fn part_dimensions(ic: &str) -> Option<CatalogueSize> {
@@ -3498,40 +3357,10 @@ pub(crate) fn part_dimensions(ic: &str) -> Option<CatalogueSize> {
     let book = lock(&CATALOGUE);
     let part = book.parts.iter().find(|part| part.ic == wanted)?;
     Some(CatalogueSize {
-        description: part.description.clone(),
         dimensions: part.dimensions.clone(),
         measurement_method: part.measurement_method.clone(),
+        kind: part.kind.clone(),
     })
-}
-
-fn dimensions_text(value: &Value) -> String {
-    match value {
-        Value::Null => String::new(),
-        Value::String(text) => text.trim().to_string(),
-        Value::Number(number) => number.to_string(),
-        Value::Bool(flag) => flag.to_string(),
-        Value::Array(items) => items
-            .iter()
-            .map(dimensions_text)
-            .filter(|text| !text.is_empty())
-            .collect::<Vec<_>>()
-            .join(", "),
-        Value::Object(map) => {
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort();
-            keys.into_iter()
-                .filter_map(|key| {
-                    let text = dimensions_text(&map[key]);
-                    if text.is_empty() {
-                        None
-                    } else {
-                        Some(format!("{key} {text}"))
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(", ")
-        }
-    }
 }
 
 fn decode_jpeg(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
@@ -3744,10 +3573,9 @@ mod tests {
         assert_eq!(book.parts[0].ic, "2BBMNM08");
         assert_eq!(book.parts[0].description, "M8 nyloc");
         assert_eq!(book.parts[0].kind, "fastener");
-        assert_eq!(
-            dimensions_text(&book.parts[0].dimensions),
-            "diameterMm 8, lengthMm 12"
-        );
+        assert_eq!(book.parts[0].dimensions["thread"], "M8");
+        assert_eq!(book.parts[0].dimensions["thread_mm"].as_f64(), Some(8.0));
+        assert_eq!(book.parts[0].dimensions["length_mm"].as_f64(), Some(12.0));
         assert_eq!(book.parts[0].crops.len(), 3);
         assert_eq!(book.parts[0].embeddings.len(), 3);
         assert!(book.parts[0].crops[0].starts_with("catalogue-crops/2BBMNM08/"));
@@ -3755,12 +3583,12 @@ mod tests {
         assert!(!dir.join("catalogue-crops").exists());
         assert_eq!(book.parts[1].ic, "2ECT");
         assert_eq!(book.parts[1].kind, "label");
-        assert_eq!(book.parts[1].dimensions, Value::String("20 mm".to_string()));
+        assert!(book.parts[1].dimensions.is_null());
         let listed = catalogue_list_from(&dir).unwrap();
         assert_eq!(listed.parts.len(), 2);
         assert_eq!(listed.parts[0].description, "M8 nyloc");
         assert_eq!(listed.parts[0].kind, "fastener");
-        assert_eq!(listed.parts[0].dimensions, "diameterMm 8, lengthMm 12");
+        assert_eq!(listed.parts[0].dimensions, "M8x12");
         assert_eq!(listed.parts[0].thumbs.len(), 3);
         assert!(listed.parts[0].thumbs[0].starts_with("data:image/jpeg;base64,"));
 
@@ -3877,10 +3705,7 @@ mod tests {
         assert_eq!(built.book.parts[0].ic, "2ERGM22");
         assert_eq!(built.book.parts[0].description, "Hinge plate");
         assert_eq!(built.book.parts[0].kind, "plate");
-        assert_eq!(
-            built.book.parts[0].dimensions,
-            Value::String("10 mm".to_string())
-        );
+        assert!(built.book.parts[0].dimensions.is_null());
         assert_eq!(built.book.parts[0].crops.len(), 3);
         assert_eq!(built.book.parts[0].embeddings.len(), 3);
         assert!(built.book.parts[0].crops[0].ends_with("000001_crop_007.jpg"));
@@ -4208,7 +4033,10 @@ mod tests {
         .unwrap();
         let book = load_book(&dir).unwrap().unwrap();
         assert_eq!(book.parts[0].measurement_method, "bolt");
-        assert_eq!(book.parts[0].dimensions["headHeight"], serde_json::json!(5));
+        assert!(book.parts[0].dimensions.get("headHeight").is_none());
+        assert_eq!(book.parts[0].dimensions["thread"], "M6");
+        assert_eq!(book.parts[0].dimensions["thread_mm"].as_f64(), Some(6.0));
+        assert_eq!(book.parts[0].dimensions["length_mm"].as_f64(), Some(40.0));
         let bytes = book_json(&book).unwrap();
         let saved: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(saved["parts"][0]["measurementMethod"], "bolt");
@@ -4232,11 +4060,10 @@ mod tests {
         ]);
         let built = build_from_tar(&packed, &mut stub_embed).unwrap();
         assert_eq!(built.book.parts[0].measurement_method, "cable_tie");
-        assert_eq!(built.book.parts[0].dimensions[0]["name"], "OD");
-        assert_eq!(built.book.parts[0].dimensions[1]["name"], "outerDiameter");
+        assert_eq!(built.book.parts[0].dimensions["od_mm"].as_f64(), Some(16.0));
         assert_eq!(
-            built.book.parts[0].dimensions[2]["mm"],
-            serde_json::json!(1.5)
+            built.book.parts[0].dimensions["thickness_mm"].as_f64(),
+            Some(1.5)
         );
 
         let plain = serde_json::json!({
@@ -4258,6 +4085,7 @@ mod tests {
         .unwrap();
         let plain_book = load_book(&plain_dir).unwrap().unwrap();
         assert!(plain_book.parts[0].measurement_method.is_empty());
+        assert!(plain_book.parts[0].dimensions.is_null());
         let plain_json: Value = serde_json::from_slice(&book_json(&plain_book).unwrap()).unwrap();
         assert!(plain_json["parts"][0].get("measurementMethod").is_none());
         let _ = fs::remove_dir_all(&plain_dir);
@@ -4325,7 +4153,7 @@ mod tests {
         let both = &book.parts[1];
         assert_eq!(both.description, "New text");
         assert_eq!(both.kind, "nut");
-        assert_eq!(both.dimensions["acrossFlats"], serde_json::json!(13));
+        assert_eq!(both.dimensions["af_mm"].as_f64(), Some(13.0));
         assert_eq!(both.crops.len(), 2);
         assert!(both.crops[0].ends_with("both.jpg"));
         assert!(both.crops[1].ends_with("crop-1.jpg"));
@@ -4976,8 +4804,8 @@ mod tests {
             .iter()
             .map(|row| row.key.as_str())
             .collect();
-        assert!(keys.contains(&"acrossflats"), "{keys:?}");
-        assert!(keys.contains(&"h"), "{keys:?}");
+        assert!(keys.contains(&"afmm"), "{keys:?}");
+        assert!(keys.contains(&"heightmm"), "{keys:?}");
         assert!(
             listed.parts[0]
                 .sizes
@@ -4986,14 +4814,14 @@ mod tests {
         );
 
         let before = stored_catalogue(&dir);
-        set_tolerance(&dir, "2BBMNM08", "h", Some(0.25)).unwrap();
+        set_tolerance(&dir, "2BBMNM08", "heightmm", Some(0.25)).unwrap();
         assert_eq!(stored_catalogue(&dir), before);
         assert!(!String::from_utf8_lossy(&before).contains("tolerance"));
         let saved = catalogue_list_from(&dir).unwrap();
         let height = saved.parts[0]
             .sizes
             .iter()
-            .find(|row| row.key == "h")
+            .find(|row| row.key == "heightmm")
             .unwrap();
         assert_eq!(height.tolerance_mm, Some(0.25));
         assert!(set_tolerance(&dir, "2BBMNM08", "nope", Some(1.0)).is_err());

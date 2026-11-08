@@ -552,8 +552,15 @@ function menuCanPrimary(): boolean {
 											{addedLabel(part.addedUnix, Date.now())}
 										</p>
 									{/if}
-									{#if part.description}
-										<p class="text-sm text-neutral-200">{part.description}</p>
+									{#if part.description || part.dimensions}
+										<p class="text-sm text-neutral-200">
+											{#if part.description}{part.description}{/if}
+											{#if part.dimensions}
+												<span class="font-medium text-neutral-100"
+													>{part.description ? " " : ""}{part.dimensions}</span
+												>
+											{/if}
+										</p>
 									{/if}
 									{#if part.type}
 										<p class="text-sm text-neutral-400">Type {part.type}</p>
@@ -583,8 +590,6 @@ function menuCanPrimary(): boolean {
 												</label>
 											{/each}
 										</div>
-									{:else if part.dimensions}
-										<p class="text-sm text-neutral-400">{part.dimensions}</p>
 									{/if}
 								</div>
 								<button

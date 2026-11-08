@@ -12,6 +12,7 @@ mod inference;
 mod inference_ep;
 mod local_config;
 mod metrology;
+mod part_size;
 mod results;
 mod training;
 mod vision;

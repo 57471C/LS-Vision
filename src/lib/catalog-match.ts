@@ -6,6 +6,7 @@ export type CatalogCandidate = {
 	ic: string;
 	description: string;
 	partType: string;
+	size?: string;
 	score: number;
 };
 
@@ -22,10 +23,12 @@ function readCandidate(value: unknown): CatalogCandidate | null {
 	if (typeof row.ic !== "string" || !row.ic.trim()) return null;
 	const score = typeof row.score === "number" ? row.score : Number.NaN;
 	if (!Number.isFinite(score)) return null;
+	const size = typeof row.size === "string" ? row.size.trim() : "";
 	return {
 		ic: row.ic,
 		description: typeof row.description === "string" ? row.description : "",
 		partType: typeof row.partType === "string" ? row.partType : "",
+		...(size ? { size } : {}),
 		score,
 	};
 }
@@ -59,6 +62,7 @@ export type TwoPassMatch = {
 	resolvedIc: string | null;
 	description: string | null;
 	partType: string | null;
+	size?: string;
 	score: number;
 	inBom: boolean;
 	candidates?: CatalogCandidate[];
@@ -94,12 +98,14 @@ export function readTwoPass(value: unknown): TwoPassMatch | undefined {
 			.every((item) => typeof item === "number" && Number.isFinite(item))
 			? box.slice(0, 4)
 			: [0, 0, 0, 0];
+	const size = readText(row.size);
 	const match: TwoPassMatch = {
 		boundingBox,
 		status: row.status,
 		resolvedIc: readText(row.resolvedIc),
 		description: readText(row.description),
 		partType: readText(row.partType),
+		...(size ? { size } : {}),
 		score,
 		inBom: row.inBom === true,
 	};
@@ -119,14 +125,21 @@ function matchPercent(score: number): number {
 	return Math.round(clamped * 100);
 }
 
+function sizedCode(ic: string, size: string | undefined): string {
+	const extra = size?.trim() ?? "";
+	return extra ? `${ic} ${extra}` : ic;
+}
+
 // Operator badge. The percent is the cosine score, rounded.
+// A catalogue size sits beside the item code, for example `2BB08C2HZ M8x20 - 91%`.
 export function badgeLabel(match: TwoPassMatch): string {
 	const pct = matchPercent(match.score);
+	const code = sizedCode(match.resolvedIc ?? "—", match.size);
 	if (match.status === "matched_bom") {
-		return `${match.resolvedIc ?? "—"} - ${pct}%`;
+		return `${code} - ${pct}%`;
 	}
 	if (match.status === "wrong_part") {
-		return `WRONG PART: ${match.resolvedIc ?? "—"} (${pct}%)`;
+		return `WRONG PART: ${code} (${pct}%)`;
 	}
 	const kind = match.partType?.trim();
 	return kind ? `UNKNOWN ${kind} (${pct}%)` : `UNKNOWN (${pct}%)`;
@@ -191,6 +204,32 @@ type OutsideBox = {
 	twoPass?: TwoPassMatch;
 };
 
+// Catalogue size for one BoM line. The first detection of that item code wins.
+export function catalogueSize(
+	items: readonly { twoPass?: { resolvedIc?: string | null; size?: string } }[],
+	ic: string,
+): string {
+	const wanted = ic.trim();
+	if (!wanted) return "";
+	for (const item of items) {
+		const pass = item.twoPass;
+		if (!pass || (pass.resolvedIc ?? "").trim() !== wanted) continue;
+		const size = pass.size?.trim() ?? "";
+		if (size) return size;
+	}
+	return "";
+}
+
+// Job-card text, then the generated size when the catalogue has one.
+export function descriptionWithSize(des: string, size: string | undefined): string {
+	const text = des.trim();
+	const extra = size?.trim() ?? "";
+	if (!extra) return text;
+	if (!text) return extra;
+	if (text === extra || text.endsWith(` ${extra}`)) return text;
+	return `${text} ${extra}`;
+}
+
 function catalogueDescription(item: OutsideBox): string {
 	const match = item.catalogMatch;
 	if (!match?.recognized) return "";
@@ -230,7 +269,10 @@ export function partsOutsideBom(
 			if (pass.status === "wrong_part") {
 				const ic = pass.resolvedIc?.trim() ?? "";
 				if (!ic) continue;
-				const des = pass.description?.trim() ?? "";
+				const des = descriptionWithSize(
+					pass.description?.trim() ?? "",
+					pass.size,
+				);
 				add(`${ic}\0${des}`, ic, des);
 				continue;
 			}

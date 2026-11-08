@@ -30,6 +30,7 @@ type ResidualPass = {
 	resolvedIc?: string | null;
 	description?: string | null;
 	partType?: string | null;
+	size?: string;
 	score?: number;
 };
 
@@ -303,19 +304,29 @@ function nearMissLabel(item: ResidualBox): string {
 	return "WRONG LENGTH";
 }
 
+function withSize(ic: string, size: string | undefined): string {
+	const code = clean(ic);
+	const extra = clean(size);
+	if (!code) return "";
+	return extra ? `${code} ${extra}` : code;
+}
+
 function matchedLabel(item: ResidualBox): string {
-	const ic = clean(item.twoPass?.resolvedIc) || clean(item.ic);
+	const ic = withSize(
+		clean(item.twoPass?.resolvedIc) || clean(item.ic),
+		item.twoPass?.size,
+	);
 	if (item.twoPass && ic) return `${ic} - ${percent(item.twoPass.score)}%`;
 	return ic || "—";
 }
 
 function surplusIc(item: ResidualBox): string {
-	return countedIc(item) || identityIc(item) || "—";
+	return withSize(countedIc(item) || identityIc(item), item.twoPass?.size) || "—";
 }
 
 function rogueLabel(item: ResidualBox): string {
 	if (item.twoPass?.status === "wrong_part") {
-		const ic = clean(item.twoPass.resolvedIc);
+		const ic = withSize(item.twoPass.resolvedIc ?? "", item.twoPass.size);
 		if (ic) return ic;
 	}
 	return "UNKNOWN";

@@ -2,7 +2,11 @@
 // biome-ignore-all lint/correctness/noUnusedVariables: Biome 2.4 does not treat Svelte template references as uses
 // biome-ignore-all lint/correctness/noUnusedImports: Biome 2.4 does not treat Svelte template references as uses
 
-import { partsOutsideBom } from "$lib/catalog-match";
+import {
+	catalogueSize,
+	descriptionWithSize,
+	partsOutsideBom,
+} from "$lib/catalog-match";
 import { panelsForSlots } from "$lib/detect-rois";
 import {
 	detectionCounts,
@@ -176,7 +180,9 @@ function slotVerdict(panel: SlotDetections): "pass" | "fail" | "incomplete" {
 							{@const tally = lineTally(seen, part.qty)}
 							<tr class="border-b border-neutral-800">
 								<td class="py-2 pr-3 font-mono font-medium">{part.ic}</td>
-								<td class="py-2 pr-3 text-neutral-200">{part.des}</td>
+								<td class="py-2 pr-3 text-neutral-200"
+									>{descriptionWithSize(part.des, catalogueSize($operator.detections, part.ic))}</td
+								>
 								<td class="py-2 text-right font-semibold">{part.qty}</td>
 								{#if showSeen}
 									<td
@@ -335,7 +341,12 @@ function slotVerdict(panel: SlotDetections): "pass" | "fail" | "incomplete" {
 									{@const tally = lineTally(seen, part.qty)}
 									<tr class="border-b border-neutral-800">
 										<td class="py-2 pr-3 font-mono font-medium">{part.ic}</td>
-										<td class="py-2 pr-3 text-neutral-200">{part.des}</td>
+										<td class="py-2 pr-3 text-neutral-200"
+											>{descriptionWithSize(
+												part.des,
+												catalogueSize(panel.detections, part.ic),
+											)}</td
+										>
 										<td class="py-2 text-right font-semibold">{part.qty}</td>
 										{#if showSeen}
 											<td

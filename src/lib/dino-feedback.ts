@@ -9,6 +9,7 @@ export type DinoMatch = {
 	ic: string;
 	description: string;
 	partType: string;
+	size?: string;
 	score: number;
 };
 
@@ -28,6 +29,7 @@ export function readDinoMatches(value: unknown): DinoMatch[] {
 			ic?: unknown;
 			description?: unknown;
 			partType?: unknown;
+			size?: unknown;
 			score?: unknown;
 		};
 		const ic = typeof row.ic === "string" ? row.ic.trim() : "";
@@ -37,7 +39,14 @@ export function readDinoMatches(value: unknown): DinoMatch[] {
 			typeof row.description === "string" ? row.description.trim() : "";
 		const partType =
 			typeof row.partType === "string" ? row.partType.trim() : "";
-		matches.push({ ic, description, partType, score: row.score });
+		const size = typeof row.size === "string" ? row.size.trim() : "";
+		matches.push({
+			ic,
+			description,
+			partType,
+			...(size ? { size } : {}),
+			score: row.score,
+		});
 	}
 	return matches;
 }
@@ -62,7 +71,8 @@ export function dinoMatchLine(matches: readonly DinoMatch[]): string {
 // Dropdown label: `bolt — M6 hex  0.81`.
 export function dinoMatchChoice(match: DinoMatch): string {
 	const type = partWords(match.partType);
-	const name = dinoMatchLabel(match);
+	const size = match.size?.trim() ?? "";
+	const name = size ? `${dinoMatchLabel(match)} ${size}` : dinoMatchLabel(match);
 	const score = match.score.toFixed(2);
 	if (!type || type.toLowerCase() === name.toLowerCase())
 		return `${name}  ${score}`;
