@@ -3710,8 +3710,8 @@ onDestroy(() => {
 								</label>
 								<p class="text-sm text-neutral-400">
 									How often the live feed checks for a barcode. The default is 8 seconds.
-									Disable stops the camera barcode read. The operator page then focuses the job card field so a code can be typed.
-									Motion delay is how long detection waits after a barcode is accepted. The default is 400. The frozen frame stays as it is.
+									Disable stops the camera barcode read. The operator page then focuses the job card field so a code can be typed. Enter loads that job card and runs detection.
+									Motion delay is how long detection waits after a barcode or a typed job card is accepted. The default is 400. The frozen frame stays as it is.
 								</p>
 							</fieldset>
 							<button

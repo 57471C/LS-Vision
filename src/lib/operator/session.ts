@@ -99,6 +99,8 @@ function attachSession(
 		image?: string;
 		width?: number;
 		height?: number;
+		previewWidth?: number;
+		previewHeight?: number;
 		timestamp_ms?: number;
 		jobCardNumber?: string;
 	};
@@ -606,12 +608,58 @@ function attachSession(
 		}
 	}
 
-	function applyLookup(view: InspectView) {
+	// The live canvas may not have painted yet. One preview JPEG is enough to hold.
+	async function ensurePreviewImage() {
+		if (previewImage) return;
+		const preview = await invoke<WatchBody>("capture_preview", {
+			index: Number(op.cameraIndex),
+		});
+		if (!pageAlive || preview.status === "fail" || !preview.image) return;
+		previewImage = preview.image;
+		if (typeof preview.previewWidth === "number" && preview.previewWidth > 0) {
+			previewWidth = preview.previewWidth;
+		}
+		if (typeof preview.previewHeight === "number" && preview.previewHeight > 0) {
+			previewHeight = preview.previewHeight;
+		}
+	}
+
+	// A typed code has no decode frame. Freeze the preview, store a raw snapshot,
+	// then wait and detect the same way a barcode hit does.
+	async function detectTypedFrame(kitCode: string) {
+		await yieldToPaint();
+		if (!pageAlive) return;
+		await ensurePreviewImage();
+		if (!pageAlive) return;
+		const generation = holdPreviewStill(kitCode);
+		if (generation === null) {
+			stopWatch();
+			stopLive();
+		}
+		const frame = await readFrame(op.cameraIndex);
+		if (!pageAlive) return;
+		if (generation !== null && generation !== detectGeneration) return;
+		noteRawSize(frame);
+		await detectAfterSettle(generation);
+	}
+
+	async function applyLookup(view: InspectView) {
 		op.result = view;
 		if (view.status === "pass") {
 			storeBom(view);
 			if (op.testMode && op.bom) {
 				void chooseAndDetect();
+				return;
+			}
+			if (!op.testMode) {
+				try {
+					await detectTypedFrame(view.kitCode || op.barcode);
+				} catch (err: unknown) {
+					if (!pageAlive) return;
+					op.detectMessage = invokeError(err, "Camera did not open.");
+					op.detectState = "done";
+					void recordResult(null, true);
+				}
 				return;
 			}
 		} else {
@@ -2371,7 +2419,7 @@ function attachSession(
 		op.loading = true;
 		op.result = null;
 		try {
-			applyLookup(await lookupCode(op.barcode));
+			await applyLookup(await lookupCode(op.barcode));
 		} catch (err: unknown) {
 			op.result = {
 				status: "fail",
@@ -2389,7 +2437,7 @@ function attachSession(
 		op.loading = true;
 		op.result = null;
 		try {
-			applyLookup(await lookupCode(op.barcode));
+			await applyLookup(await lookupCode(op.barcode));
 		} catch (err: unknown) {
 			op.result = {
 				status: "fail",
@@ -2417,7 +2465,7 @@ function attachSession(
 		op.loading = true;
 		op.result = null;
 		try {
-			applyLookup(await lookupCode(op.barcode));
+			await applyLookup(await lookupCode(op.barcode));
 		} catch (err: unknown) {
 			op.result = {
 				status: "fail",
