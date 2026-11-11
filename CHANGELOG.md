@@ -4,7 +4,7 @@
 
 - A DINO catalogue import stores structured millimetres with each class's length rule, diameter rule, and note. The operator overlay, the BoM line, and View references show the generated size, such as `M8x20` or `130x37 mm`. Metrology checks the fields those rules name. A Dimensions string is not parsed.
 - Settings and the DINOv2 catalogue, including crop images, are stored in the results database. The first launch copies `vision/config.local.json` into that database when it has no settings. Settings > Training chooses the DINOv2 model, and the installer bundles both register models.
-- After a barcode is accepted, detection waits for the motion delay. The overlay marks a match, a near miss, an extra, and an unknown part. Hovering a box shows its measured sizes.
+- After a barcode is accepted, detection waits for the motion delay. The overlay marks a match, a near miss, an extra, and an unknown part. Hovering a finished detection box shows its measurement arrows and measured sizes. Out-of-spec arrows stay visible.
 - A typed job card that returns a BoM freezes the live feed and runs that same detection. The camera barcode path is unchanged.
 - Preview Detect lists the closest catalogue matches. Append, and a marquee tick, save that crop under the item code the admin enters.
 

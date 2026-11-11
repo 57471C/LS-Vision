@@ -29,6 +29,7 @@ import {
 import {
 	type DimensionMark,
 	layoutDimensions,
+	measurementArrowsVisible,
 	metrologyReadout,
 	metrologySpans,
 	mismatchNote,
@@ -104,6 +105,10 @@ type DetectionMark = {
 	noteFill: string;
 	noteKind: string;
 	residual: string;
+	// Present even when the arrows are hidden, so hover can say why none drew.
+	spanCount: number;
+	rawSpanCount: number;
+	measureStatus: string;
 	dimensions: DimensionMark[];
 };
 
@@ -130,6 +135,12 @@ function imageLoaded(event: Event) {
 			? event.currentTarget
 			: null;
 	rememberPaneSize(image);
+}
+
+function rawSpanCount(value: unknown): number {
+	if (!value || typeof value !== "object") return 0;
+	const spans = (value as { spans?: unknown }).spans;
+	return Array.isArray(spans) ? spans.length : 0;
 }
 
 function colorForIc(ic: string): string {
@@ -242,24 +253,33 @@ function detectionMarks(
 		];
 		if (note) avoids.push({ x: noteX, y: noteY, w: noteW, h: noteH });
 		if (item.slot) avoids.push({ x, y, w: 14, h: 14 });
-		const dimensions = layoutDimensions(
-			metrologySpans(item.metrology).map((span) => ({
-				...span,
-				x1: originX + span.x1 * scale,
-				y1: originY + span.y1 * scale,
-				x2: originX + span.x2 * scale,
-				y2: originY + span.y2 * scale,
-			})),
-			readMetrologyResult(item.metrology)?.status === "DIMENSION_MISMATCH",
-			avoids,
-			{
-				x: originX,
-				y: originY,
-				w: paneWidth * scale,
-				h: paneHeight * scale,
-			},
-			1,
-		);
+		const measured = readMetrologyResult(item.metrology);
+		const outOfSpec = measured?.status === "DIMENSION_MISMATCH";
+		const spans = metrologySpans(item.metrology);
+		// The same spans drive the hover sizes and the out-of-spec lines.
+		const dimensions = measurementArrowsVisible(
+			measured?.status,
+			hoverKey === key,
+		)
+			? layoutDimensions(
+					spans.map((span) => ({
+						...span,
+						x1: originX + span.x1 * scale,
+						y1: originY + span.y1 * scale,
+						x2: originX + span.x2 * scale,
+						y2: originY + span.y2 * scale,
+					})),
+					outOfSpec,
+					avoids,
+					{
+						x: originX,
+						y: originY,
+						w: paneWidth * scale,
+						h: paneHeight * scale,
+					},
+					1,
+				)
+			: [];
 		const tint = item.slot ? slotColor(item.slot).stroke : "";
 		marks.push({
 			key,
@@ -292,6 +312,9 @@ function detectionMarks(
 			noteFill: mismatch ? "#dc2626" : "#171717",
 			noteKind: mismatch ? "DIMENSION_MISMATCH" : hover ? "hover" : "",
 			residual: item.residual ?? "",
+			spanCount: spans.length,
+			rawSpanCount: rawSpanCount(item.metrology),
+			measureStatus: measured?.status ?? "",
 			dimensions,
 		});
 	}
@@ -438,6 +461,23 @@ $: bannerCount = (wrongParts ? 1 : 0) + (extraParts > 0 ? 1 : 0);
 
 let hoveredKey = "";
 let hoverSnapshot = "";
+let loggedHover = "";
+let imageHost: HTMLDivElement | undefined;
+
+// Geometry only. This list does not read the hover key, so adding arrows does
+// not move the boxes the pointer is tested against.
+$: hitMarks = detectionMarks(
+	$operator.snapshot,
+	$operator.paneWidth,
+	$operator.paneHeight,
+	$operator.frameWidth,
+	$operator.frameHeight,
+	overlayBoxes,
+	$zoom,
+	$operator.bom?.parts ?? null,
+	$operator.admin,
+	"",
+);
 
 $: snapshotMarks = detectionMarks(
 	$operator.snapshot,
@@ -449,7 +489,7 @@ $: snapshotMarks = detectionMarks(
 	$zoom,
 	$operator.bom?.parts ?? null,
 	$operator.admin,
-	hoveredKey,
+	$operator.detectState === "done" ? hoveredKey : "",
 );
 
 $: {
@@ -460,48 +500,74 @@ $: {
 	}
 }
 
-function overlayPoint(event: PointerEvent): { x: number; y: number } | null {
-	const overlay = refs.paneFrame?.querySelector("[data-detection-overlay]");
-	if (!(overlay instanceof SVGSVGElement)) return null;
-	const rect = overlay.getBoundingClientRect();
-	const width = overlay.viewBox.baseVal.width || overlay.width.baseVal.value;
-	const height = overlay.viewBox.baseVal.height || overlay.height.baseVal.value;
-	if (rect.width < 1 || rect.height < 1 || width < 1 || height < 1) return null;
-	return {
-		x: ((event.clientX - rect.left) / rect.width) * width,
-		y: ((event.clientY - rect.top) / rect.height) * height,
-	};
+function snapshotPoint(event: PointerEvent): { x: number; y: number } | null {
+	const host = imageHost;
+	if (!host || !$operator.snapshot || $operator.detectState !== "done") return null;
+	const rect = host.getBoundingClientRect();
+	const viewW = $zoom ? $zoom.width : $operator.frameWidth;
+	const viewH = $zoom ? $zoom.height : $operator.frameHeight;
+	if (rect.width < 1 || rect.height < 1 || viewW < 1 || viewH < 1) return null;
+	const x = ((event.clientX - rect.left) / rect.width) * viewW;
+	const y = ((event.clientY - rect.top) / rect.height) * viewH;
+	if (x < 0 || y < 0 || x > viewW || y > viewH) return null;
+	return { x, y };
+}
+
+function hitKeyAt(x: number, y: number): string {
+	// Later boxes are painted on top. A few pixels covers the stroke.
+	const slop = 4;
+	for (let index = hitMarks.length - 1; index >= 0; index -= 1) {
+		const mark = hitMarks[index];
+		if (mark.child) continue;
+		if (
+			x >= mark.x - slop &&
+			x <= mark.x + mark.w + slop &&
+			y >= mark.y - slop &&
+			y <= mark.y + mark.h + slop
+		) {
+			return mark.key;
+		}
+	}
+	return "";
 }
 
 function onSnapshotPointerMove(event: PointerEvent) {
-	if (!$operator.snapshot) {
-		hoveredKey = "";
+	// The finished still owns this test. The live canvas is not a hit target.
+	// Adding arrows does not change the host rectangle, so the key stays set.
+	const point = snapshotPoint(event);
+	if (!point) return;
+	const key = hitKeyAt(point.x, point.y);
+	if (key) {
+		if (hoveredKey !== key) hoveredKey = key;
 		return;
 	}
-	const point = overlayPoint(event);
-	if (!point) {
-		hoveredKey = "";
-		return;
-	}
-	let found = "";
-	for (let index = snapshotMarks.length - 1; index >= 0; index -= 1) {
-		const mark = snapshotMarks[index];
-		if (mark.child) continue;
-		if (
-			point.x >= mark.x &&
-			point.x <= mark.x + mark.w &&
-			point.y >= mark.y &&
-			point.y <= mark.y + mark.h
-		) {
-			found = mark.key;
-			break;
-		}
-	}
-	if (found !== hoveredKey) hoveredKey = found;
+	if (hoveredKey) hoveredKey = "";
 }
 
-function onSnapshotPointerLeave() {
+function onSnapshotPointerLeave(event: PointerEvent) {
+	const next = event.relatedTarget;
+	if (next instanceof Node && refs.paneFrame?.contains(next)) return;
 	hoveredKey = "";
+}
+
+$: hoverStatus = (() => {
+	if (!$operator.snapshot || $operator.detectState !== "done") return "";
+	const boxes = hitMarks.filter((mark) => !mark.child);
+	const withSpans = boxes.filter((mark) => mark.spanCount > 0).length;
+	if (!hoveredKey) {
+		return `Hover none · ${boxes.length} boxes · ${withSpans} with spans`;
+	}
+	const mark = snapshotMarks.find((item) => item.key === hoveredKey);
+	if (!mark) return `Hover ${hoveredKey} · box missing`;
+	const status = mark.measureStatus || "no measure";
+	const payload =
+		mark.rawSpanCount === mark.spanCount ? "" : ` payload ${mark.rawSpanCount}`;
+	return `Hover ${mark.ic || "box"} · ${status} · spans ${mark.spanCount}${payload} · arrows ${mark.dimensions.length}`;
+})();
+
+$: if (hoverStatus && hoverStatus !== loggedHover) {
+	loggedHover = hoverStatus;
+	console.info("[metrology-hover]", hoverStatus);
 }
 </script>
 
@@ -556,17 +622,25 @@ function onSnapshotPointerLeave() {
 		{#if $operator.roiMessage}
 			<p class="text-xs text-amber-200">{$operator.roiMessage}</p>
 		{:else if $operator.snapshot}
-			<p class="text-xs text-amber-200">Automatic stream is stopped</p>
+			<div class="min-w-0 text-right">
+				<p class="text-xs text-amber-200">Automatic stream is stopped</p>
+				{#if hoverStatus}
+					<p class="truncate font-mono text-[11px] text-neutral-100" data-hover-status>
+						{hoverStatus}
+					</p>
+				{/if}
+			</div>
 		{/if}
 	</div>
 	<div
 		bind:this={refs.paneFrame}
 		class="relative min-h-0 flex-1 overflow-hidden"
-		on:pointermove={onSnapshotPointerMove}
+		on:pointermove|capture={onSnapshotPointerMove}
 		on:pointerleave={onSnapshotPointerLeave}
 	>
 		{#if $operator.snapshot || ($operator.feedOn && $cameraFeedOn)}
 			<div
+				bind:this={imageHost}
 				class="absolute {$zoom ? '' : 'inset-0'}"
 				style={$zoom
 					? `left:${$zoom.left}px;top:${$zoom.top}px;width:${$zoom.width}px;height:${$zoom.height}px;`
@@ -575,7 +649,7 @@ function onSnapshotPointerLeave() {
 				{#if $operator.feedOn && $cameraFeedOn}
 					<canvas
 						bind:this={refs.liveCanvas}
-						class="h-full w-full {$zoom ? 'object-fill' : 'object-contain'}"
+						class="pointer-events-none h-full w-full {$zoom ? 'object-fill' : 'object-contain'}"
 						class:invisible={Boolean($operator.snapshot) || !$operator.livePainted}
 						aria-label="Camera feed"
 					></canvas>
@@ -592,9 +666,9 @@ function onSnapshotPointerLeave() {
 						alt={$operator.snapshot.detected
 							? `Detected parts for kit ${$operator.snapshot.kitCode}`
 							: `Snapshot of kit ${$operator.snapshot.kitCode}`}
-						class="{$operator.feedOn && $cameraFeedOn
-							? 'absolute inset-0'
-							: ''} h-full w-full {$zoom ? 'object-fill' : 'object-contain'}"
+						class="pointer-events-none {$operator.feedOn && $cameraFeedOn
+							? 'absolute inset-0 z-0'
+							: 'relative z-0'} h-full w-full {$zoom ? 'object-fill' : 'object-contain'}"
 						on:load={imageLoaded}
 					/>
 				{/if}
@@ -690,14 +764,14 @@ function onSnapshotPointerLeave() {
 				{#if $operator.snapshot && $operator.paneWidth > 0 && $operator.paneHeight > 0 && overlayBoxes.length > 0}
 					{@const viewW = $zoom ? $zoom.width : $operator.frameWidth}
 					{@const viewH = $zoom ? $zoom.height : $operator.frameHeight}
-					{#if snapshotMarks.length > 0 && viewW > 0 && viewH > 0}
+					{#if (snapshotMarks.length > 0 || hitMarks.length > 0) && viewW > 0 && viewH > 0}
 						<svg
-							class="pointer-events-none absolute left-0 top-0 z-10"
+							class="pointer-events-none absolute inset-0 z-[16] h-full w-full overflow-hidden"
+							style="pointer-events: none"
 							data-detection-overlay
-							width={viewW}
-							height={viewH}
 							viewBox="0 0 {viewW} {viewH}"
 							preserveAspectRatio="none"
+							overflow="hidden"
 							aria-hidden="true"
 						>
 							{#each snapshotMarks as mark (mark.key)}
@@ -711,6 +785,7 @@ function onSnapshotPointerLeave() {
 										stroke="#d4d4d4"
 										stroke-opacity="0.55"
 										stroke-width={CHILD_STROKE}
+										pointer-events="none"
 										data-part-role="child"
 									/>
 									<text
@@ -721,6 +796,7 @@ function onSnapshotPointerLeave() {
 										font-size={LABEL_FONT}
 										font-family="ui-monospace, monospace"
 										font-weight="600"
+										pointer-events="none"
 										data-part-role="child"
 									>
 										{mark.label}
@@ -734,6 +810,7 @@ function onSnapshotPointerLeave() {
 											y2={mark.y + mark.h}
 											stroke="#dc2626"
 											stroke-width={BOX_STROKE}
+											pointer-events="none"
 										/>
 										<line
 											x1={mark.x + mark.w}
@@ -742,6 +819,7 @@ function onSnapshotPointerLeave() {
 											y2={mark.y + mark.h}
 											stroke="#dc2626"
 											stroke-width={BOX_STROKE}
+											pointer-events="none"
 										/>
 									{:else}
 										<rect
@@ -753,6 +831,7 @@ function onSnapshotPointerLeave() {
 											stroke={mark.color}
 											stroke-width={BOX_STROKE}
 											stroke-dasharray={mark.dashed ? "8 5" : undefined}
+											pointer-events="none"
 											data-residual={mark.residual || undefined}
 										/>
 									{/if}
@@ -762,6 +841,7 @@ function onSnapshotPointerLeave() {
 										width={mark.labelW}
 										height={mark.labelH}
 										fill={mark.unexpected ? "#dc2626" : mark.color}
+										pointer-events="none"
 									/>
 									<text
 										x={mark.labelX + LABEL_PAD_X}
@@ -771,6 +851,7 @@ function onSnapshotPointerLeave() {
 										font-family="ui-monospace, monospace"
 										font-weight="600"
 										dominant-baseline="central"
+										pointer-events="none"
 									>
 										{mark.label}
 									</text>
@@ -781,6 +862,7 @@ function onSnapshotPointerLeave() {
 											width={mark.noteW}
 											height={mark.noteH}
 											fill={mark.noteFill}
+											pointer-events="none"
 											data-metrology={mark.noteKind}
 										/>
 										<text
@@ -791,12 +873,13 @@ function onSnapshotPointerLeave() {
 											font-family="ui-monospace, monospace"
 											font-weight="600"
 											dominant-baseline="central"
+											pointer-events="none"
 										>
 											{mark.note}
 										</text>
 									{/if}
 								{/if}
-								<DimensionMarks marks={mark.dimensions} />
+								<DimensionMarks marks={mark.dimensions} underlayPass />
 								{#if mark.slot}
 									<rect
 										x={mark.x}
@@ -804,6 +887,7 @@ function onSnapshotPointerLeave() {
 										width="14"
 										height="14"
 										fill={slotColor(mark.slot).stroke}
+										pointer-events="none"
 									/>
 									<text
 										x={mark.x + 7}
@@ -813,6 +897,7 @@ function onSnapshotPointerLeave() {
 										font-family="ui-monospace, monospace"
 										font-weight="700"
 										text-anchor="middle"
+										pointer-events="none"
 									>
 										{mark.slot}
 									</text>
