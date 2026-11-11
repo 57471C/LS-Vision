@@ -4084,7 +4084,7 @@ onDestroy(() => {
 									Debug catalogue candidates
 								</label>
 								<p class="text-sm text-neutral-400">
-									When this is on, each detection includes the top two global catalogue candidates.
+									When this is on, each detection includes the top three global catalogue candidates.
 								</p>
 								{#if catalogDebugNotice}
 									<p class="text-sm text-neutral-200">{catalogDebugNotice}</p>

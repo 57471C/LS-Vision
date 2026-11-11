@@ -7,6 +7,7 @@ import { readCameraScale, settingsForCamera } from "$lib/camera-settings";
 import {
 	badgeStyle,
 	type CatalogMatch,
+	dinoGuessLine,
 	overlayLabel,
 	type TwoPassMatch,
 } from "$lib/catalog-match";
@@ -232,7 +233,13 @@ function detectionMarks(
 			!item.consumed && !mismatch && hoverKey === key
 				? metrologyReadout(item.metrology)
 				: "";
-		const note = mismatch || hover;
+		const rejected =
+			pass?.status === "wrong_part" || pass?.status === "unrecognized";
+		const guesses =
+			!item.consumed && rejected
+				? dinoGuessLine(item.catalogMatch, pass?.candidates)
+				: "";
+		const note = mismatch || hover || guesses;
 		const noteW = note
 			? Math.ceil(note.length * LABEL_FONT * 0.62) + LABEL_PAD_X * 2
 			: 0;
@@ -310,7 +317,13 @@ function detectionMarks(
 			noteW,
 			noteH,
 			noteFill: mismatch ? "#dc2626" : "#171717",
-			noteKind: mismatch ? "DIMENSION_MISMATCH" : hover ? "hover" : "",
+			noteKind: mismatch
+				? "DIMENSION_MISMATCH"
+				: hover
+					? "hover"
+					: guesses
+						? "guesses"
+						: "",
 			residual: item.residual ?? "",
 			spanCount: spans.length,
 			rawSpanCount: rawSpanCount(item.metrology),
