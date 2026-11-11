@@ -4,6 +4,8 @@
 import type { DimensionMark } from "$lib/metrology";
 
 export let marks: DimensionMark[] = [];
+// A dark line under a neutral pass stroke. Out-of-spec marks ignore this.
+export let underlayPass = false;
 </script>
 
 {#each marks as mark (mark.key)}
@@ -12,6 +14,18 @@ export let marks: DimensionMark[] = [];
 		data-metrology-line={mark.mismatch ? "DIMENSION_MISMATCH" : "pass"}
 		pointer-events="none"
 	>
+		{#if underlayPass && !mark.mismatch}
+			<line
+				x1={mark.x1}
+				y1={mark.y1}
+				x2={mark.x2}
+				y2={mark.y2}
+				stroke="#171717"
+				stroke-width="3.5"
+				stroke-linecap="butt"
+				vector-effect="non-scaling-stroke"
+			/>
+		{/if}
 		<line
 			x1={mark.x1}
 			y1={mark.y1}
