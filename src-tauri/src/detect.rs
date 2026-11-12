@@ -2243,9 +2243,10 @@ fn attach_catalog(
             crate::catalog::MatchStatus::Unrecognized => "unrecognized",
         };
         lines.push(format!(
-            "Catalogue {} -> {status} {}",
+            "Catalogue {} -> {status} {}{}",
             detection.ic,
-            two_pass.resolved_ic.as_deref().unwrap_or("-")
+            two_pass.resolved_ic.as_deref().unwrap_or("-"),
+            catalogue_guesses(&matched)
         ));
         detection.two_pass = Some(two_pass);
         detection.catalog_match = Some(matched);
@@ -2254,6 +2255,32 @@ fn attach_catalog(
         }
     }
     lines
+}
+
+/// Top three catalogue scores, the same order Preview Detect shows.
+fn catalogue_guesses(matched: &crate::catalog::CatalogMatch) -> String {
+    let mut rows = Vec::new();
+    if let Some(top) = &matched.top {
+        rows.push(format!("{} {}%", top.ic, percent_score(top.score)));
+    }
+    for runner in matched.runners_up.iter().take(2) {
+        if runner.ic.trim().is_empty() {
+            continue;
+        }
+        rows.push(format!("{} {}%", runner.ic, percent_score(runner.score)));
+    }
+    if rows.is_empty() {
+        return String::new();
+    }
+    format!(" [{}]", rows.join(", "))
+}
+
+fn percent_score(score: f32) -> i32 {
+    let value = f64::from(score) * 100.0;
+    if !value.is_finite() {
+        return 0;
+    }
+    value.round().clamp(0.0, 100.0) as i32
 }
 
 fn held_embed(ic: &str, values: Vec<f32>) -> Option<crate::dinov2::HeldEmbed> {

@@ -1,9 +1,12 @@
-//! Two-pass catalogue match for one embedded crop.
+//! Catalogue match for one embedded crop.
 //!
-//! Pass 1 scores only the item codes on the active BoM. A score at or above
-//! the saved match threshold is `matched_bom`. Otherwise pass 2 scores the
-//! whole catalogue. A global score at or above the threshold is `wrong_part`.
-//! Anything weaker is `unrecognized`. An empty BoM list skips pass 1.
+//! The crop is ranked against the whole catalogue. That order is the same
+//! list Preview Detect shows. The highest score is the result. When it is at
+//! or above the saved match threshold and that item code is on the active BoM,
+//! the box is `matched_bom`. The same score for any other item code is
+//! `wrong_part`, including when a BoM part scores lower and still clears the
+//! threshold. Anything weaker is `unrecognized`. An empty BoM list cannot
+//! mark a hit as `matched_bom`.
 
 use std::collections::{HashMap, HashSet};
 
@@ -11,7 +14,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{CatalogCandidate, CatalogEntry};
 
-const GLOBAL_CANDIDATES: usize = 2;
+/// Same count Preview Detect shows by default.
+const GLOBAL_CANDIDATES: usize = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -35,12 +39,12 @@ pub struct TwoPassMatch {
     pub size: String,
     pub score: f32,
     pub in_bom: bool,
-    /// Top two global item codes. Omitted unless Settings > Training debug is on.
+    /// Top three global item codes. Omitted unless Settings > Training debug is on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidates: Option<Vec<CatalogCandidate>>,
 }
 
-/// Trimmed item codes. `None` and an empty list both skip pass 1.
+/// Trimmed item codes. `None` and an empty list both leave every hit off the BoM.
 pub(crate) fn bom_ic_set(ics: Option<Vec<String>>) -> Option<HashSet<String>> {
     let Some(ics) = ics else {
         return None;
@@ -64,19 +68,18 @@ pub(crate) fn classify(
     let ranked = rank(entries, query);
     let candidates =
         include_candidates.then(|| ranked.iter().take(GLOBAL_CANDIDATES).cloned().collect());
-    let global = ranked.first();
-    let bom_top = bom_ics.and_then(|allowed| {
-        ranked
-            .iter()
-            .find(|candidate| allowed.contains(&candidate.ic))
-    });
-    if let Some(candidate) = bom_top.filter(|candidate| candidate.score >= threshold) {
-        return named(bbox, MatchStatus::MatchedBom, candidate, true, candidates);
+    // Membership is applied after the rank. A BoM part does not outrank a closer match.
+    let best = ranked.first();
+    if let Some(candidate) = best.filter(|candidate| candidate.score >= threshold) {
+        let in_bom = bom_ics.is_some_and(|allowed| allowed.contains(&candidate.ic));
+        let status = if in_bom {
+            MatchStatus::MatchedBom
+        } else {
+            MatchStatus::WrongPart
+        };
+        return named(bbox, status, candidate, in_bom, candidates);
     }
-    if let Some(candidate) = global.filter(|candidate| candidate.score >= threshold) {
-        return named(bbox, MatchStatus::WrongPart, candidate, false, candidates);
-    }
-    let nearest = global.cloned();
+    let nearest = best.cloned();
     TwoPassMatch {
         bounding_box: bbox,
         status: MatchStatus::Unrecognized,
@@ -293,9 +296,75 @@ mod tests {
         assert!(!matched.in_bom);
         assert!((matched.score - 1.0).abs() < 1.0e-5);
         let candidates = matched.candidates.expect("debug candidates");
-        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates.len(), 3);
         assert_eq!(candidates[0].ic, "2ERGM22");
         assert_eq!(candidates[1].ic, "6PBB833");
+        assert_eq!(candidates[2].ic, "4LRS006");
+    }
+
+    #[test]
+    fn a_closer_part_wins_over_a_bom_part_that_also_clears_the_threshold() {
+        let entries = catalogue();
+        let allowed = bom(&["6PBB833"]);
+        // Hinge is closer. The tilted bracket crop is still above 0.70, and it used to win.
+        let query = unit(&[1.0, 1.5, 0.0]);
+        let matched = classify(&entries, &query, [0, 0, 4, 4], Some(&allowed), 0.70, true);
+        let hits = top_hits(&entries, &query, 3);
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].ic, "2ERGM22");
+        assert_eq!(matched.resolved_ic.as_deref(), Some(hits[0].ic.as_str()));
+        assert_eq!(matched.status, MatchStatus::WrongPart);
+        assert!(!matched.in_bom);
+        assert!(matched.score > 0.70);
+        let lookalike = hits.iter().find(|hit| hit.ic == "6PBB833").unwrap();
+        assert!(lookalike.score >= 0.70, "{}", lookalike.score);
+        assert!(matched.score > lookalike.score);
+        let candidates = matched.candidates.expect("debug candidates");
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|row| row.ic.as_str())
+                .collect::<Vec<_>>(),
+            hits.iter().map(|hit| hit.ic.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn the_bom_part_is_kept_when_it_is_the_closest_match() {
+        let entries = catalogue();
+        let allowed = bom(&["6PBB833"]);
+        let query = unit(&[1.01, 1.0, 0.0]);
+        let matched = classify(&entries, &query, [1, 1, 5, 5], Some(&allowed), 0.70, false);
+        let hits = top_hits(&entries, &query, 3);
+        assert_eq!(hits[0].ic, "6PBB833");
+        assert_eq!(matched.resolved_ic.as_deref(), Some("6PBB833"));
+        assert_eq!(matched.status, MatchStatus::MatchedBom);
+        assert!(matched.in_bom);
+        assert!(matched.score > hits[1].score);
+    }
+
+    #[test]
+    fn an_equal_score_does_not_prefer_the_bom_part() {
+        let entries = vec![
+            entry("6PBB833", "Bracket", "bracket", unit(&[1.0, 0.0])),
+            entry("2ERGM22", "Hinge", "hinge", unit(&[0.0, 1.0])),
+        ];
+        let allowed = bom(&["6PBB833"]);
+        // Equal best scores. Item-code order picks the hinge, not the BoM bracket.
+        let query = unit(&[1.0, 1.0]);
+        let matched = classify(&entries, &query, [2, 2, 6, 6], Some(&allowed), 0.70, false);
+        let hits = top_hits(&entries, &query, 2);
+        assert_eq!(hits[0].ic, "2ERGM22");
+        assert_eq!(hits[1].ic, "6PBB833");
+        assert!(
+            (hits[0].score - hits[1].score).abs() < 1.0e-5,
+            "{} {}",
+            hits[0].score,
+            hits[1].score
+        );
+        assert_eq!(matched.resolved_ic.as_deref(), Some("2ERGM22"));
+        assert_eq!(matched.status, MatchStatus::WrongPart);
+        assert!(!matched.in_bom);
     }
 
     #[test]

@@ -125,6 +125,32 @@ function matchPercent(score: number): number {
 	return Math.round(clamped * 100);
 }
 
+// Highest catalogue scores for one box, at most three. The same order Preview
+// Detect shows. The operator overlay draws this under a rejected box on hover.
+export function dinoGuessLine(
+	match: CatalogMatch | undefined,
+	candidates?: readonly CatalogCandidate[] | null,
+): string {
+	const listed = (candidates ?? []).filter((item) => item.ic.trim());
+	const rows: CatalogCandidate[] = [];
+	if (listed.length > 0) {
+		for (const item of listed) {
+			if (rows.length >= 3) break;
+			rows.push(item);
+		}
+	} else if (match?.top?.ic.trim()) {
+		rows.push(match.top);
+		for (const item of match.runnersUp) {
+			if (rows.length >= 3) break;
+			if (!item.ic.trim()) continue;
+			rows.push(item);
+		}
+	}
+	return rows
+		.map((row) => `${row.ic.trim()} ${matchPercent(row.score)}%`)
+		.join(" · ");
+}
+
 function sizedCode(ic: string, size: string | undefined): string {
 	const extra = size?.trim() ?? "";
 	return extra ? `${ic} ${extra}` : ic;
