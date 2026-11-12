@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.3
+
+- The main detect keeps the highest DINOv2 match, then checks the BoM. A similar BoM part no longer wins when another catalogue part scores higher. That box is a wrong part and does not count toward the quantity seen.
+- Hovering a rejected box shows the top three catalogue guesses. They stay off the still otherwise. Measurement arrows for that same hover are unchanged.
+
 ## 0.5.2
 
 - A DINO catalogue import stores structured millimetres with each class's length rule, diameter rule, and note. The operator overlay, the BoM line, and View references show the generated size, such as `M8x20` or `130x37 mm`. Metrology checks the fields those rules name. A Dimensions string is not parsed.

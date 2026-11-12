@@ -2,7 +2,7 @@
 
 Desktop application for verifying fastener kits on the bench using computer vision.
 
-Built with Tauri 2, SvelteKit, TypeScript, and Rust. Version 0.5.2. Inference is ONNX Runtime in the Rust process. The camera, barcode decode, and BoM lookup run there too.
+Built with Tauri 2, SvelteKit, TypeScript, and Rust. Version 0.5.3. Inference is ONNX Runtime in the Rust process. The camera, barcode decode, and BoM lookup run there too.
 
 ## What it does
 
@@ -35,10 +35,11 @@ In Settings > Training, use Update model to copy an `.onnx` file into the app da
 
 ## Project status
 
-Version 0.5.2 runs inference, the camera, barcode decode, and BoM lookup in the Tauri process. A `.pt` model shows a warning instead of detecting.
+Version 0.5.3 runs inference, the camera, barcode decode, and BoM lookup in the Tauri process. A `.pt` model shows a warning instead of detecting.
 
 Recent additions:
 
+- The main detect keeps the highest DINOv2 match, then checks the BoM. A similar BoM part no longer wins when another catalogue part scores higher. Hovering a rejected box shows the top three catalogue guesses. They stay off the still otherwise.
 - A DINO catalogue import stores structured millimetres and each class's length and diameter rules. The overlay, the BoM line, and View references show the generated size, such as `M8x20` or `130x37 mm`. Metrology uses those fields. A Dimensions string is not parsed.
 - Settings and the DINOv2 catalogue, including crop images, are stored in the results database (`results/results.sqlite`). Settings > Training chooses the DINOv2 model (`s_reg` or `b_reg`). The installer bundles both register models.
 - After a barcode is accepted, the operator page waits a motion delay (default 400 ms) before detection. The overlay marks surplus, near-miss, and rogue parts for display only. Hovering a finished detection box shows its measurement arrows and measured sizes. Out-of-spec arrows stay visible.
