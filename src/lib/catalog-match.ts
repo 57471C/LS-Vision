@@ -126,7 +126,7 @@ function matchPercent(score: number): number {
 }
 
 // Highest catalogue scores for one box, at most three. The same order Preview
-// Detect shows. A rejected box lists these under the badge.
+// Detect shows. The operator overlay draws this under a rejected box on hover.
 export function dinoGuessLine(
 	match: CatalogMatch | undefined,
 	candidates?: readonly CatalogCandidate[] | null,

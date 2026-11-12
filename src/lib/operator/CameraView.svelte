@@ -235,11 +235,12 @@ function detectionMarks(
 				: "";
 		const rejected =
 			pass?.status === "wrong_part" || pass?.status === "unrecognized";
+		// The top three stay off the still until the pointer is inside this box.
 		const guesses =
-			!item.consumed && rejected
+			!item.consumed && rejected && hoverKey === key
 				? dinoGuessLine(item.catalogMatch, pass?.candidates)
 				: "";
-		const note = mismatch || hover || guesses;
+		const note = mismatch || guesses || hover;
 		const noteW = note
 			? Math.ceil(note.length * LABEL_FONT * 0.62) + LABEL_PAD_X * 2
 			: 0;
