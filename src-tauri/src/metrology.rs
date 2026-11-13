@@ -5,7 +5,8 @@
 //! resolved to a catalogue part (`matched_bom` or `wrong_part`) is cropped
 //! from the full-resolution frame, measured, and given a `metrology` flag.
 //! An unrecognized box is left alone. The flag does not change the two-pass
-//! status, the BoM count, or the YOLO label file.
+//! status, the BoM count, or the YOLO label file. Skip and result lines are
+//! printed and returned so the operator console can show them.
 //!
 //! The crop is expanded by the saved margin, then OpenCV turns it grey,
 //! thresholds it (Otsu or a fixed cutoff), keeps the largest external contour,
@@ -371,101 +372,127 @@ pub(crate) fn measure_boxes(
     height: u32,
     boxes: &[BoxMeasure],
 ) -> Vec<Option<MetrologyResult>> {
+    measure_report(document, rgb, width, height, boxes).0
+}
+
+/// Same measurement as [`measure_boxes`], plus the lines the operator console shows.
+/// Metrology that is off, or a frame with no catalogue match, stays silent.
+pub(crate) fn measure_report(
+    document: Option<&Value>,
+    rgb: &[u8],
+    width: u32,
+    height: u32,
+    boxes: &[BoxMeasure],
+) -> (Vec<Option<MetrologyResult>>, Vec<String>) {
     let settings = settings_from(document);
-    if !settings.enabled {
-        return vec![None; boxes.len()];
-    }
-    if !boxes.iter().any(|item| item.matched) {
-        return vec![None; boxes.len()];
+    if !settings.enabled || !boxes.iter().any(|item| item.matched) {
+        return (vec![None; boxes.len()], Vec::new());
     }
     let Some(document) = document else {
-        return vec![None; boxes.len()];
+        return (vec![None; boxes.len()], Vec::new());
     };
+    let mut lines = Vec::new();
     let Some(mm) = mm_per_px(document, width) else {
-        eprintln!("metrology skipped: no camera scale");
-        return vec![None; boxes.len()];
+        log_line(&mut lines, "metrology skipped: no camera scale");
+        return (vec![None; boxes.len()], lines);
     };
     if !opencv_ready() {
-        eprintln!("metrology skipped: OpenCV is not available");
-        return vec![None; boxes.len()];
+        log_line(&mut lines, "metrology skipped: OpenCV is not available");
+        return (vec![None; boxes.len()], lines);
     }
-    boxes
-        .iter()
-        .map(|item| {
-            if !item.matched {
-                return None;
-            }
-            if item.class_id == LABEL_CLASS {
-                eprintln!("metrology {}: label class is not measured", item.ic);
-                return None;
-            }
-            let part = crate::catalogue::part_dimensions(&item.ic);
-            let dimensions = part
-                .as_ref()
-                .map(|part| part.dimensions.clone())
-                .unwrap_or(Value::Null);
-            let method = part
-                .as_ref()
-                .map(|part| part.measurement_method.clone())
-                .unwrap_or_default();
-            let kind = part
-                .as_ref()
-                .map(|part| part.kind.clone())
-                .unwrap_or_default();
-            let tolerances = crate::catalogue::tolerances_for(&item.ic);
-            let mut local = settings.clone();
-            let (length_override, diameter_override) =
-                generic_tolerance_overrides(&dimensions, &tolerances);
-            if let Some(mm) = length_override {
-                local.length_tolerance_mm = mm;
-            }
-            if let Some(mm) = diameter_override {
-                local.diameter_tolerance_mm = mm;
-            }
-            let result = if method.is_empty() || method == "custom" {
-                let expected = expected_from(&method, &kind, &dimensions);
-                measure_rgb(rgb, width, height, item.bbox, &local, mm, &expected)
-            } else {
-                measure_method_for(
-                    rgb,
-                    width,
-                    height,
-                    item.bbox,
-                    &settings,
-                    mm,
-                    "",
-                    &dimensions,
-                    &method,
-                    &kind,
-                    &tolerances,
-                )
-            };
-            match result {
-                Some(result) => {
-                    let status = match result.status {
-                        MetrologyStatus::Pass => "pass",
-                        MetrologyStatus::DimensionMismatch => "DIMENSION_MISMATCH",
-                    };
-                    if method.is_empty() || method == "custom" {
-                        eprintln!(
+    let mut results = Vec::with_capacity(boxes.len());
+    for item in boxes {
+        if !item.matched {
+            results.push(None);
+            continue;
+        }
+        if item.class_id == LABEL_CLASS {
+            log_line(
+                &mut lines,
+                format!("metrology {}: label class is not measured", item.ic),
+            );
+            results.push(None);
+            continue;
+        }
+        let part = crate::catalogue::part_dimensions(&item.ic);
+        let dimensions = part
+            .as_ref()
+            .map(|part| part.dimensions.clone())
+            .unwrap_or(Value::Null);
+        let method = part
+            .as_ref()
+            .map(|part| part.measurement_method.clone())
+            .unwrap_or_default();
+        let kind = part
+            .as_ref()
+            .map(|part| part.kind.clone())
+            .unwrap_or_default();
+        let tolerances = crate::catalogue::tolerances_for(&item.ic);
+        let mut local = settings.clone();
+        let (length_override, diameter_override) =
+            generic_tolerance_overrides(&dimensions, &tolerances);
+        if let Some(mm) = length_override {
+            local.length_tolerance_mm = mm;
+        }
+        if let Some(mm) = diameter_override {
+            local.diameter_tolerance_mm = mm;
+        }
+        let result = if method.is_empty() || method == "custom" {
+            let expected = expected_from(&method, &kind, &dimensions);
+            measure_rgb(rgb, width, height, item.bbox, &local, mm, &expected)
+        } else {
+            measure_method_for(
+                rgb,
+                width,
+                height,
+                item.bbox,
+                &settings,
+                mm,
+                "",
+                &dimensions,
+                &method,
+                &kind,
+                &tolerances,
+            )
+        };
+        match result {
+            Some(result) => {
+                let status = match result.status {
+                    MetrologyStatus::Pass => "pass",
+                    MetrologyStatus::DimensionMismatch => "DIMENSION_MISMATCH",
+                };
+                if method.is_empty() || method == "custom" {
+                    log_line(
+                        &mut lines,
+                        format!(
                             "metrology {} {status} length {:.1} mm diameter {:.1} mm",
                             item.ic, result.length_mm, result.diameter_mm
-                        );
-                    } else {
-                        eprintln!(
+                        ),
+                    );
+                } else {
+                    log_line(
+                        &mut lines,
+                        format!(
                             "metrology {} {method} {status} length {:.1} mm diameter {:.1} mm",
                             item.ic, result.length_mm, result.diameter_mm
-                        );
-                    }
-                    Some(result)
+                        ),
+                    );
                 }
-                None => {
-                    eprintln!("metrology {}: no measurement", item.ic);
-                    None
-                }
+                results.push(Some(result));
             }
-        })
-        .collect()
+            None => {
+                log_line(&mut lines, format!("metrology {}: no measurement", item.ic));
+                results.push(None);
+            }
+        }
+    }
+    (results, lines)
+}
+
+fn log_line(lines: &mut Vec<String>, message: impl Into<String>) {
+    let message = message.into();
+    eprintln!("{message}");
+    lines.push(message);
 }
 
 pub(crate) fn measure_rgb(
@@ -1790,10 +1817,28 @@ fn opencv_ready() -> bool {
     if name.is_empty() {
         return true;
     }
+    // The installer places the DLL beside the exe. A full path still loads when
+    // the process search path does not include that directory.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let beside = dir.join(name);
+            if beside.is_file() && library_loads_path(&beside) {
+                return true;
+            }
+        }
+    }
     library_loads(name)
 }
 
 fn library_loads(name: &str) -> bool {
+    library_loads_os(std::ffi::OsStr::new(name))
+}
+
+fn library_loads_path(path: &std::path::Path) -> bool {
+    library_loads_os(path.as_os_str())
+}
+
+fn library_loads_os(name: &std::ffi::OsStr) -> bool {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
@@ -1801,10 +1846,7 @@ fn library_loads(name: &str) -> bool {
         use windows::Win32::System::LibraryLoader::LoadLibraryW;
         use windows::core::PCWSTR;
 
-        let wide: Vec<u16> = std::ffi::OsStr::new(name)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
+        let wide: Vec<u16> = name.encode_wide().chain(std::iter::once(0)).collect();
         unsafe {
             let Ok(module) = LoadLibraryW(PCWSTR(wide.as_ptr())) else {
                 return false;
@@ -2201,6 +2243,29 @@ mod tests {
         assert!(results[0].is_none());
         let matched = results[1].as_ref().expect("matched box");
         assert_eq!(matched.status, MetrologyStatus::Pass);
+        assert!(!matched.spans.is_empty());
+    }
+
+    #[test]
+    fn measure_report_names_a_missing_scale_and_stays_quiet_when_off() {
+        let width = 220_u32;
+        let height = 140_u32;
+        let rgb = white_on_black(width, height, 40, 50, 100, 30);
+        let boxes = vec![BoxMeasure {
+            bbox: [40, 50, 140, 80],
+            matched: true,
+            ic: "FAST-00124".to_string(),
+            class_id: 0,
+        }];
+        let enabled = json!({ "metrology": { "enabled": true }, "camera": { "index": 0 } });
+        let (results, lines) = measure_report(Some(&enabled), &rgb, width, height, &boxes);
+        assert!(results[0].is_none());
+        assert_eq!(lines, vec!["metrology skipped: no camera scale".to_string()]);
+
+        let off = json!({ "metrology": { "enabled": false } });
+        let (results, lines) = measure_report(Some(&off), &rgb, width, height, &boxes);
+        assert!(results[0].is_none());
+        assert!(lines.is_empty());
     }
 
     fn fill(data: &mut [u8], width: u32, height: u32, x: u32, y: u32, w: u32, h: u32, on: bool) {

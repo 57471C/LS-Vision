@@ -2020,7 +2020,7 @@ fn detect_pixels(
                         crate::dinov2::hold_frame(rgb, width, height);
                     }
                     let feedback_n = feedback_count(dino_feedback, found.kind, document.as_ref());
-                    let catalog = attach_catalog(
+                    let mut catalog = attach_catalog(
                         rgb,
                         width,
                         height,
@@ -2030,7 +2030,13 @@ fn detect_pixels(
                         include_candidates,
                         feedback_n,
                     );
-                    apply_metrology(document.as_ref(), rgb, width, height, &mut found.detections);
+                    catalog.extend(apply_metrology(
+                        document.as_ref(),
+                        rgb,
+                        width,
+                        height,
+                        &mut found.detections,
+                    ));
                     Ok(detection_value(found, dinov2, catalog))
                 }
                 Err(message) => Ok(failure(&model_status_message(&message))),
@@ -2071,7 +2077,7 @@ fn detect_pixels(
                     held_all.extend(held);
                 }
                 let feedback_n = feedback_count(dino_feedback, found.kind, document.as_ref());
-                let catalog = attach_catalog(
+                let mut catalog = attach_catalog(
                     rgb,
                     width,
                     height,
@@ -2081,7 +2087,13 @@ fn detect_pixels(
                     include_candidates,
                     feedback_n,
                 );
-                apply_metrology(document.as_ref(), rgb, width, height, &mut found.detections);
+                catalog.extend(apply_metrology(
+                    document.as_ref(),
+                    rgb,
+                    width,
+                    height,
+                    &mut found.detections,
+                ));
                 let mut row = detection_value(found, dinov2, catalog);
                 if let Some(object) = row.as_object_mut() {
                     object.insert("slot".to_string(), json!(slot));
@@ -2157,15 +2169,16 @@ fn log_dinov2_embeddings(
 
 /// Measure catalogue matches when Settings > Capture has metrology on.
 /// Unrecognized boxes stay without a `metrology` field.
+/// The returned lines are the same text printed for the operator console.
 fn apply_metrology(
     document: Option<&Value>,
     rgb: &[u8],
     width: u32,
     height: u32,
     detections: &mut [Detection],
-) {
+) -> Vec<String> {
     if detections.is_empty() {
-        return;
+        return Vec::new();
     }
     let boxes: Vec<crate::metrology::BoxMeasure> = detections
         .iter()
@@ -2191,10 +2204,11 @@ fn apply_metrology(
             }
         })
         .collect();
-    let measured = crate::metrology::measure_boxes(document, rgb, width, height, &boxes);
+    let (measured, lines) = crate::metrology::measure_report(document, rgb, width, height, &boxes);
     for (detection, result) in detections.iter_mut().zip(measured) {
         detection.metrology = result;
     }
+    lines
 }
 
 /// Top-N catalogue list for an RF-DETR preview. The operator call and a YOLO
@@ -3362,6 +3376,166 @@ mod tests {
             .expect("jpeg")
             .as_ref()
             .to_vec()
+    }
+
+    fn white_rect(width: u32, height: u32, x: u32, y: u32, w: u32, h: u32) -> Vec<u8> {
+        let mut data = vec![0_u8; (width * height * 3) as usize];
+        for row in y..y + h {
+            for col in x..x + w {
+                let index = ((row * width + col) * 3) as usize;
+                data[index] = 255;
+                data[index + 1] = 255;
+                data[index + 2] = 255;
+            }
+        }
+        data
+    }
+
+    fn matched_box(bbox: [i32; 4], ic: &str) -> Detection {
+        Detection {
+            ic: ic.to_string(),
+            confidence: 0.9,
+            bbox,
+            reference_match: None,
+            embed: None,
+            catalog_match: None,
+            two_pass: Some(crate::catalog::TwoPassMatch {
+                bounding_box: bbox,
+                status: crate::catalog::MatchStatus::MatchedBom,
+                resolved_ic: Some(ic.to_string()),
+                description: None,
+                part_type: Some("bolt".to_string()),
+                size: String::new(),
+                score: 0.91,
+                in_bom: true,
+                candidates: None,
+            }),
+            metrology: None,
+            dino_matches: None,
+            class_id: 0,
+        }
+    }
+
+    /// A camera snapshot is a packed RGB `RawFrame`. Test mode is that same
+    /// buffer after a JPEG round trip. Both must carry spans, and a scale that
+    /// does not match the expected size must set DIMENSION_MISMATCH.
+    #[test]
+    fn camera_raw_and_jpeg_file_both_attach_metrology() {
+        let width = 220_u32;
+        let height = 140_u32;
+        let rgb = white_rect(width, height, 40, 50, 100, 30);
+        let bbox = [40, 50, 140, 80];
+        let document = json!({
+            "metrology": {
+                "enabled": true,
+                "marginPercent": 5,
+                "thresholdMode": "otsu",
+                "fixedThreshold": 128,
+                "minContourAreaPx": 200,
+                "lengthToleranceMm": 1.5,
+                "diameterToleranceMm": 0.8
+            },
+            "camera": {
+                "index": 0,
+                "scale": { "mmPerPx": 0.25, "width": width, "height": height }
+            }
+        });
+        let frame = RawFrame {
+            width,
+            height,
+            channels: 3,
+            data: rgb.clone(),
+            timestamp_ms: 0,
+        };
+        let (raw_pixels, raw_w, raw_h) = raw_rgb(&frame).expect("camera frame");
+        let jpeg = jpeg_rgb(&rgb, width, height, 95);
+        let (file_pixels, file_w, file_h) = decode_rgb(&jpeg).expect("image file");
+        assert_eq!((raw_w, raw_h), (width, height));
+        assert_eq!((file_w, file_h), (width, height));
+
+        let expected = crate::metrology::expected_from(
+            "",
+            "",
+            &json!({ "diameterMm": 6, "lengthMm": 40 }),
+        );
+        let settings = crate::metrology::MetrologySettings {
+            enabled: true,
+            margin_percent: 5.0,
+            mode: crate::metrology::ThresholdMode::Otsu,
+            fixed_threshold: 128,
+            min_contour_area_px: 200.0,
+            length_tolerance_mm: 1.5,
+            diameter_tolerance_mm: 0.8,
+        };
+        // 100 px at 0.25 mm/px is about 25 mm, against an expected 40 mm.
+        let wrong_scale = 0.25_f64;
+
+        for (label, pixels, w, h) in [
+            ("camera", raw_pixels, raw_w, raw_h),
+            ("file", file_pixels.as_slice(), file_w, file_h),
+        ] {
+            let boxes = vec![crate::metrology::BoxMeasure {
+                bbox,
+                matched: true,
+                ic: "FAST-00124".to_string(),
+                class_id: 0,
+            }];
+            let (measured, lines) =
+                crate::metrology::measure_report(Some(&document), pixels, w, h, &boxes);
+            let result = measured[0].as_ref().expect(label);
+            assert!(!result.spans.is_empty(), "{label} spans");
+            assert!(
+                lines.iter().any(|line| line.contains("FAST-00124")),
+                "{label} {lines:?}"
+            );
+
+            let mismatch = crate::metrology::measure_rgb(
+                pixels,
+                w,
+                h,
+                bbox,
+                &settings,
+                wrong_scale,
+                &expected,
+            )
+            .unwrap_or_else(|| panic!("{label} mismatch"));
+            assert_eq!(
+                mismatch.status,
+                crate::metrology::MetrologyStatus::DimensionMismatch,
+                "{label} {}",
+                mismatch.note
+            );
+            assert!(
+                mismatch.note.starts_with("Expected M6x40, measured "),
+                "{label} {}",
+                mismatch.note
+            );
+            assert_eq!(mismatch.spans.len(), 2, "{label}");
+
+            let mut detections = vec![
+                Detection {
+                    ic: "other".to_string(),
+                    confidence: 0.4,
+                    bbox,
+                    reference_match: None,
+                    embed: None,
+                    catalog_match: None,
+                    two_pass: Some(crate::catalog::unrecognized_box(bbox)),
+                    metrology: None,
+                    dino_matches: None,
+                    class_id: 0,
+                },
+                matched_box(bbox, "FAST-00124"),
+            ];
+            let attached = apply_metrology(Some(&document), pixels, w, h, &mut detections);
+            assert!(detections[0].metrology.is_none(), "{label} unrecognized");
+            let metrology = detections[1].metrology.as_ref().expect(label);
+            assert!(!metrology.spans.is_empty(), "{label} payload spans");
+            assert!(
+                attached.iter().any(|line| line.starts_with("metrology ")),
+                "{label} {attached:?}"
+            );
+        }
     }
 
     fn logged_match(line: &str, class_name: &str) -> Option<f32> {

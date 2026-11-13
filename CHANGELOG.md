@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.4
+
+- The installer places `opencv_world` next to `ls-vision.exe`, so metrology runs on an installed camera snapshot the same way it runs on a still image. A skip or result line is also written to the operator console.
+
 ## 0.5.3
 
 - The main detect keeps the highest DINOv2 match, then checks the BoM. A similar BoM part no longer wins when another catalogue part scores higher. That box is a wrong part and does not count toward the quantity seen.

@@ -3,7 +3,7 @@
 // This writes .cargo/config.toml so a later cargo build in this repo sees them too.
 
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -121,6 +121,7 @@ function configureWindows() {
 		console.error(`Cannot build the OpenCV caliper. Missing: ${missing.join(", ")}.`);
 		process.exit(1);
 	}
+	stageOpencvDll(world);
 	const env = {
 		OPENCV_LINK_LIBS: process.env.OPENCV_LINK_LIBS?.trim() || world.name,
 		OPENCV_LINK_PATHS: slash(world.libDir),
@@ -141,6 +142,31 @@ function configureWindows() {
 	body.push("");
 	writeFileSync(path.join(cargoDir, "config.toml"), body.join("\n"));
 	return env;
+}
+
+// Tauri reads opencv/*.dll before Cargo runs. Stage it beside the crate so the
+// installer can place the same file next to ls-vision.exe.
+function stageOpencvDll(world) {
+	const bin = path.resolve(world.libDir, "../bin");
+	if (!existsSync(bin)) {
+		console.error(`Cannot bundle OpenCV. No bin directory beside ${world.libDir}.`);
+		process.exit(1);
+	}
+	const preferred = `${world.name}.dll`.toLowerCase();
+	const names = readdirSync(bin)
+		.filter((name) => /^opencv_world\d+\.dll$/i.test(name))
+		.sort();
+	const file = names.find((name) => name.toLowerCase() === preferred) ?? names.at(-1);
+	if (!file) {
+		console.error(`Cannot bundle OpenCV. No opencv_world DLL in ${bin}.`);
+		process.exit(1);
+	}
+	const source = path.join(bin, file);
+	const destDir = path.join(root, "src-tauri", "opencv");
+	const dest = path.join(destDir, file);
+	mkdirSync(destDir, { recursive: true });
+	if (existsSync(dest) && statSync(dest).size === statSync(source).size) return;
+	copyFileSync(source, dest);
 }
 
 const extra = process.platform === "win32" ? configureWindows() : {};

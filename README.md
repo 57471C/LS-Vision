@@ -2,7 +2,7 @@
 
 Desktop application for verifying fastener kits on the bench using computer vision.
 
-Built with Tauri 2, SvelteKit, TypeScript, and Rust. Version 0.5.3. Inference is ONNX Runtime in the Rust process. The camera, barcode decode, and BoM lookup run there too.
+Built with Tauri 2, SvelteKit, TypeScript, and Rust. Version 0.5.4. Inference is ONNX Runtime in the Rust process. The camera, barcode decode, and BoM lookup run there too.
 
 ## What it does
 
@@ -31,14 +31,15 @@ npm install
 npm run tauri dev
 ```
 
-In Settings > Training, use Update model to copy an `.onnx` file into the app data models folder. Dev and the installed app share that folder. YOLO weight files are not stored in git and are not bundled. The installer bundles `models/dinov2_vits14_reg.onnx` and `models/dinov2_vitb14_reg.onnx` into `models/` next to the exe, and the OpenVINO DLLs into the same directory as the exe, when those files are present at build time. The non-register `dinov2_vits14.onnx` is not bundled. Settings > Training chooses `dinoModel` (`s_reg` or `b_reg`, default `s_reg`). Both stay gitignored. Training and export happen offline. The app loads `.onnx` files only. See [docs/Training-and-Models.md](docs/Training-and-Models.md).
+In Settings > Training, use Update model to copy an `.onnx` file into the app data models folder. Dev and the installed app share that folder. YOLO weight files are not stored in git and are not bundled. The installer bundles `models/dinov2_vits14_reg.onnx` and `models/dinov2_vitb14_reg.onnx` into `models/` next to the exe, and the OpenVINO DLLs and `opencv_world` into the same directory as the exe, when those files are present at build time. The non-register `dinov2_vits14.onnx` is not bundled. Settings > Training chooses `dinoModel` (`s_reg` or `b_reg`, default `s_reg`). Both stay gitignored. Training and export happen offline. The app loads `.onnx` files only. See [docs/Training-and-Models.md](docs/Training-and-Models.md).
 
 ## Project status
 
-Version 0.5.3 runs inference, the camera, barcode decode, and BoM lookup in the Tauri process. A `.pt` model shows a warning instead of detecting.
+Version 0.5.4 runs inference, the camera, barcode decode, and BoM lookup in the Tauri process. A `.pt` model shows a warning instead of detecting.
 
 Recent additions:
 
+- The installer places `opencv_world` next to `ls-vision.exe`. A camera snapshot that matches a catalogue part is measured the same way a still image is, and the operator console shows the metrology line.
 - The main detect keeps the highest DINOv2 match, then checks the BoM. A similar BoM part no longer wins when another catalogue part scores higher. Hovering a rejected box shows the top three catalogue guesses. They stay off the still otherwise.
 - A DINO catalogue import stores structured millimetres and each class's length and diameter rules. The overlay, the BoM line, and View references show the generated size, such as `M8x20` or `130x37 mm`. Metrology uses those fields. A Dimensions string is not parsed.
 - Settings and the DINOv2 catalogue, including crop images, are stored in the results database (`results/results.sqlite`). Settings > Training chooses the DINOv2 model (`s_reg` or `b_reg`). The installer bundles both register models.

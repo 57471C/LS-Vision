@@ -1107,6 +1107,11 @@ mod tests {
             Some(""),
             "OpenVINO DLLs install beside the exe"
         );
+        assert_eq!(
+            resources.get("opencv/*.dll").and_then(Value::as_str),
+            Some(""),
+            "OpenCV world DLL installs beside the exe"
+        );
         assert!(
             resources.values().all(|dest| {
                 dest.as_str()

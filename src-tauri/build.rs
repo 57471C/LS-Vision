@@ -14,6 +14,8 @@ fn main() {
         println!("cargo:rustc-link-lib=delayimp");
         println!("cargo:rustc-env=LS_VISION_OPENCV_DLL={name}");
         copy_beside_target(&path);
+        // The installer reads opencv/*.dll. Dev builds also copy beside the exe.
+        copy_for_installer(&path);
     }
     tauri_build::build();
 }
@@ -66,14 +68,37 @@ fn copy_beside_target(dll: &Path) {
         return;
     };
     for dir in [profile.to_path_buf(), profile.join("deps")] {
-        let dest = dir.join(file_name);
-        if dest.is_file()
-            && fs::metadata(dll).ok().map(|meta| meta.len())
-                == fs::metadata(&dest).ok().map(|meta| meta.len())
-        {
-            continue;
-        }
-        let _ = fs::create_dir_all(&dir);
-        let _ = fs::copy(dll, dest);
+        copy_if_changed(dll, &dir.join(file_name));
+    }
+}
+
+/// `tauri.conf.json` maps `opencv/*.dll` beside the installed exe.
+fn copy_for_installer(dll: &Path) {
+    if !dll.is_file() {
+        return;
+    }
+    let Ok(manifest) = env::var("CARGO_MANIFEST_DIR") else {
+        return;
+    };
+    let Some(file_name) = dll.file_name() else {
+        return;
+    };
+    copy_if_changed(dll, &PathBuf::from(manifest).join("opencv").join(file_name));
+}
+
+fn copy_if_changed(dll: &Path, dest: &Path) {
+    if dest.is_file()
+        && fs::metadata(dll).ok().map(|meta| meta.len()) == fs::metadata(dest).ok().map(|meta| meta.len())
+    {
+        return;
+    }
+    if let Some(dir) = dest.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    if let Err(err) = fs::copy(dll, dest) {
+        println!(
+            "cargo:warning=could not copy OpenCV DLL to {}: {err}",
+            dest.display()
+        );
     }
 }
